@@ -837,6 +837,10 @@ class ha_tidesdb : public handler
     int update_row(const uchar *old_data, uchar *new_data) override;  /* MariaDB had both const */
     int delete_row(const uchar *buf) override;
     int delete_all_rows(void) override;
+    /* TRUNCATE TABLE — MySQL routes here, default base impl returns
+       HA_ERR_WRONG_COMMAND. We delegate to delete_all_rows() which already
+       does an O(1) CF drop + recreate. (MariaDB only had delete_all_rows.) */
+    int truncate(dd::Table *table_def) override;
 
     /* Full-text search */
     int ft_init() override;

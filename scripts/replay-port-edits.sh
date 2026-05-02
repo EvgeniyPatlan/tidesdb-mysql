@@ -873,5 +873,85 @@ open(p, 'w').write(src)
 print("    Round 6 edits applied")
 PY
 
+# ----------------------------------------------------------------------------
+# Round 25 — TRUNCATE TABLE override.
+#
+# MariaDB routes TRUNCATE through delete_all_rows(); MySQL 9.7 added a separate
+# handler::truncate(dd::Table*) hook whose default returns HA_ERR_WRONG_COMMAND
+# (surfaces as ER_ILLEGAL_HA). TideSQL has the right drop-and-recreate logic in
+# delete_all_rows already; we just need a one-line override in MySQL that
+# delegates to it.
+#
+# Edits both the .cc ($SRC = plugin/ha_tidesdb.cc) and the sibling header at
+# plugin/ha_tidesdb.h.
+# ----------------------------------------------------------------------------
+echo "[replay] Round 25 — add truncate(dd::Table*) override delegating to delete_all_rows"
+
+HDR="$REPO/plugin/ha_tidesdb.h"
+
+# Header: insert decl right after delete_all_rows().
+if [ -f "$HDR" ] && ! grep -q "int truncate(dd::Table" "$HDR"; then
+    HDR="$HDR" python3 - <<'PY'
+import os
+p = os.environ["HDR"]
+s = open(p).read()
+needle = "    int delete_all_rows(void) override;"
+add = ("    int delete_all_rows(void) override;\n"
+       "    /* TRUNCATE TABLE -- MySQL routes here; default base impl returns\n"
+       "       HA_ERR_WRONG_COMMAND. Delegates to delete_all_rows() which already\n"
+       "       does an O(1) CF drop + recreate. (MariaDB only had delete_all_rows.) */\n"
+       "    int truncate(dd::Table *table_def) override;")
+if needle in s and "int truncate(dd::Table" not in s:
+    s = s.replace(needle, add, 1)
+    open(p, 'w').write(s)
+    print("    header decl inserted")
+else:
+    print("    header decl already present or anchor missing -- skipped")
+PY
+else
+    echo "    header decl already present -- skipped"
+fi
+
+# .cc: insert delegate right after delete_all_rows()'s closing brace.
+if ! grep -q "int ha_tidesdb::truncate(dd::Table" "$SRC"; then
+    SRC="$SRC" python3 - <<'PY'
+import os
+p = os.environ["SRC"]
+s = open(p).read()
+needle = ('    share->next_row_id.store(HIDDEN_PK_FIRST_ROW_ID, std::memory_order_relaxed);\n\n'
+          '    DBUG_RETURN(0);\n'
+          '}\n\n'
+          '/* ******************** Bulk DML ******************** */')
+add = ('    share->next_row_id.store(HIDDEN_PK_FIRST_ROW_ID, std::memory_order_relaxed);\n\n'
+       '    DBUG_RETURN(0);\n'
+       '}\n\n'
+       '/*\n'
+       '  TRUNCATE TABLE entry point.\n'
+       '\n'
+       '  MySQL 9.7 routes TRUNCATE through handler::truncate(dd::Table*); the default\n'
+       '  returns HA_ERR_WRONG_COMMAND, which surfaces as ER_ILLEGAL_HA. We already do\n'
+       '  the right work in delete_all_rows() (drop+recreate every CF, reset hidden-PK\n'
+       '  counter, discard txn buffers), so this is a one-line delegate.\n'
+       '\n'
+       '  The dd::Table* arg lets atomic-DDL engines mutate the data-dictionary entry;\n'
+       '  TidesDB does not yet rely on the DD for table state, so we ignore it.\n'
+       '*/\n'
+       'int ha_tidesdb::truncate(dd::Table *table_def [[maybe_unused]])\n'
+       '{\n'
+       '    DBUG_ENTER("ha_tidesdb::truncate");\n'
+       '    DBUG_RETURN(delete_all_rows());\n'
+       '}\n\n'
+       '/* ******************** Bulk DML ******************** */')
+if needle in s:
+    s = s.replace(needle, add, 1)
+    open(p, 'w').write(s)
+    print("    .cc impl inserted")
+else:
+    print("    .cc anchor missing -- skipped (already applied or upstream changed)")
+PY
+else
+    echo "    .cc impl already present -- skipped"
+fi
+
 echo "[replay] done. Verifying file size:"
 wc -l "$SRC"

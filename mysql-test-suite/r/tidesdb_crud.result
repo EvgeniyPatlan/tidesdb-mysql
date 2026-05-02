@@ -16,12 +16,12 @@ born  DATE
 SHOW CREATE TABLE t1;
 Table	Create Table
 t1	CREATE TABLE `t1` (
-  `id` int(11) DEFAULT NULL,
+  `id` int DEFAULT NULL,
   `name` varchar(100) DEFAULT NULL,
   `score` decimal(10,2) DEFAULT NULL,
-  `bio` text DEFAULT NULL,
+  `bio` text,
   `born` date DEFAULT NULL
-) ENGINE=TidesDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 #
 # ============================================
 # TEST 2: INSERT - single row

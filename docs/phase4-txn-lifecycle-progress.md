@@ -64,3 +64,23 @@ smoke-test.sh:                      all phases ✓
 ```
 
 Not the dramatic jump I'd hoped for from this debug session, but the failure modes are now genuinely informative (real test errors, not random crashes), and the diagnostic infrastructure (Debug TidesDB build, gdb in container, symboled linkage) is in place for the next pass.
+
+## Update — TRUNCATE TABLE override (Round 25)
+
+Added `ha_tidesdb::truncate(dd::Table*)` as a one-line delegate to `delete_all_rows()`. MySQL 9.7 split TRUNCATE off into a separate handler hook (MariaDB used `delete_all_rows` for both); without the override, the default returns `HA_ERR_WRONG_COMMAND` → `ER_ILLEGAL_HA`.
+
+Outcome:
+
+```
+test-plugin.sh (hand-rolled):       31 / 31 ✓ (unchanged)
+tidesdb MTR suite (lifted, 52):     28 / 52 ✓ (54%)
+```
+
+Test deltas:
+
+- `tidesdb_crud`        — FAIL → **PASS** (was blocked on TRUNCATE)
+- `tidesdb_drop_create` — still FAIL, now on `CREATE OR REPLACE TABLE` (MariaDB-only DDL syntax — separate gap, not a TRUNCATE issue)
+
+The MTR suite count went 51 → 52 because a previously skipped test entered the active set on this run; pass count went +2 (1 from TRUNCATE, 1 from the freshly running test).
+
+Replay coverage: Round 25 in `scripts/replay-port-edits.sh` regenerates this fix idempotently.

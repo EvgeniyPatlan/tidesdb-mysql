@@ -7019,6 +7019,23 @@ int ha_tidesdb::delete_all_rows(void)
     DBUG_RETURN(0);
 }
 
+/*
+  TRUNCATE TABLE entry point.
+
+  MySQL 9.7 routes TRUNCATE through handler::truncate(dd::Table*); the default
+  returns HA_ERR_WRONG_COMMAND, which surfaces as ER_ILLEGAL_HA. We already do
+  the right work in delete_all_rows() (drop+recreate every CF, reset hidden-PK
+  counter, discard txn buffers), so this is a one-line delegate.
+
+  The dd::Table* arg lets atomic-DDL engines mutate the data-dictionary entry;
+  TidesDB does not yet rely on the DD for table state, so we ignore it.
+*/
+int ha_tidesdb::truncate(dd::Table *table_def [[maybe_unused]])
+{
+    DBUG_ENTER("ha_tidesdb::truncate");
+    DBUG_RETURN(delete_all_rows());
+}
+
 /* ******************** Bulk DML ******************** */
 
 /*
