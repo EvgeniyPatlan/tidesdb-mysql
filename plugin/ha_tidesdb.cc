@@ -2805,6 +2805,81 @@ static int tidesdb_savepoint_release(handlerton *, THD *thd, void *sv)
     return tdb_rc_to_ha(rc, "savepoint_release");
 }
 
+/*
+  2PC prepare phase.
+
+  MySQL's binlog-driven 2PC orders engine prepares and commits around the
+  binlog flush. When binlog is enabled (MTR default), MySQL calls this
+  hook before the binlog write; only after the binlog flush succeeds does
+  it call tidesdb_commit.
+
+  We move the actual TidesDB commit into prepare so that conflict errors
+  surface via HA_ERR_LOCK_DEADLOCK *before* binlog ordering. This avoids
+  the Debug-only assertion at sql/binlog.cc:7756
+  (`thd->commit_error != THD::CE_COMMIT_ERROR`) that fires whenever a
+  commit hook returns non-zero, and lets the user see ER_LOCK_DEADLOCK
+  cleanly -- exactly what the conflict tests expect.
+
+  Risks:
+   * If mysqld dies between prepare-success and commit, the txn is
+     already durable in TidesDB but won't be in the binlog. There is no
+     XA recovery path; this is consistent with the prior "commit at
+     hton commit" behavior on crash and acceptable for this engine.
+   * We don't register commit_by_xid / rollback_by_xid -- TidesDB has no
+     prepare/commit_xid split, and the unrecovered case is the same.
+
+  When prepare runs and succeeds, commit_done is set so the subsequent
+  commit hook is a pure bookkeeping no-op.
+*/
+static int tidesdb_prepare(handlerton *, THD *thd, bool all)
+{
+    tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, tidesdb_hton);
+    if (!trx || !trx->txn) return 0;
+
+    bool is_real_commit =
+        all || !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
+    if (!is_real_commit) return 0;
+
+    /* Read-only txn -- no TidesDB commit needed; let commit hook clean up. */
+    if (!trx->dirty) return 0;
+
+    /* Release any active stmt savepoint before commit (TidesDB requires this). */
+    if (trx->stmt_savepoint_active)
+    {
+        tidesdb_txn_release_savepoint(trx->txn, "stmt");
+        trx->stmt_savepoint_active = false;
+    }
+
+    int rc = tidesdb_txn_commit(trx->txn);
+    if (rc != TDB_SUCCESS)
+    {
+        /* Truly unexpected errors get logged; transient conflicts don't spam. */
+        if (rc != TDB_ERR_CONFLICT && rc != TDB_ERR_LOCKED && rc != TDB_ERR_MEMORY_LIMIT)
+            sql_print_error(
+                "[TIDESDB] hton_prepare: tidesdb_txn_commit returned %d "
+                "(dirty=%d gen=%lu)",
+                rc, trx->dirty, (unsigned long)trx->txn_generation);
+        tidesdb_txn_rollback(trx->txn);
+        tidesdb_txn_free(trx->txn);
+        trx->txn = NULL;
+        trx->txn_generation++;
+        trx->dirty = false;
+        trx->stmt_savepoint_active = false;
+        trx->commit_done = false;
+        row_locks_release_all(trx);
+        /* Surfaces to user as ER_LOCK_DEADLOCK / similar. Because this is
+           prepare (not commit), the binlog assertion does NOT fire. */
+        return tdb_rc_to_ha(rc, "hton_prepare");
+    }
+
+    /* TidesDB-side commit done. Mark so the commit hook skips the actual
+       commit work. The txn handle stays alive for txn_reset reuse. */
+    trx->commit_done = true;
+    trx->txn_generation++;
+    trx->needs_reset = true;
+    return 0;
+}
+
 #if MYSQL_VERSION_ID >= 110800
 static int tidesdb_commit(THD *thd, bool all)
 #else
@@ -2845,6 +2920,17 @@ static int tidesdb_commit(handlerton *, THD *thd, bool all)
         return 0;
     }
 
+    /* If prepare already committed to TidesDB, this is the binlog-ordering
+       commit hook -- pure bookkeeping. */
+    if (trx->commit_done)
+    {
+        trx->commit_done = false;
+        trx->dirty = false;
+        trx->stmt_savepoint_active = false;
+        row_locks_release_all(trx);
+        return 0;
+    }
+
     /* We must release any active statement savepoint before final commit/rollback.
        Savepoints must be explicitly released before txn_commit. */
     if (trx->stmt_savepoint_active)
@@ -2853,20 +2939,16 @@ static int tidesdb_commit(handlerton *, THD *thd, bool all)
         trx->stmt_savepoint_active = false;
     }
 
-    /* Real commit -- flush to storage.
-       After a successful commit, we keep the txn object alive and let
-       get_or_create_trx() call tidesdb_txn_reset() to get a fresh
-       snapshot.  This avoids the expensive free+begin cycle on every
-       autocommit statement (saves malloc/free + internal buffer
-       reallocation).  The bulk-insert path already uses commit+reset
-       successfully, so the pattern is proven safe.
-       If commit fails, fall back to rollback+free. */
+    /* Single-phase path -- no prepare was called (e.g. binlog disabled, or
+       autocommit statement on read-only txn). Do the same work prepare
+       would have done. The Debug-only binlog assertion only fires when
+       2PC is engaged via binlog, so returning the conflict error here is
+       safe in this path. */
     if (trx->dirty)
     {
         int rc = tidesdb_txn_commit(trx->txn);
         if (rc != TDB_SUCCESS)
         {
-            /* Only log truly unexpected errors (not transient conflicts). */
             if (rc != TDB_ERR_CONFLICT && rc != TDB_ERR_LOCKED && rc != TDB_ERR_MEMORY_LIMIT)
                 sql_print_error(
                     "[TIDESDB] hton_commit: tidesdb_txn_commit returned %d "
@@ -2879,15 +2961,8 @@ static int tidesdb_commit(handlerton *, THD *thd, bool all)
             trx->dirty = false;
             trx->stmt_savepoint_active = false;
             row_locks_release_all(trx);
-            /* Phase 4 workaround: return 0 instead of error so MySQL
-             * Debug build does not assert in MYSQL_BIN_LOG::finish_commit.
-             * Phase 5 should implement 2PC and surface the error
-             * properly. The txn IS rolled back here so data correctness
-             * is preserved -- only the user-visible error is hidden. */
-            (void)tdb_rc_to_ha(rc, "hton_commit");
-            return 0;
+            return tdb_rc_to_ha(rc, "hton_commit");
         }
-        /* We keep txn alive for reuse via txn_reset on next use. */
         trx->txn_generation++;
         trx->needs_reset = true;
     }
@@ -2937,6 +3012,11 @@ static int tidesdb_rollback(handlerton *, THD *thd, bool all)
     trx->needs_reset = true;
     trx->dirty = false;
     trx->stmt_savepoint_active = false;
+    /* Edge case: prepare succeeded but binlog flush then failed -> MySQL
+       calls rollback after prepare. The TidesDB txn was already committed,
+       so this rollback is a no-op for the data; just clear the flag so a
+       fresh txn starts clean. */
+    trx->commit_done = false;
     row_locks_release_all(trx);
     return 0;
 }
@@ -3599,6 +3679,7 @@ static int tidesdb_init_func(void *p)
     tidesdb_hton->drop_database = tidesdb_hton_drop_database;
 
     /* Handlerton transaction callbacks -- one TidesDB txn per BEGIN..COMMIT */
+    tidesdb_hton->prepare = tidesdb_prepare;
     tidesdb_hton->commit = tidesdb_commit;
     tidesdb_hton->rollback = tidesdb_rollback;
     tidesdb_hton->close_connection = tidesdb_close_connection;

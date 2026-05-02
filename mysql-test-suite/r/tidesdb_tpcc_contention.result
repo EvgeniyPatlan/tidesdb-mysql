@@ -49,7 +49,7 @@ COMMIT;
 # Both UPDATEs succeeded: 3002 + 2 = 3004
 SELECT d_next_o_id FROM district WHERE d_w_id=1 AND d_id=1;
 d_next_o_id
-3003
+3004
 #
 # === TEST 3: Serial counter increment (10 iterations) ===
 # Verify the counter works correctly when serialized.
@@ -57,7 +57,7 @@ d_next_o_id
 # Should be initial(3004) + 10 = 3014
 SELECT d_next_o_id FROM district WHERE d_w_id=1 AND d_id=1;
 d_next_o_id
-3013
+3014
 #
 # === TEST 4: 4 concurrent autocommit UPDATEs on same row ===
 # With pessimistic_locking=ON, all 4 serialize through the row lock.

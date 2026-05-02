@@ -46,7 +46,7 @@ COMMIT;
 # Both CALL succeeded: 5001 + 1 + 1 = 5003
 SELECT d_next_o_id FROM district WHERE d_w_id=1 AND d_id=1;
 d_next_o_id
-5002
+5003
 #
 # TEST 3: Serial counter increment (10 iterations)
 #

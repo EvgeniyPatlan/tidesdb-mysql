@@ -447,6 +447,11 @@ struct tidesdb_trx_t
     bool stmt_savepoint_active; /* true while a "stmt" savepoint exists */
     bool stmt_was_dirty;        /* true if current stmt had writes */
     bool needs_reset;           /* true after commit/rollback; cleared after txn_reset */
+    bool commit_done;           /* true after prepare did the actual TidesDB commit;
+                                   commit hook then becomes a no-op. Lets us surface
+                                   conflict via HA_ERR_LOCK_DEADLOCK from prepare,
+                                   avoiding the binlog.cc:7756 Debug assertion that
+                                   fires when commit returns non-zero. */
     tidesdb_isolation_level_t isolation_level; /* from first table opened */
     uint64_t txn_generation; /* monotonic counter; incremented each time a new txn is created */
 
