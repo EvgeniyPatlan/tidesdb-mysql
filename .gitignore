@@ -1,0 +1,51 @@
+# Cloned upstreams — populated by scripts/setup-workspace.sh
+vendor/
+
+# MySQL build artifacts
+**/build/
+**/build-static/
+**/CMakeCache.txt
+**/CMakeFiles/
+**/cmake_install.cmake
+**/Makefile
+**/*.o
+**/*.so
+**/*.a
+**/*.dylib
+**/*.dll
+
+# MTR runtime
+mtr-var/
+mtr-tmp/
+
+# Hand-rolled test artifacts
+test-data/
+tidesdb_data/
+tidesdb-prefix/
+
+# Logs
+*.log
+build-plugin.log
+build-tidesdb.log
+
+# Boost (auto-downloaded by MySQL CMake)
+boost/
+
+# Editor / OS junk
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Python (helper scripts may use venvs)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# GDB / coredumps
+core
+core.*
+.gdb_history

@@ -1,0 +1,1 @@
+ERROR 1022 (23000) at line 14: Can't write; duplicate key in table 't1'

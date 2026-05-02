@@ -1,0 +1,22 @@
+-- Phase 4 test 29: failed CREATE TABLE rolls back cleanly.
+-- Triggers a syntactic error AFTER the engine has registered, then verifies
+-- no orphan CF survives.
+
+-- Sanity: no t1 yet
+SHOW TABLES LIKE 't1';
+
+-- This should fail because of a duplicate column name (id appears twice).
+-- The engine may have already created the CF when the SQL layer rejects it;
+-- with HTON_SUPPORTS_ATOMIC_DDL set, the server must call delete_table() to
+-- clean up the half-created CF.
+CREATE TABLE t1 (id INT, id INT) ENGINE=TIDESDB;
+
+-- Confirm no t1 visible at SQL layer.
+SHOW TABLES LIKE 't1';
+
+-- Try again with a clean spec — should succeed.
+CREATE TABLE t1 (id INT PRIMARY KEY) ENGINE=TIDESDB;
+SHOW TABLES LIKE 't1';
+
+-- Cleanup
+DROP TABLE t1;
