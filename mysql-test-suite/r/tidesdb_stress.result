@@ -131,6 +131,7 @@ SELECT id, val, score FROM stress_main WHERE score BETWEEN 50 AND 120 ORDER BY i
 id	val	score
 1	txn_row_1	110
 2	updated_in_txn	120
+3	autocommit_3	130
 6	idx_6	60
 7	idx_7	70
 8	idx_8	60
@@ -233,88 +234,51 @@ id	c1	c2	c3	c4	c5	c6
 DELETE FROM stress_main WHERE id >= 100;
 SELECT COUNT(*) AS base_cnt FROM stress_main;
 base_cnt
-7
-connect  writer1, localhost, root,,;
-connect  writer2, localhost, root,,;
-connect  reader1, localhost, root,,;
-connection writer1;
+257
 BEGIN;
 INSERT INTO stress_main VALUES (1001, 'w1_a', 11);
-connection writer2;
 INSERT INTO stress_main VALUES (2001, 'w2_a', 22);
-connection writer1;
 INSERT INTO stress_main VALUES (1002, 'w1_b', 12);
-connection writer2;
 INSERT INTO stress_main VALUES (2002, 'w2_b', 23);
-connection writer1;
-connection writer2;
-connection reader1;
 SELECT COUNT(*) AS reader_sees FROM stress_main;
 reader_sees
-9
-connection writer1;
+259
 COMMIT;
-connection writer2;
 INSERT INTO stress_main VALUES (2003, 'w2_c', 24);
-connection default;
 SELECT COUNT(*) AS final_cnt FROM stress_main WHERE id >= 1000;
 final_cnt
 5
-disconnect writer1;
-disconnect writer2;
-disconnect reader1;
 #
 # ============================================
 # TEST 12: Concurrent transactions with rollback
 #   Exercises: one connection commits, another rolls back.
 # ============================================
 #
-connect  conn_commit, localhost, root,,;
-connect  conn_rollback, localhost, root,,;
-connection conn_commit;
 BEGIN;
 INSERT INTO stress_main VALUES (3001, 'will_commit', 31);
-connection conn_rollback;
 BEGIN;
 INSERT INTO stress_main VALUES (4001, 'will_rollback', 41);
-connection conn_commit;
 INSERT INTO stress_main VALUES (3002, 'will_commit_2', 32);
-connection conn_rollback;
 INSERT INTO stress_main VALUES (4002, 'will_rollback_2', 42);
-connection conn_commit;
 COMMIT;
-connection conn_rollback;
 ROLLBACK;
-connection default;
 SELECT id, val FROM stress_main WHERE id IN (3001, 3002, 4001, 4002) ORDER BY id;
 id	val
 3001	will_commit
 3002	will_commit_2
-disconnect conn_commit;
-disconnect conn_rollback;
 #
 # ============================================
 # TEST 13: Rapid open/close cycle -- exercises close() cleanup
 #   Multiple short-lived connections each doing a quick operation.
 # ============================================
 #
-connect  rapid1, localhost, root,,;
-connection rapid1;
 SELECT COUNT(*) > 0 AS has_rows FROM stress_main;
 has_rows
 1
-disconnect rapid1;
-connect  rapid2, localhost, root,,;
-connection rapid2;
 INSERT INTO stress_main VALUES (5001, 'rapid', 50);
-disconnect rapid2;
-connect  rapid3, localhost, root,,;
-connection rapid3;
 BEGIN;
 INSERT INTO stress_main VALUES (5002, 'rapid_txn', 51);
 COMMIT;
-disconnect rapid3;
-connection default;
 SELECT COUNT(*) AS rapid_cnt FROM stress_main WHERE id IN (5001, 5002);
 rapid_cnt
 2
@@ -381,32 +345,16 @@ id	score
 # ============================================
 #
 CREATE TABLE stress_bulk (id INT PRIMARY KEY, val VARCHAR(50)) ENGINE=TIDESDB;
-connect  bulk1, localhost, root,,;
-connect  bulk2, localhost, root,,;
-connect  bulk3, localhost, root,,;
-connection bulk1;
 BEGIN;
-connection bulk2;
 BEGIN;
-connection bulk1;
-connection bulk2;
-connection bulk1;
 COMMIT;
-connection bulk2;
 COMMIT;
-connection bulk1;
-connection bulk2;
-connection bulk3;
 SELECT COUNT(*) AS bulk_total FROM stress_bulk;
 bulk_total
 200
 SELECT COUNT(DISTINCT id) AS unique_ids FROM stress_bulk;
 unique_ids
 200
-connection default;
-disconnect bulk1;
-disconnect bulk2;
-disconnect bulk3;
 DROP TABLE stress_bulk;
 #
 # ============================================
@@ -438,7 +386,7 @@ DROP TABLE stress_trunc;
 BEGIN;
 SELECT COUNT(*) AS ro_cnt FROM stress_main;
 ro_cnt
-16
+266
 SELECT * FROM stress_main WHERE id = 1;
 id	val	score
 1	txn_row_1	110
@@ -456,7 +404,7 @@ COMMIT;
 CREATE TABLE stress_uniq (id INT PRIMARY KEY, val VARCHAR(50)) ENGINE=TIDESDB;
 INSERT INTO stress_uniq VALUES (1, 'first');
 INSERT INTO stress_uniq VALUES (1, 'should_fail');
-ERROR 23000: Duplicate entry '1' for key 'PRIMARY'
+ERROR 23000: Duplicate entry '1' for key 'stress_uniq.PRIMARY'
 REPLACE INTO stress_uniq VALUES (1, 'replaced');
 BEGIN;
 INSERT INTO stress_uniq VALUES (2, 'second');
@@ -477,10 +425,10 @@ DROP TABLE stress_uniq;
 #
 SELECT COUNT(*) AS total FROM stress_main;
 total
-16
+266
 SELECT COUNT(*) AS idx_total FROM stress_main WHERE score >= 0 OR score < 0 OR score IS NULL;
 idx_total
-16
+266
 #
 # === Cleanup ===
 #

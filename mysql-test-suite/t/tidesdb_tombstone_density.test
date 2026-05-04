@@ -30,7 +30,7 @@ SELECT LOCATE('=512', CREATE_OPTIONS) > 0 AS min_entries_value
   FROM information_schema.TABLES
   WHERE TABLE_SCHEMA='test' AND TABLE_NAME='t_td';
 
-ALTER TABLE t_td TOMBSTONE_DENSITY_TRIGGER=2000;
+ALTER TABLE t_td ENGINE_ATTRIBUTE='{"tombstone_density_trigger":2000}';
 SELECT LOCATE('=2000', CREATE_OPTIONS) > 0 AS new_value
   FROM information_schema.TABLES
   WHERE TABLE_SCHEMA='test' AND TABLE_NAME='t_td';
@@ -122,13 +122,13 @@ DROP TABLE t_auto;
 --echo #
 
 SELECT IF(VARIABLE_VALUE >= 0, 'ok', 'bad') AS total
-  FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='TIDESDB_TOTAL_TOMBSTONES';
+  FROM performance_schema.global_status WHERE VARIABLE_NAME='TIDESDB_TOTAL_TOMBSTONES';
 SELECT IF(VARIABLE_VALUE >= 0, 'ok', 'bad') AS ratio
-  FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='TIDESDB_TOMBSTONE_RATIO';
+  FROM performance_schema.global_status WHERE VARIABLE_NAME='TIDESDB_TOMBSTONE_RATIO';
 SELECT IF(VARIABLE_VALUE >= 0, 'ok', 'bad') AS density
-  FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='TIDESDB_MAX_SST_TOMBSTONE_DENSITY';
+  FROM performance_schema.global_status WHERE VARIABLE_NAME='TIDESDB_MAX_SST_TOMBSTONE_DENSITY';
 SELECT IF(VARIABLE_VALUE >= 0, 'ok', 'bad') AS density_level
-  FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='TIDESDB_MAX_SST_TOMBSTONE_DENSITY_LEVEL';
+  FROM performance_schema.global_status WHERE VARIABLE_NAME='TIDESDB_MAX_SST_TOMBSTONE_DENSITY_LEVEL';
 
 --source suite/tidesdb/include/cleanup_tidesdb.inc
 --echo # Done.

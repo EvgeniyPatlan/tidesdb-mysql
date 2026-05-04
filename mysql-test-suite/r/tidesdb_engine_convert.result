@@ -18,18 +18,16 @@ id	name	val
 4	delta	4.25
 5	epsilon	5.50
 ALTER TABLE t_innodb ENGINE=TidesDB;
-Warnings:
-Note	1071	Specified key was too long; max key length is 255 bytes
 SHOW CREATE TABLE t_innodb;
 Table	Create Table
 t_innodb	CREATE TABLE `t_innodb` (
-  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `id` int NOT NULL AUTO_INCREMENT,
   `name` varchar(100) DEFAULT NULL,
   `val` decimal(10,2) DEFAULT NULL,
-  `created` datetime DEFAULT current_timestamp(),
+  `created` datetime DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  KEY `idx_name` (`name`(63))
-) ENGINE=TidesDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+  KEY `idx_name` (`name`)
+) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 SELECT id, name, val FROM t_innodb ORDER BY id;
 id	name	val
 1	alpha	1.50

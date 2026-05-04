@@ -4054,6 +4054,7 @@ ha_tidesdb::ha_tidesdb(handlerton *hton, TABLE_SHARE *table_arg)
       cached_skip_unique_(false),
       cached_single_delete_primary_(false),
       cached_thdvars_valid_(false),
+      last_dup_key_no_(MAX_KEY),
       stmt_has_write_lock_(false),
       is_pk_(false),
       scan_iter_last_err_(0),
@@ -5490,6 +5491,7 @@ int ha_tidesdb::write_row(uchar *buf)
         {
             tidesdb_free(dup_val);
             errkey = share->pk_index;
+            last_dup_key_no_ = errkey;  /* preserved for info(HA_STATUS_ERRKEY) */
             memcpy(dup_ref, pk, pk_len);
             tmp_restore_column_map(table->read_set, old_map);
             DBUG_RETURN(HA_ERR_FOUND_DUPP_KEY);
@@ -5564,6 +5566,7 @@ int ha_tidesdb::write_row(uchar *buf)
                     if (dup_pk_len > 0 && dup_pk_len <= ref_length)
                         memcpy(dup_ref, fk + idx_prefix_len, dup_pk_len);
                     errkey = i;
+                    last_dup_key_no_ = errkey;  /* preserved for info(HA_STATUS_ERRKEY) */
                     tmp_restore_column_map(table->read_set, old_map);
                     DBUG_RETURN(HA_ERR_FOUND_DUPP_KEY);
                 }
@@ -5857,6 +5860,16 @@ int ha_tidesdb::index_init(uint idx, bool sorted)
     idx_pk_exact_done_ = false;
     scan_dir_ = DIR_NONE;
     spatial_scan_active_ = false;
+
+    /* Drop any stale ICP state left over from a previous scan on this same
+       handler instance for a different key. If we don't, in_range_check_pushed_down
+       may still be true from the prior scan -- handler::compare_key short-circuits
+       to 0 when it's set, so read_range_next stops enforcing end_range and rows
+       past the upper bound leak through (same shape as the PK push bug, but
+       triggered by handler reuse rather than a cross-key push). */
+    if (pushed_idx_cond_keyno != MAX_KEY && pushed_idx_cond_keyno != idx)
+        cancel_pushed_idx_cond();
+
     /* Cache is_pk for the duration of the scan so navigation methods can
        read a member instead of re-deriving the answer per row. */
     is_pk_ = share->has_user_pk && idx == share->pk_index;
@@ -7507,6 +7520,14 @@ int ha_tidesdb::info(uint flag)
     DBUG_ENTER("ha_tidesdb::info");
 
     if (share) ref_length = share->pk_key_len;
+
+    /* HA_STATUS_ERRKEY -- handler::get_dup_key zeros errkey to (uint)-1 right
+       before this call and expects the engine to populate it from the most
+       recent dup detection. Without this, REPLACE / IODKU bail with
+       ER_DUP_KEY (1022) instead of recovering via delete+insert and surfacing
+       ER_DUP_ENTRY (1062) where appropriate. */
+    if (flag & HA_STATUS_ERRKEY)
+        errkey = last_dup_key_no_;
 
     if ((flag & (HA_STATUS_VARIABLE | HA_STATUS_CONST)) && share && share->cf)
     {

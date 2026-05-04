@@ -74,18 +74,18 @@ id	val
 SHOW CREATE TABLE t_alter;
 Table	Create Table
 t_alter	CREATE TABLE `t_alter` (
-  `id` int(11) NOT NULL,
+  `id` int NOT NULL,
   `val` varchar(100) DEFAULT NULL,
   PRIMARY KEY (`id`)
-) ENGINE=TidesDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
-ALTER TABLE t_alter SYNC_MODE='NONE';
+) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+ALTER TABLE t_alter ENGINE_ATTRIBUTE='{"sync_mode":"NONE"}';
 SHOW CREATE TABLE t_alter;
 Table	Create Table
 t_alter	CREATE TABLE `t_alter` (
-  `id` int(11) NOT NULL,
+  `id` int NOT NULL,
   `val` varchar(100) DEFAULT NULL,
   PRIMARY KEY (`id`)
-) ENGINE=TidesDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci `SYNC_MODE`='NONE'
+) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci /*!80021 ENGINE_ATTRIBUTE='{"sync_mode": "NONE"}' */
 SELECT * FROM t_alter ORDER BY id;
 id	val
 1	before
@@ -111,20 +111,20 @@ ALTER TABLE t_schema ADD COLUMN extra INT DEFAULT 0;
 SHOW CREATE TABLE t_schema;
 Table	Create Table
 t_schema	CREATE TABLE `t_schema` (
-  `id` int(11) NOT NULL,
+  `id` int NOT NULL,
   `val` varchar(50) DEFAULT NULL,
-  `extra` int(11) DEFAULT 0,
+  `extra` int DEFAULT '0',
   PRIMARY KEY (`id`)
-) ENGINE=TidesDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 SELECT * FROM t_schema ORDER BY id;
 id	val	extra
-1	one	NULL
-2	two	NULL
+1	one	0
+2	two	0
 INSERT INTO t_schema VALUES (3, 'three', 99);
 SELECT * FROM t_schema ORDER BY id;
 id	val	extra
-1	one	NULL
-2	two	NULL
+1	one	0
+2	two	0
 3	three	99
 DROP TABLE t_schema;
 #
@@ -141,7 +141,7 @@ INSERT INTO t_altidx VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie');
 SELECT id FROM t_altidx WHERE name = 'bob';
 id
 2
-ALTER TABLE t_altidx SYNC_MODE='NONE';
+ALTER TABLE t_altidx ENGINE_ATTRIBUTE='{"sync_mode":"NONE"}';
 SELECT id FROM t_altidx WHERE name = 'bob';
 id
 2
@@ -193,7 +193,7 @@ val
 row1
 row2
 row3
-ALTER TABLE t_nopk SYNC_MODE='NONE';
+ALTER TABLE t_nopk ENGINE_ATTRIBUTE='{"sync_mode":"NONE"}';
 SELECT * FROM t_nopk;
 val
 row1

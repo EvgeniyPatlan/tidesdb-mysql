@@ -1,5 +1,4 @@
 --source suite/tidesdb/include/have_tidesdb.inc
---source include/have_innodb.inc
 #
 # Test: ALTER TABLE ENGINE conversion (InnoDB <-> TidesDB)
 # Including migration from InnoDB to TidesDB with data preservation

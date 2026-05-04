@@ -568,6 +568,12 @@ class ha_tidesdb : public handler
     bool cached_single_delete_primary_;
     bool cached_thdvars_valid_;
 
+    /* Last duplicate-key index reported from write_row. handler::get_dup_key
+       resets handler::errkey to -1 before calling info(HA_STATUS_ERRKEY); we
+       restore it from this saved copy so REPLACE / INSERT IGNORE / IODKU can
+       identify which key collided. MAX_KEY (= no record). */
+    uint last_dup_key_no_;
+
     /* Write-lock mode -- set when store_lock detects FOR UPDATE / write intent.
        Used to decide whether to acquire row locks in index_read_map. */
     bool stmt_has_write_lock_;

@@ -134,6 +134,9 @@ INSERT INTO t_iodku_idx VALUES (1, 10, 'orig-1'), (2, 20, 'orig-2');
 # IODKU duplicate on PK, changes indexed column k
 INSERT INTO t_iodku_idx VALUES (1, 99, 'new-1')
 ON DUPLICATE KEY UPDATE k = VALUES(k), val = VALUES(val);
+Warnings:
+Warning	1287	'VALUES function' is deprecated and will be removed in a future release. Please use an alias (INSERT INTO ... VALUES (...) AS alias) and replace VALUES(col) in the ON DUPLICATE KEY UPDATE clause with alias.col instead
+Warning	1287	'VALUES function' is deprecated and will be removed in a future release. Please use an alias (INSERT INTO ... VALUES (...) AS alias) and replace VALUES(col) in the ON DUPLICATE KEY UPDATE clause with alias.col instead
 SELECT * FROM t_iodku_idx ORDER BY id;
 id	k	val
 1	99	new-1

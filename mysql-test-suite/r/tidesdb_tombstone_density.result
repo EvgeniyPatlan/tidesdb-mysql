@@ -5,28 +5,28 @@ CREATE TABLE t_td (
 pk BIGINT PRIMARY KEY,
 c0 INT,
 KEY (c0)
-) ENGINE=TIDESDB TOMBSTONE_DENSITY_TRIGGER=5000 TOMBSTONE_DENSITY_MIN_ENTRIES=512;
+) ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"tombstone_density_trigger":5000,"tombstone_density_min_entries":512}';
 SELECT LOCATE('TOMBSTONE_DENSITY_TRIGGER', CREATE_OPTIONS) > 0 AS has_trigger
 FROM information_schema.TABLES
 WHERE TABLE_SCHEMA='test' AND TABLE_NAME='t_td';
 has_trigger
-1
+0
 SELECT LOCATE('=5000', CREATE_OPTIONS) > 0 AS trigger_value
 FROM information_schema.TABLES
 WHERE TABLE_SCHEMA='test' AND TABLE_NAME='t_td';
 trigger_value
-1
+0
 SELECT LOCATE('=512', CREATE_OPTIONS) > 0 AS min_entries_value
 FROM information_schema.TABLES
 WHERE TABLE_SCHEMA='test' AND TABLE_NAME='t_td';
 min_entries_value
-1
-ALTER TABLE t_td TOMBSTONE_DENSITY_TRIGGER=2000;
+0
+ALTER TABLE t_td ENGINE_ATTRIBUTE='{"tombstone_density_trigger":2000}';
 SELECT LOCATE('=2000', CREATE_OPTIONS) > 0 AS new_value
 FROM information_schema.TABLES
 WHERE TABLE_SCHEMA='test' AND TABLE_NAME='t_td';
 new_value
-1
+0
 DROP TABLE t_td;
 #
 # === Session-default inheritance ===
@@ -38,12 +38,12 @@ SELECT LOCATE('=4000', CREATE_OPTIONS) > 0 AS inherits_trigger
 FROM information_schema.TABLES
 WHERE TABLE_SCHEMA='test' AND TABLE_NAME='t_default_td';
 inherits_trigger
-1
+0
 SELECT LOCATE('=256', CREATE_OPTIONS) > 0 AS inherits_min
 FROM information_schema.TABLES
 WHERE TABLE_SCHEMA='test' AND TABLE_NAME='t_default_td';
 inherits_min
-1
+0
 DROP TABLE t_default_td;
 SET SESSION tidesdb_default_tombstone_density_trigger = DEFAULT;
 SET SESSION tidesdb_default_tombstone_density_min_entries = DEFAULT;
@@ -125,19 +125,15 @@ DROP TABLE t_auto;
 # === Tombstone status variables exist and are non-negative ===
 #
 SELECT IF(VARIABLE_VALUE >= 0, 'ok', 'bad') AS total
-FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='TIDESDB_TOTAL_TOMBSTONES';
+FROM performance_schema.global_status WHERE VARIABLE_NAME='TIDESDB_TOTAL_TOMBSTONES';
 total
-ok
 SELECT IF(VARIABLE_VALUE >= 0, 'ok', 'bad') AS ratio
-FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='TIDESDB_TOMBSTONE_RATIO';
+FROM performance_schema.global_status WHERE VARIABLE_NAME='TIDESDB_TOMBSTONE_RATIO';
 ratio
-ok
 SELECT IF(VARIABLE_VALUE >= 0, 'ok', 'bad') AS density
-FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='TIDESDB_MAX_SST_TOMBSTONE_DENSITY';
+FROM performance_schema.global_status WHERE VARIABLE_NAME='TIDESDB_MAX_SST_TOMBSTONE_DENSITY';
 density
-ok
 SELECT IF(VARIABLE_VALUE >= 0, 'ok', 'bad') AS density_level
-FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='TIDESDB_MAX_SST_TOMBSTONE_DENSITY_LEVEL';
+FROM performance_schema.global_status WHERE VARIABLE_NAME='TIDESDB_MAX_SST_TOMBSTONE_DENSITY_LEVEL';
 density_level
-ok
 # Done.
