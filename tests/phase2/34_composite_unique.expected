@@ -1,0 +1,6 @@
++--------+-----+-------+
+| region | sku | label |
++--------+-----+-------+
+| us     |   2 | b     |
++--------+-----+-------+
+ERROR 1062 (23000) at line 25: Duplicate entry 'us-1' for key 't_uq.uk_region_sku'

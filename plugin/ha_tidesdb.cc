@@ -5507,8 +5507,14 @@ int ha_tidesdb::write_row(uchar *buf)
        Cached dup-check iterators avoid the catastrophically expensive
        tidesdb_iter_new() (O(num_sstables) merge-heap construction) on
        every single INSERT.  The iterator per unique index is created
-       once and reused via seek() across rows within the same txn. */
-    if (share->num_secondary_indexes > 0 && !skip_unique)
+       once and reused via seek() across rows within the same txn.
+       Note: skip_unique (which includes pk_auto_generated) is intentionally
+       NOT used here. AUTO_INCREMENT only guarantees PK uniqueness; secondary
+       UNIQUE indexes (e.g., UNIQUE KEY (region, sku) on a table with an
+       independent auto-inc id) still need their own check, otherwise
+       INSERT/REPLACE/INSERT IGNORE silently bypass the constraint. Only the
+       explicit session-level skip_unique_check should bypass this. */
+    if (share->num_secondary_indexes > 0 && !cached_skip_unique_)
     {
         /* trx already cached at top of write_row */
         uint64_t cur_gen = trx ? trx->txn_generation : 0;

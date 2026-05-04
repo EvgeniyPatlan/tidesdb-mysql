@@ -6,12 +6,12 @@
 #   REPO       - repo root (default /work)
 #   DATA       - mysqld data dir (default /tmp/tidesdb-data)
 #   PORT       - tcp port for mysqld (default 3307; --skip-networking by default)
-#   PLUGIN_DIR - default $REPO/vendor/mysql-server/build/plugin_output_directory
+#   PLUGIN_DIR - default $REPO/mysql-server/build/plugin_output_directory
 
 set -uo pipefail
 
 : "${REPO:=/work}"
-: "${BUILD:=$REPO/vendor/mysql-server/build}"
+: "${BUILD:=$REPO/mysql-server/build}"
 : "${MYSQLD:=$BUILD/runtime_output_directory/mysqld}"
 : "${MYSQL:=$BUILD/runtime_output_directory/mysql}"
 : "${PLUGIN_DIR:=$BUILD/plugin_output_directory}"
@@ -46,6 +46,11 @@ mh_kill_prior () {
 
 mh_bootstrap () {
     rm -rf "$DATA"; mkdir -p "$DATA"
+    # TidesDB stores its CFs in $REPO/tidesdb_data/, which is NOT inside the
+    # MySQL datadir; clearing only $DATA leaves stale CFs from prior runs.
+    # Without this, a fresh test that re-creates a table sees existing CF
+    # data and trips false UNIQUE / PK conflicts on the very first INSERT.
+    rm -rf "$REPO/tidesdb_data"
     # NB: --no-defaults must precede --initialize-insecure (it's a meta-option
     # consumed before the initialization options are parsed).
     "$MYSQLD" \

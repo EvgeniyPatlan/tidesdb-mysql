@@ -754,7 +754,14 @@ class ha_tidesdb : public handler
                HA_REQUIRES_KEY_COLUMNS_FOR_DELETE | HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
                HA_ONLINE_ANALYZE | HA_CAN_ONLINE_BACKUPS | HA_CONCURRENT_OPTIMIZE |
                HA_CAN_TABLES_WITHOUT_ROLLBACK | HA_CAN_FULLTEXT | HA_CAN_FULLTEXT_EXT |
-               HA_CAN_GEOMETRY | HA_CAN_RTREEKEYS | HA_CAN_EXPORT;
+               HA_CAN_GEOMETRY | HA_CAN_RTREEKEYS | HA_CAN_EXPORT |
+               /* AUTO_INCREMENT can appear at any position in a composite key
+                  (matches InnoDB; auto-inc value generation runs through
+                  get_auto_increment which uses share->auto_inc_val regardless
+                  of the column's position in the PK). Without this, MySQL
+                  rejects multi-column PKs whose auto-inc isn't the leading
+                  column with ER_WRONG_AUTO_KEY (1075). */
+               HA_AUTO_PART_KEY;
     }
 
     ulong index_flags(uint idx, uint part, bool all_parts) const override;
