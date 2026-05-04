@@ -78,23 +78,26 @@ Server-level system variables: `tidesdb_flush_threads`, `tidesdb_compaction_thre
 
 | Test layer | Result |
 |---|---|
-| `test-plugin.sh` (hand-rolled CRUD, 31 cases)        | **31/31 ✓** |
+| `test-plugin.sh` (hand-rolled CRUD, 33 cases)        | **33/33 ✓** |
 | `test-persistence.sh` (cross-restart durability)     | **PASS** |
 | `smoke-test.sh` (end-to-end pipeline)                | **all phases ✓** |
 | MTR suite lifted from TideSQL (52 tests)             | **47/47 executed pass, 5 skipped** |
 
 What works:
 
-- `INT`, `BIGINT`, `SMALLINT`, `TINYINT`, `VARCHAR`, `CHAR`, `TEXT`, `BLOB`, `DATE`, `DATETIME`, `TIMESTAMP`, `DECIMAL`, `FLOAT`, `DOUBLE`, `ENUM`
-- Primary keys (single-column, integer & string)
-- `INSERT`, `SELECT … WHERE pk = ?`, `UPDATE`, `DELETE`, full table scans, range scans
+- Types: `INT`, `BIGINT`, `SMALLINT`, `TINYINT`, `VARCHAR`, `CHAR`, `TEXT`, `BLOB`, `DATE`, `DATETIME`, `TIMESTAMP`, `DECIMAL`, `FLOAT`, `DOUBLE`, `ENUM`, `JSON`
+- **Primary keys: single-column AND composite** (mixed types, including `AUTO_INCREMENT` as a non-leading column — `PRIMARY KEY (tenant, id)` with `id AUTO_INC` works)
+- `INSERT`, `SELECT … WHERE pk = ?`, `UPDATE`, `DELETE`, full table scans, range scans (PK + secondary)
 - `AUTO_INCREMENT`, `TRUNCATE TABLE`, `REPLACE INTO`, `INSERT … ON DUPLICATE KEY UPDATE`
-- Secondary indexes (single-column) with ICP
+- **Secondary indexes (single-column AND composite)** with ICP; `UNIQUE KEY (a, b)` enforced even on tables with `AUTO_INCREMENT` PK
 - 2-phase commit via `prepare` hook → `ER_LOCK_DEADLOCK` surfaces cleanly to user code
 - Cross-restart persistence
+- `ALTER TABLE x ENGINE=TIDESDB` (engine conversion from InnoDB)
 - Per-table compression (`NONE | SNAPPY | LZ4 | ZSTD | LZ4_FAST`) via `ENGINE_ATTRIBUTE`
 - Bloom filters via `ENGINE_ATTRIBUTE`
 - Per-row TTL, server-level TidesDB tuning system variables, online backup / checkpoint
+- Mixed-engine transactions (TidesDB + InnoDB in the same `BEGIN…COMMIT`)
+- Full-text search, spatial / R-tree indexes, generated columns
 
 Skipped MTR tests (specific feature gaps, each documented inline):
 
@@ -106,7 +109,6 @@ Skipped MTR tests (specific feature gaps, each documented inline):
 
 Not yet, but in-scope for follow-up work:
 
-- **Composite / multi-column primary keys** — encoder is single-column only.
 - **Atomic DDL via SDI** — registered but not exercised; restart-safe DDL is tracked in [phase4-atomic-ddl-investigation.md](docs/phase4-atomic-ddl-investigation.md).
 - **Replication, FK constraints, savepoint nesting** — not in scope yet.
 

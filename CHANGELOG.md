@@ -77,3 +77,39 @@ Test ports (MariaDB grammar / MySQL 8+ schema changes):
 
 Cleanly skipped via `--skip` (5 tests, each with a specific documented gap):
 `tidesdb_vector`, `tidesdb_encryption`, `tidesdb_online_ddl`, `tidesdb_partition`, `tidesdb_pessimistic_insert_lock`.
+
+### Phase 6 — composite primary keys + community Docker image
+
+Two real handler bugs and one test-harness leak gated proper composite-PK use, even though the encoding layer (`make_comparable_key`) had iterated over all `user_defined_key_parts` from the start.
+
+Handler fixes:
+
+- **`AUTO_INCREMENT` rejected as a non-leading PK column.** MySQL's `check_if_table_can_have_primary_key` requires `HA_AUTO_PART_KEY` in `table_flags()` before allowing schemas like `PRIMARY KEY (tenant, id)` with `id AUTO_INC`. Without the flag, MySQL bails with `ER_WRONG_AUTO_KEY (1075)`. Added the flag.
+- **Secondary `UNIQUE` checks silently bypassed on AUTO_INC PK tables.** `write_row` reused the same `skip_unique` flag for both the PK uniqueness check (correctly skipped — autogen IDs are guaranteed unique) and the secondary `UNIQUE` loop (must NOT be skipped — autogen says nothing about secondary uniques). Result: `INSERT/REPLACE/INSERT IGNORE` silently accepted duplicates on `UNIQUE KEY (region, sku)`. Split the conditions.
+
+Test infrastructure:
+
+- `mh_bootstrap` was wiping `$DATA` (MySQL datadir) but not `$REPO/tidesdb_data/` where TidesDB CFs actually live. Same-named tables on consecutive runs inherited stale CF data and tripped false duplicates on the very first INSERT. Now `mh_bootstrap` wipes both.
+
+Tests added:
+
+- `tests/phase2/33_composite_pk_edge.sql` — 3-column composite PK, VARCHAR+DATE composite, `AUTO_INCREMENT` trailing in composite PK, PK column UPDATE (row movement).
+- `tests/phase2/34_composite_unique.sql` — composite UNIQUE KEY enforcement on a table with AUTO_INC PK (regression test for the fix above).
+
+Hand-rolled tally: **31/31 → 33/33**.
+
+### Community Docker image (`docker/Dockerfile.mysql`)
+
+Two-stage build that produces a runnable `tidesdb/mysql:9.7` image — anyone can play with the engine in a single command:
+
+```
+docker build -f docker/Dockerfile.mysql -t tidesdb/mysql:9.7 .
+docker run -d -e MYSQL_ROOT_PASSWORD=secret -p 3306:3306 tidesdb/mysql:9.7
+```
+
+- **Stage 1** (Oracle Linux 9 + `gcc-toolset-14`): builds `libtidesdb.a` and `ha_tidesdb.so` against MySQL 9.7.0 source. OS family matches the runtime image so glibc/libstdc++ ABI is binary-compatible.
+- **Stage 2** (`FROM mysql:9.7`): adds `snappy` (the only runtime dep not already in the base image), drops `ha_tidesdb.so` into `/usr/lib64/mysql/plugin/`, ships an auto-load `tidesdb.cnf` at `/etc/mysql/conf.d/`, and a one-time demo schema in `/docker-entrypoint-initdb.d/`.
+
+`docker/runtime/smoke-test.sh` exercises engine load, CRUD, composite PK + AUTO_INC, composite UNIQUE constraint enforcement, and durability across container restart.
+
+`docker/runtime/docker-compose.yml` provides one-command bring-up with a named volume for data persistence.
