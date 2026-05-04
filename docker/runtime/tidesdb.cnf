@@ -1,0 +1,31 @@
+#
+# TidesDB plugin auto-load.
+#
+# Loaded on every mysqld start so the engine is always available, even
+# after a container restart. The plugin .so lives at
+# /usr/lib64/mysql/plugin/ha_tidesdb.so (installed by Dockerfile.mysql).
+#
+# Override individual TidesDB settings here or via -e MYSQL_<var>= when
+# starting the container.
+#
+[mysqld]
+plugin-load-add = ha_tidesdb.so
+
+# Keep TidesDB's column-family data inside the MySQL datadir so it gets
+# the same volume / permissions / backups treatment as InnoDB tables.
+# (Default would be /var/lib/tidesdb_data, which the mysql user can't
+# write to in the official mysql:9.7 image.)
+#
+# `loose_` prefix: this variable is plugin-defined, so it's unknown during
+# the initial mysqld --initialize-insecure step (which runs before any
+# plugin loads). Without `loose_`, that step would abort with
+# "unknown variable". `loose_` makes mysqld warn-and-continue.
+loose_tidesdb_data_home_dir = /var/lib/mysql/tidesdb_data/
+
+# Optional defaults you may want to tune. Uncomment / set as you like.
+#tidesdb_default_compression       = LZ4
+#tidesdb_default_sync_mode         = INTERVAL
+#tidesdb_block_cache_size          = 1073741824   # 1 GiB
+#tidesdb_max_open_sstables         = 512
+#tidesdb_compaction_threads        = 4
+#tidesdb_flush_threads             = 2

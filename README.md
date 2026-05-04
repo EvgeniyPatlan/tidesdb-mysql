@@ -6,15 +6,43 @@ A **MySQL 9.7 storage engine plugin** that uses [TidesDB](https://github.com/tid
 
 This is a port of [TideSQL](https://github.com/tidesdb/tidesql) (TidesDB + MariaDB) to MySQL 9.7. Despite the family resemblance, MariaDB and MySQL have diverged enough at the handler API and data-dictionary layers that this is a rewrite-by-replay rather than a drop-in.
 
-## Quick start
+## Quick start (Docker — recommended for trying it out)
 
-Requires Docker (the build runs inside `tides-builder`, an Ubuntu 24.04 image with the MySQL+TidesDB toolchain pre-installed).
+The fastest way to play with it: build a runnable `mysql:9.7` image with the plugin baked in.
 
 ```bash
-git clone https://github.com/<you>/tidesdb-mysql.git
+git clone https://github.com/EvgeniyPatlan/tidesdb-mysql.git
 cd tidesdb-mysql
+
+# Build the image (cold: ~25-40 min — clones MySQL source, compiles the plugin
+# on Oracle Linux 9 to match the official mysql:9.7 image's libstdc++ ABI).
+docker build -f docker/Dockerfile.mysql -t tidesdb/mysql:9.7 .
+
+# Run.
+docker run -d --name tidesdb \
+  -e MYSQL_ROOT_PASSWORD=secret \
+  -p 3306:3306 \
+  tidesdb/mysql:9.7
+
+# Verify the engine is available.
+docker exec tidesdb mysql -uroot -psecret -e "SHOW ENGINES;" | grep -i tidesdb
+# Expected: TIDESDB  YES  TidesDB ...
+
+# Connect and try the demo schema.
+docker exec -it tidesdb mysql -uroot -psecret tidesdb_demo
+# mysql> SELECT * FROM kv;
+# mysql> SELECT * FROM metrics ORDER BY ts DESC LIMIT 5;
+```
+
+`docker compose -f docker/runtime/docker-compose.yml up -d` works too if you'd rather use compose.
+
+## Building from source
+
+If you want to develop the plugin (run tests, edit code, rebuild fast):
+
+```bash
 ./scripts/build-all.sh        # ~30 min cold (clones MySQL, builds plugin)
-./scripts/test-plugin.sh      # 31/31 hand-rolled tests
+./scripts/test-plugin.sh      # 33/33 hand-rolled tests
 ```
 
 `build-all.sh` runs three steps:

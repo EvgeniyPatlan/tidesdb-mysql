@@ -1,0 +1,42 @@
+# Quickstart compose file for the runnable TidesDB-MySQL image.
+#
+# Build (first time, ~25-40 min):
+#   docker compose -f docker/runtime/docker-compose.yml build
+#
+# Run:
+#   docker compose -f docker/runtime/docker-compose.yml up -d
+#
+# Connect:
+#   docker compose -f docker/runtime/docker-compose.yml exec mysql \
+#     mysql -uroot -psecret -e "SHOW ENGINES;"
+#
+# Tear down (keeps data volume):
+#   docker compose -f docker/runtime/docker-compose.yml down
+#
+# Tear down & wipe data:
+#   docker compose -f docker/runtime/docker-compose.yml down -v
+
+services:
+  mysql:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.mysql
+    image: tidesdb/mysql:9.7
+    container_name: tidesdb-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: secret
+      MYSQL_DATABASE: demo
+    ports:
+      - "3306:3306"
+    volumes:
+      - tidesdb-data:/var/lib/mysql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-uroot", "-psecret"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  tidesdb-data:

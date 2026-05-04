@@ -1,0 +1,156 @@
+# syntax=docker/dockerfile:1.6
+
+###############################################################################
+#  TidesDB storage engine for MySQL 9.7 — runnable image
+#
+#  Multi-stage build:
+#    Stage 1 (builder): Oracle Linux 9 -- matches the OS family of the
+#                        official mysql:9.7 image so the plugin .so we
+#                        produce links against the same glibc / libstdc++.
+#    Stage 2 (runtime): mysql:9.7 with ha_tidesdb.so dropped into the
+#                        plugin directory and auto-loaded on every start.
+#
+#  Build:
+#    docker build -f docker/Dockerfile.mysql -t tidesdb/mysql:9.7 .
+#
+#  Run:
+#    docker run -d --name tidesdb \
+#      -e MYSQL_ROOT_PASSWORD=secret \
+#      -p 3306:3306 \
+#      tidesdb/mysql:9.7
+#
+#  Connect:
+#    docker exec -it tidesdb mysql -uroot -psecret \
+#      -e "SHOW ENGINES;"            # TIDESDB should appear
+#
+#    docker exec -it tidesdb mysql -uroot -psecret <<SQL
+#      CREATE DATABASE demo;
+#      USE demo;
+#      CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(64)) ENGINE=TIDESDB;
+#      INSERT INTO t VALUES (1, 'hello'), (2, 'world');
+#      SELECT * FROM t;
+#    SQL
+#
+#  First build is slow (~25-40 min) because Stage 1 builds the relevant
+#  pieces of MySQL 9.7 from source (the plugin needs the matching SDK).
+#  Subsequent rebuilds with --build-arg cache reuse take a few minutes.
+###############################################################################
+
+
+###############################################################################
+# Stage 1: builder
+###############################################################################
+FROM oraclelinux:9 AS builder
+
+# Pin sources for reproducibility; bump when the engine is known-compatible.
+ARG MYSQL_TAG=mysql-9.7.0
+ARG TIDESDB_TAG=v9.2.0
+
+# Build dependencies. MySQL 9.7 requires GCC 14, which OL9 ships only as
+# the gcc-toolset-14 SCL; the default GCC is 11. Other -devel packages
+# come from base + ol9_codeready_builder + EPEL.
+RUN dnf -y install --setopt=install_weak_deps=False \
+        oracle-epel-release-el9 oraclelinux-developer-release-el9 && \
+    dnf -y config-manager --enable ol9_codeready_builder && \
+    dnf -y install --setopt=install_weak_deps=False \
+        gcc-toolset-14-gcc gcc-toolset-14-gcc-c++ gcc-toolset-14-binutils \
+        gcc-toolset-14-annobin-annocheck gcc-toolset-14-annobin-plugin-gcc \
+        make cmake ninja-build bison git pkgconf-pkg-config \
+        diffutils tar which patch findutils \
+        openssl-devel ncurses-devel readline-devel \
+        libtirpc-devel libcurl-devel \
+        libzstd-devel lz4-devel snappy-devel && \
+    dnf clean all
+
+# Activate gcc-toolset-14 for every subsequent RUN. SCLs are normally
+# enabled by `scl enable`, but we just point CC/CXX at the toolset's
+# binaries directly + extend PATH so cmake's compiler probe finds them.
+ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:$PATH \
+    CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc \
+    CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++
+
+WORKDIR /build
+
+# 1) Clone MySQL Server source (shallow, ~1 GB).
+RUN git clone --depth=1 --branch ${MYSQL_TAG} \
+        https://github.com/mysql/mysql-server.git mysql-server
+
+# 2) Clone TidesDB and build its static archive (PIC so it can link into a .so).
+RUN git clone --depth=1 --branch ${TIDESDB_TAG} \
+        https://github.com/tidesdb/tidesdb.git tidesdb && \
+    cd tidesdb && \
+    cmake -S . -B build-static \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_SHARED_LIBS=OFF \
+          -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+          -DTIDESDB_BUILD_TESTS=OFF \
+          -DTIDESDB_BUILD_BENCHMARK=OFF && \
+    cmake --build build-static -j"$(nproc)" && \
+    cmake --install build-static --prefix /build/tidesdb-prefix
+
+# 3) Drop our plugin source into the MySQL tree.
+COPY plugin/ /build/mysql-server/storage/tidesdb/
+
+# 4) Configure MySQL just enough to build the plugin target. The MySQL
+#    convenience libs (mysys, strings, ...) are pulled in transitively;
+#    everything else (auth plugins, ndb, federated, etc.) is disabled to
+#    keep the build short.
+RUN cd mysql-server && \
+    TIDESDB_ROOT=/build/tidesdb-prefix \
+    cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DDOWNLOAD_BOOST=1 \
+          -DWITH_BOOST=/build/boost \
+          -DWITH_UNIT_TESTS=OFF \
+          -DCMAKE_PREFIX_PATH=/build/tidesdb-prefix \
+          -DPLUGIN_ROCKSDB=NO \
+          -DPLUGIN_NDB=NO \
+          -DPLUGIN_FEDERATED=NO \
+          -DPLUGIN_ARCHIVE=NO \
+          -DPLUGIN_BLACKHOLE=NO \
+          -DPLUGIN_EXAMPLE=NO \
+          -DPLUGIN_GROUP_REPLICATION=NO \
+          -DWITH_GROUP_REPLICATION=OFF \
+          -DWITH_AUTHENTICATION_LDAP=OFF \
+          -DWITH_AUTHENTICATION_KERBEROS=OFF \
+          -DWITH_AUTHENTICATION_FIDO=OFF \
+          -DWITH_AUTHENTICATION_WEBAUTHN=OFF
+
+RUN cd mysql-server && \
+    TIDESDB_ROOT=/build/tidesdb-prefix \
+    cmake --build build --target tidesdb -j"$(nproc)"
+
+# Verify the .so exists where we expect it.
+RUN ls -la /build/mysql-server/build/plugin_output_directory/ha_tidesdb.so
+
+
+###############################################################################
+# Stage 2: runtime — official mysql:9.7 with ha_tidesdb.so installed
+###############################################################################
+FROM mysql:9.7
+
+LABEL org.opencontainers.image.title="MySQL 9.7 + TidesDB"
+LABEL org.opencontainers.image.description="MySQL 9.7 LTS with the TidesDB LSM-tree storage engine plugin"
+LABEL org.opencontainers.image.source="https://github.com/EvgeniyPatlan/tidesdb-mysql"
+LABEL org.opencontainers.image.licenses="GPL-2.0-only"
+
+# Runtime shared libs the plugin links against. zstd / lz4 are already in
+# the official mysql:9.7 image; snappy is not, so add it.
+USER root
+RUN microdnf install -y --setopt=install_weak_deps=0 snappy && microdnf clean all
+
+# Plugin .so goes where mysqld looks for plugins on this image.
+COPY --from=builder \
+     /build/mysql-server/build/plugin_output_directory/ha_tidesdb.so \
+     /usr/lib64/mysql/plugin/ha_tidesdb.so
+
+# Auto-load the plugin on every start (no manual INSTALL PLUGIN needed).
+# /etc/my.cnf on this image does `!includedir /etc/mysql/conf.d/`.
+COPY docker/runtime/tidesdb.cnf /etc/mysql/conf.d/tidesdb.cnf
+
+# First-boot demo schema. The mysql image runs anything in
+# /docker-entrypoint-initdb.d/ exactly once when the data dir is empty.
+COPY docker/runtime/00-tidesdb-welcome.sql /docker-entrypoint-initdb.d/00-tidesdb-welcome.sql
+
+# Drop back to the image's default user.
+USER mysql

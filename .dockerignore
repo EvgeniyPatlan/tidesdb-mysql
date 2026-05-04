@@ -1,0 +1,29 @@
+# Keep the Docker build context small. Only files actually needed by
+# docker/Dockerfile.mysql should be sent to the daemon.
+
+# Cloned upstreams (Dockerfile clones its own copies)
+vendor/
+
+# Build outputs
+**/build/
+**/build-static/
+
+# MTR runtime
+mtr-var/
+mtr-tmp/
+
+# Hand-rolled test data
+test-data/
+tidesdb_data/
+tidesdb-prefix/
+
+# Logs
+*.log
+
+# Editor / OS junk
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+.git/
