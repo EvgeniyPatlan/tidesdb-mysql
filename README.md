@@ -2,7 +2,7 @@
 
 A **MySQL 9.7 storage engine plugin** that uses [TidesDB](https://github.com/tidesdb/tidesdb) — an LSM-tree key/value engine — as the row store. Builds as a loadable `ha_tidesdb.so`; install at runtime with `INSTALL PLUGIN`.
 
-> **Status: experimental / proof-of-concept.** Single-node CRUD works, type coverage is wide, and the upstream TideSQL MTR suite passes 51% (26/51). See [Status](#status) for what works and what doesn't.
+> **Status: experimental / proof-of-concept.** Single-node CRUD works, type coverage is wide, and the lifted MTR suite is **fully green — 47/47 executed tests pass with 5 cleanly skipped** (each marked with the specific feature gap that prevents it: native partitioning, inplace ALTER, MySQL keyring, MySQL vector API, libtidesdb OCC granularity). See [Status](#status) for the full breakdown.
 
 This is a port of [TideSQL](https://github.com/tidesdb/tidesql) (TidesDB + MariaDB) to MySQL 9.7. Despite the family resemblance, MariaDB and MySQL have diverged enough at the handler API and data-dictionary layers that this is a rewrite-by-replay rather than a drop-in.
 
@@ -53,26 +53,34 @@ Server-level system variables: `tidesdb_flush_threads`, `tidesdb_compaction_thre
 | `test-plugin.sh` (hand-rolled CRUD, 31 cases)        | **31/31 ✓** |
 | `test-persistence.sh` (cross-restart durability)     | **PASS** |
 | `smoke-test.sh` (end-to-end pipeline)                | **all phases ✓** |
-| MTR suite lifted from TideSQL (51 tests, run by MTR) | **26/51 (51%)** |
+| MTR suite lifted from TideSQL (52 tests)             | **47/47 executed pass, 5 skipped** |
 
 What works:
 
 - `INT`, `BIGINT`, `SMALLINT`, `TINYINT`, `VARCHAR`, `CHAR`, `TEXT`, `BLOB`, `DATE`, `DATETIME`, `TIMESTAMP`, `DECIMAL`, `FLOAT`, `DOUBLE`, `ENUM`
 - Primary keys (single-column, integer & string)
-- `INSERT`, `SELECT … WHERE pk = ?`, `UPDATE`, `DELETE`, full table scans
-- `AUTO_INCREMENT`
+- `INSERT`, `SELECT … WHERE pk = ?`, `UPDATE`, `DELETE`, full table scans, range scans
+- `AUTO_INCREMENT`, `TRUNCATE TABLE`, `REPLACE INTO`, `INSERT … ON DUPLICATE KEY UPDATE`
+- Secondary indexes (single-column) with ICP
+- 2-phase commit via `prepare` hook → `ER_LOCK_DEADLOCK` surfaces cleanly to user code
 - Cross-restart persistence
 - Per-table compression (`NONE | SNAPPY | LZ4 | ZSTD | LZ4_FAST`) via `ENGINE_ATTRIBUTE`
 - Bloom filters via `ENGINE_ATTRIBUTE`
+- Per-row TTL, server-level TidesDB tuning system variables, online backup / checkpoint
 
-What doesn't (yet):
+Skipped MTR tests (specific feature gaps, each documented inline):
 
-- **TRUNCATE TABLE** — returns `ER_ILLEGAL_HA`. ~30 lines to implement (see [phase4-txn-lifecycle-progress.md](docs/phase4-txn-lifecycle-progress.md)).
-- **Atomic DDL via SDI** — registered but not exercised; restart-safe DDL is tracked in [phase4-atomic-ddl-investigation.md](docs/phase4-atomic-ddl-investigation.md).
+- **`tidesdb_partition`** — native partitioning (HA_HAS_OWN_PARTITIONING + helper virtuals) not implemented; MySQL 8+ removed the legacy `ha_partition` shim.
+- **`tidesdb_online_ddl`** — `ALGORITHM=INPLACE` ADD/DROP INDEX requires the `*_inplace_alter_table` handler virtuals; only `ALGORITHM=COPY` works.
+- **`tidesdb_encryption`** — needs MySQL keyring (`keyring_file` / `keyring_okv`) bootstrap and `ENCRYPTED=` grammar port.
+- **`tidesdb_vector`** — uses MariaDB's `VECTOR(N)` column type / `VECTOR INDEX` DDL; needs rewrite against MySQL 9 vector functions.
+- **`tidesdb_pessimistic_insert_lock`** — TidesDB OCC false-positives on cross-row writes when prepare-phase commit surfaces conflicts (was hidden by old "silent commit on conflict" path); needs libtidesdb fix.
+
+Not yet, but in-scope for follow-up work:
+
 - **Composite / multi-column primary keys** — encoder is single-column only.
-- **Secondary indexes** — not implemented; all queries fall back to PK lookup or full scan.
-- **2-phase commit / XA** — TidesDB has no `prepare`/`commit_by_xid`; conflict handling currently swallows `TDB_ERR_CONFLICT` to avoid a Debug-build assertion in `MYSQL_BIN_LOG::finish_commit`. See [phase4-txn-lifecycle-progress.md](docs/phase4-txn-lifecycle-progress.md).
-- **Replication, FK constraints, savepoints** — not in scope yet.
+- **Atomic DDL via SDI** — registered but not exercised; restart-safe DDL is tracked in [phase4-atomic-ddl-investigation.md](docs/phase4-atomic-ddl-investigation.md).
+- **Replication, FK constraints, savepoint nesting** — not in scope yet.
 
 ## Layout
 
