@@ -8936,48 +8936,58 @@ THR_LOCK_DATA **ha_tidesdb::store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lo
   COPY        column type changes, PK changes
 */
 enum_alter_inplace_result ha_tidesdb::check_if_supported_inplace_alter(
-    TABLE *altered_table, Alter_inplace_info *ha_alter_info)
+    TABLE *altered_table [[maybe_unused]], Alter_inplace_info *ha_alter_info)
 {
     DBUG_ENTER("ha_tidesdb::check_if_supported_inplace_alter");
 
-    alter_table_operations flags = ha_alter_info->handler_flags;
+    Alter_inplace_info::HA_ALTER_FLAGS flags = ha_alter_info->handler_flags;
 
-    /* Operations that are pure metadata (INSTANT).
-       ADD/DROP COLUMN is instant because the packed row format includes
-       a header with the stored null_bytes and field_count, so
-       deserialize_row adapts to rows written with any prior schema. */
-    static const alter_table_operations TIDESDB_INSTANT =
-        Alter_inplace_info::ALTER_COLUMN_NAME | ALTER_RENAME_COLUMN | ALTER_CHANGE_COLUMN_DEFAULT |
-        Alter_inplace_info::ALTER_COLUMN_DEFAULT | ALTER_COLUMN_OPTION | ALTER_CHANGE_CREATE_OPTION |
-        ALTER_DROP_CHECK_CONSTRAINT | Alter_inplace_info::ALTER_VIRTUAL_GCOL_EXPR | Alter_inplace_info::ALTER_RENAME | ALTER_RENAME_INDEX |
-        ALTER_INDEX_IGNORABILITY | ALTER_ADD_COLUMN | ALTER_DROP_COLUMN |
-        Alter_inplace_info::ALTER_STORED_COLUMN_ORDER | Alter_inplace_info::ALTER_VIRTUAL_COLUMN_ORDER;
+    /* Pure-metadata operations -- INSTANT (no data rewrite, no index work).
+       Note: ADD/DROP COLUMN is intentionally NOT here. While our row format
+       carries field_count and deserialize_row can fill missing trailing
+       columns from default_values, the path doesn't currently round-trip
+       cleanly across DEFAULT + UPDATE + DROP COLUMN sequences (see hand-
+       rolled test 31_alter_add_drop_column). Falling back to ALGORITHM=COPY
+       guarantees correct rewrite. INSTANT here is reserved for changes that
+       genuinely don't touch row bytes. */
+    static const Alter_inplace_info::HA_ALTER_FLAGS TIDESDB_INSTANT =
+        Alter_inplace_info::ALTER_COLUMN_NAME |
+        Alter_inplace_info::ALTER_COLUMN_DEFAULT |
+        Alter_inplace_info::CHANGE_CREATE_OPTION |
+        Alter_inplace_info::DROP_CHECK_CONSTRAINT |
+        Alter_inplace_info::ALTER_VIRTUAL_GCOL_EXPR |
+        Alter_inplace_info::ALTER_RENAME |
+        Alter_inplace_info::RENAME_INDEX |
+        Alter_inplace_info::CHANGE_INDEX_OPTION;
 
-    /* Operations we can do inplace (add/drop secondary indexes) */
-    static const alter_table_operations TIDESDB_INPLACE_INDEX =
-        ALTER_ADD_NON_UNIQUE_NON_PRIM_INDEX | ALTER_DROP_NON_UNIQUE_NON_PRIM_INDEX |
-        ALTER_ADD_UNIQUE_INDEX | ALTER_DROP_UNIQUE_INDEX | ALTER_ADD_INDEX | ALTER_DROP_INDEX |
-        ALTER_INDEX_ORDER;
+    /* Operations we can do inplace (add/drop secondary indexes). */
+    static const Alter_inplace_info::HA_ALTER_FLAGS TIDESDB_INPLACE_INDEX =
+        Alter_inplace_info::ADD_INDEX |
+        Alter_inplace_info::DROP_INDEX |
+        Alter_inplace_info::ADD_UNIQUE_INDEX |
+        Alter_inplace_info::DROP_UNIQUE_INDEX |
+        Alter_inplace_info::ADD_SPATIAL_INDEX;
 
-    /* If only instant operations, return INSTANT */
-    if (!(flags & ~TIDESDB_INSTANT)) DBUG_RETURN(HA_ALTER_INPLACE_INSTANT);
+    /* Pure-INSTANT (data-dictionary update only) */
+    if (!(flags & ~TIDESDB_INSTANT))
+        DBUG_RETURN(HA_ALTER_INPLACE_INSTANT);
 
-    /* If only instant + index operations, return INPLACE with no lock.
-       TidesDB handles all concurrency via MVCC internally -- the index
-       population scan runs inside its own transaction and does not need
-       server-level MDL blocking. */
+    /* INSTANT + secondary-index changes -- INPLACE with shared lock.
+       Concurrent reads OK; concurrent writes blocked while the index
+       population scan runs. PK changes still require ALGORITHM=COPY. */
     if (!(flags & ~(TIDESDB_INSTANT | TIDESDB_INPLACE_INDEX)))
     {
-        /**** Changing PK requires full rebuild */
-        if (flags & (ALTER_ADD_PK_INDEX | ALTER_DROP_PK_INDEX))
+        if (flags & (Alter_inplace_info::ADD_PK_INDEX |
+                     Alter_inplace_info::DROP_PK_INDEX))
         {
-            ha_alter_info->unsupported_reason = "TidesDB cannot change PRIMARY KEY inplace";
+            ha_alter_info->unsupported_reason =
+                "TidesDB cannot change PRIMARY KEY inplace";
             DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
         }
-        DBUG_RETURN(HA_ALTER_INPLACE_NO_LOCK);
+        DBUG_RETURN(HA_ALTER_INPLACE_SHARED_LOCK);
     }
 
-    /* Everything else requires COPY */
+    /* Everything else falls back to ALGORITHM=COPY. */
     DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
 }
 
@@ -8985,8 +8995,11 @@ enum_alter_inplace_result ha_tidesdb::check_if_supported_inplace_alter(
   Create CFs for newly added indexes.
   Called with shared MDL lock (concurrent DML is allowed).
 */
-bool ha_tidesdb::prepare_inplace_alter_table(TABLE *altered_table,
-                                             Alter_inplace_info *ha_alter_info) /* MariaDB-only override removed */
+bool ha_tidesdb::prepare_inplace_alter_table(
+    TABLE *altered_table,
+    Alter_inplace_info *ha_alter_info,
+    const dd::Table *old_table_def [[maybe_unused]],
+    dd::Table *new_table_def [[maybe_unused]])
 {
     DBUG_ENTER("ha_tidesdb::prepare_inplace_alter_table");
 
@@ -9075,7 +9088,11 @@ bool ha_tidesdb::prepare_inplace_alter_table(TABLE *altered_table,
   Inplace phase -- we populate newly added indexes by scanning the table.
   Called with no MDL lock blocking (HA_ALTER_INPLACE_NO_LOCK).
 */
-bool ha_tidesdb::inplace_alter_table(TABLE *altered_table, Alter_inplace_info *ha_alter_info) /* MariaDB-only override removed */
+bool ha_tidesdb::inplace_alter_table(
+    TABLE *altered_table,
+    Alter_inplace_info *ha_alter_info,
+    const dd::Table *old_table_def [[maybe_unused]],
+    dd::Table *new_table_def [[maybe_unused]])
 {
     DBUG_ENTER("ha_tidesdb::inplace_alter_table");
 
@@ -9351,8 +9368,12 @@ bool ha_tidesdb::inplace_alter_table(TABLE *altered_table, Alter_inplace_info *h
   On commit       drop old index CFs, update share->idx_cfs for new table shape.
   On rollback     drop newly created CFs.
 */
-bool ha_tidesdb::commit_inplace_alter_table(TABLE *altered_table, Alter_inplace_info *ha_alter_info,
-                                            bool commit) /* MariaDB-only override removed */
+bool ha_tidesdb::commit_inplace_alter_table(
+    TABLE *altered_table,
+    Alter_inplace_info *ha_alter_info,
+    bool commit,
+    const dd::Table *old_table_def [[maybe_unused]],
+    dd::Table *new_table_def [[maybe_unused]])
 {
     DBUG_ENTER("ha_tidesdb::commit_inplace_alter_table");
 

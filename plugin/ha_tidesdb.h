@@ -939,16 +939,26 @@ class ha_tidesdb : public handler
     int external_lock(THD *thd, int lock_type) override;
     THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lock_type lock_type) override;
 
-    /* Online DDL -- inplace alter family. MySQL's signatures differ enough
-     * (extra dd::Table* params) that we drop the override marker and leave
-     * these as engine-internal helpers. Phase 4 work to wire MySQL's atomic
-     * DDL path to TidesDB's inplace machinery. */
+    /* Online DDL -- inplace ALTER family. MySQL's prepare/inplace/commit
+       virtuals carry `const dd::Table* old_table_def, dd::Table* new_table_def`
+       parameters (atomic-DDL data-dictionary integration); restore those and
+       re-add `override` so MySQL routes ALGORITHM=INPLACE through us. We
+       support ADD/DROP/RENAME secondary indexes inplace; everything else
+       falls back to ALGORITHM=COPY via HA_ALTER_INPLACE_NOT_SUPPORTED. */
     enum_alter_inplace_result check_if_supported_inplace_alter(
-        TABLE *altered_table, Alter_inplace_info *ha_alter_info);
+        TABLE *altered_table, Alter_inplace_info *ha_alter_info) override;
     bool prepare_inplace_alter_table(TABLE *altered_table,
-                                     Alter_inplace_info *ha_alter_info);
-    bool inplace_alter_table(TABLE *altered_table, Alter_inplace_info *ha_alter_info);
-    bool commit_inplace_alter_table(TABLE *altered_table, Alter_inplace_info *ha_alter_info,
-                                    bool commit);
+                                     Alter_inplace_info *ha_alter_info,
+                                     const dd::Table *old_table_def,
+                                     dd::Table *new_table_def) override;
+    bool inplace_alter_table(TABLE *altered_table,
+                             Alter_inplace_info *ha_alter_info,
+                             const dd::Table *old_table_def,
+                             dd::Table *new_table_def) override;
+    bool commit_inplace_alter_table(TABLE *altered_table,
+                                    Alter_inplace_info *ha_alter_info,
+                                    bool commit,
+                                    const dd::Table *old_table_def,
+                                    dd::Table *new_table_def) override;
     bool check_if_incompatible_data(HA_CREATE_INFO *create_info, uint table_changes) override;
 };

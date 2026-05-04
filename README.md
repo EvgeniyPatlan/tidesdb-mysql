@@ -78,10 +78,10 @@ Server-level system variables: `tidesdb_flush_threads`, `tidesdb_compaction_thre
 
 | Test layer | Result |
 |---|---|
-| `test-plugin.sh` (hand-rolled CRUD, 33 cases)        | **33/33 ✓** |
+| `test-plugin.sh` (hand-rolled CRUD, 34 cases)        | **34/34 ✓** |
 | `test-persistence.sh` (cross-restart durability)     | **PASS** |
 | `smoke-test.sh` (end-to-end pipeline)                | **all phases ✓** |
-| MTR suite lifted from TideSQL (52 tests)             | **47/47 executed pass, 5 skipped** |
+| MTR suite lifted from TideSQL (52 tests)             | **48/48 executed pass, 4 skipped** |
 
 What works:
 
@@ -90,6 +90,7 @@ What works:
 - `INSERT`, `SELECT … WHERE pk = ?`, `UPDATE`, `DELETE`, full table scans, range scans (PK + secondary)
 - `AUTO_INCREMENT`, `TRUNCATE TABLE`, `REPLACE INTO`, `INSERT … ON DUPLICATE KEY UPDATE`
 - **Secondary indexes (single-column AND composite)** with ICP; `UNIQUE KEY (a, b)` enforced even on tables with `AUTO_INCREMENT` PK
+- **Online DDL: `ALTER TABLE … ADD/DROP INDEX, ALGORITHM=INPLACE`** (concurrent reads OK; writes blocked while index populates)
 - 2-phase commit via `prepare` hook → `ER_LOCK_DEADLOCK` surfaces cleanly to user code
 - Cross-restart persistence
 - `ALTER TABLE x ENGINE=TIDESDB` (engine conversion from InnoDB)
@@ -102,13 +103,13 @@ What works:
 Skipped MTR tests (specific feature gaps, each documented inline):
 
 - **`tidesdb_partition`** — native partitioning (HA_HAS_OWN_PARTITIONING + helper virtuals) not implemented; MySQL 8+ removed the legacy `ha_partition` shim.
-- **`tidesdb_online_ddl`** — `ALGORITHM=INPLACE` ADD/DROP INDEX requires the `*_inplace_alter_table` handler virtuals; only `ALGORITHM=COPY` works.
 - **`tidesdb_encryption`** — needs MySQL keyring (`keyring_file` / `keyring_okv`) bootstrap and `ENCRYPTED=` grammar port.
 - **`tidesdb_vector`** — uses MariaDB's `VECTOR(N)` column type / `VECTOR INDEX` DDL; needs rewrite against MySQL 9 vector functions.
 - **`tidesdb_pessimistic_insert_lock`** — TidesDB OCC false-positives on cross-row writes when prepare-phase commit surfaces conflicts (was hidden by old "silent commit on conflict" path); needs libtidesdb fix.
 
 Not yet, but in-scope for follow-up work:
 
+- **`ALGORITHM=INSTANT` ADD/DROP COLUMN** — `ALGORITHM=COPY` works correctly (rewrites all rows), but the INSTANT path's row-format default-back-fill has a bug that mis-fills new column values for older rows. Falling back to COPY until the deserialize_row default-fill is fixed.
 - **Atomic DDL via SDI** — registered but not exercised; restart-safe DDL is tracked in [phase4-atomic-ddl-investigation.md](docs/phase4-atomic-ddl-investigation.md).
 - **Replication, FK constraints, savepoint nesting** — not in scope yet.
 
