@@ -1,4 +1,11 @@
 --source suite/tidesdb/include/have_tidesdb.inc
+
+# This test exercises MariaDB's VECTOR(N) data type and `VECTOR INDEX` DDL.
+# MySQL 9 has its own vector functions but no equivalent column type or
+# index syntax, so this test cannot run on MySQL without a rewrite against
+# the MySQL vector API. Skip until ported.
+--skip MariaDB-only VECTOR(N) column type / VECTOR INDEX grammar
+
 #
 # Test: Vector search (MHNSW approximate nearest neighbor)
 #

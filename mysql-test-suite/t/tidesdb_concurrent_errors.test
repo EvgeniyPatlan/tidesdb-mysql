@@ -77,102 +77,97 @@ connect (c2, localhost, root,,);
 connect (c3, localhost, root,,);
 connect (c4, localhost, root,,);
 
+# MariaDB allows anonymous compound blocks (BEGIN NOT ATOMIC ... END) and
+# WHILE loops at the top level; MySQL does not. Wrap each connection's
+# body in a stored procedure so the DECLARE CONTINUE HANDLER lives in a
+# valid scope. Behavior is equivalent: handlers catch transient
+# 1180/1213/1205 (retryable) and 1030 (must-not-happen counter).
+delimiter |;
+DROP PROCEDURE IF EXISTS p_c1|
+CREATE PROCEDURE p_c1()
+BEGIN
+  DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+  DECLARE CONTINUE HANDLER FOR 1030 SET @err_1030 = @err_1030 + 1;
+  SET @i = 1;
+  SET @err_1030 = 0;
+  WHILE @i <= 300 DO
+    START TRANSACTION;
+    SELECT k INTO @dummy FROM t1 WHERE id = 1 + (@i % 500) LIMIT 1;
+    UPDATE t1 SET k = k + 1 WHERE id = 1 + (@i % 500);
+    UPDATE t1 SET c = REPEAT(CHAR(65 + (@i % 26)), 120) WHERE id = 1 + ((@i + 100) % 500);
+    DELETE FROM t1 WHERE id = 1 + ((@i + 200) % 2000);
+    INSERT INTO t1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('w',120), REPEAT('z',60));
+    COMMIT;
+    SET @i = @i + 1;
+  END WHILE;
+END|
+
+DROP PROCEDURE IF EXISTS p_c2|
+CREATE PROCEDURE p_c2()
+BEGIN
+  DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+  DECLARE CONTINUE HANDLER FOR 1030 SET @err_1030 = @err_1030 + 1;
+  SET @i = 1;
+  SET @err_1030 = 0;
+  WHILE @i <= 300 DO
+    START TRANSACTION;
+    SELECT k INTO @dummy FROM t1 WHERE id = 1 + ((@i + 50) % 500) LIMIT 1;
+    UPDATE t1 SET k = k + 1 WHERE id = 1 + ((@i + 50) % 500);
+    UPDATE t1 SET c = REPEAT(CHAR(65 + (@i % 26)), 120) WHERE id = 1 + ((@i + 150) % 500);
+    DELETE FROM t1 WHERE id = 1 + ((@i + 250) % 2000);
+    INSERT INTO t1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('x',120), REPEAT('y',60));
+    COMMIT;
+    SET @i = @i + 1;
+  END WHILE;
+END|
+
+DROP PROCEDURE IF EXISTS p_c3|
+CREATE PROCEDURE p_c3()
+BEGIN
+  DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+  DECLARE CONTINUE HANDLER FOR 1030 SET @err_1030 = @err_1030 + 1;
+  SET @i = 1;
+  SET @err_1030 = 0;
+  WHILE @i <= 300 DO
+    START TRANSACTION;
+    SELECT k INTO @dummy FROM t1 WHERE id = 500 + (@i % 500) LIMIT 1;
+    UPDATE t1 SET k = k + 1 WHERE id = 500 + (@i % 500);
+    UPDATE t1 SET c = REPEAT(CHAR(65 + (@i % 26)), 120) WHERE id = 500 + ((@i + 100) % 500);
+    DELETE FROM t1 WHERE id = 500 + ((@i + 200) % 1500);
+    INSERT INTO t1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('v',120), REPEAT('u',60));
+    COMMIT;
+    SET @i = @i + 1;
+  END WHILE;
+END|
+
+DROP PROCEDURE IF EXISTS p_c4|
+CREATE PROCEDURE p_c4()
+BEGIN
+  DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+  DECLARE CONTINUE HANDLER FOR 1030 SET @err_1030 = @err_1030 + 1;
+  SET @i = 1;
+  SET @err_1030 = 0;
+  WHILE @i <= 300 DO
+    UPDATE t1 SET k = k + 1 WHERE id = 1 + (@i % 2000);
+    SET @i = @i + 1;
+  END WHILE;
+END|
+delimiter ;|
+
 --disable_query_log
 --disable_result_log
 
-# ---- Connection c1: read_write pattern on rows 1-500 ----
 connection c1;
-delimiter |;
-send
-  SET @i = 1;
-  SET @err_1030 = 0;
-  WHILE @i <= 300 DO
-    BEGIN NOT ATOMIC
-      DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205
-        BEGIN END;
-      DECLARE CONTINUE HANDLER FOR 1030
-        SET @err_1030 = @err_1030 + 1;
-      START TRANSACTION;
-      SELECT k INTO @dummy FROM t1 WHERE id = 1 + (@i % 500) LIMIT 1;
-      UPDATE t1 SET k = k + 1 WHERE id = 1 + (@i % 500);
-      UPDATE t1 SET c = REPEAT(CHAR(65 + (@i % 26)), 120) WHERE id = 1 + ((@i + 100) % 500);
-      DELETE FROM t1 WHERE id = 1 + ((@i + 200) % 2000);
-      INSERT INTO t1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('w',120), REPEAT('z',60));
-      COMMIT;
-    END;
-    SET @i = @i + 1;
-  END WHILE;
-|
-delimiter ;|
+send CALL p_c1();
 
-# ---- Connection c2: overlapping writes on rows 1-500 ----
 connection c2;
-delimiter |;
-send
-  SET @i = 1;
-  SET @err_1030 = 0;
-  WHILE @i <= 300 DO
-    BEGIN NOT ATOMIC
-      DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205
-        BEGIN END;
-      DECLARE CONTINUE HANDLER FOR 1030
-        SET @err_1030 = @err_1030 + 1;
-      START TRANSACTION;
-      SELECT k INTO @dummy FROM t1 WHERE id = 1 + ((@i + 50) % 500) LIMIT 1;
-      UPDATE t1 SET k = k + 1 WHERE id = 1 + ((@i + 50) % 500);
-      UPDATE t1 SET c = REPEAT(CHAR(65 + (@i % 26)), 120) WHERE id = 1 + ((@i + 150) % 500);
-      DELETE FROM t1 WHERE id = 1 + ((@i + 250) % 2000);
-      INSERT INTO t1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('x',120), REPEAT('y',60));
-      COMMIT;
-    END;
-    SET @i = @i + 1;
-  END WHILE;
-|
-delimiter ;|
+send CALL p_c2();
 
-# ---- Connection c3: writes on rows 500-1000 ----
 connection c3;
-delimiter |;
-send
-  SET @i = 1;
-  SET @err_1030 = 0;
-  WHILE @i <= 300 DO
-    BEGIN NOT ATOMIC
-      DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205
-        BEGIN END;
-      DECLARE CONTINUE HANDLER FOR 1030
-        SET @err_1030 = @err_1030 + 1;
-      START TRANSACTION;
-      SELECT k INTO @dummy FROM t1 WHERE id = 500 + (@i % 500) LIMIT 1;
-      UPDATE t1 SET k = k + 1 WHERE id = 500 + (@i % 500);
-      UPDATE t1 SET c = REPEAT(CHAR(65 + (@i % 26)), 120) WHERE id = 500 + ((@i + 100) % 500);
-      DELETE FROM t1 WHERE id = 500 + ((@i + 200) % 1500);
-      INSERT INTO t1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('v',120), REPEAT('u',60));
-      COMMIT;
-    END;
-    SET @i = @i + 1;
-  END WHILE;
-|
-delimiter ;|
+send CALL p_c3();
 
-# ---- Connection c4: all autocommit UPDATEs (rapid txn churn) ----
 connection c4;
-delimiter |;
-send
-  SET @i = 1;
-  SET @err_1030 = 0;
-  WHILE @i <= 300 DO
-    BEGIN NOT ATOMIC
-      DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205
-        BEGIN END;
-      DECLARE CONTINUE HANDLER FOR 1030
-        SET @err_1030 = @err_1030 + 1;
-      UPDATE t1 SET k = k + 1 WHERE id = 1 + (@i % 2000);
-    END;
-    SET @i = @i + 1;
-  END WHILE;
-|
-delimiter ;|
+send CALL p_c4();
 
 # ---- Reap all ----
 connection c1;
@@ -232,96 +227,40 @@ if ($pk_cnt != $idx_cnt)
 --echo # ============================================
 --echo #
 
+# TEST 2: same conflict-storm pattern, parameterized stored procedure.
+delimiter |;
+DROP PROCEDURE IF EXISTS p_storm|
+CREATE PROCEDURE p_storm(IN base_k INT)
+BEGIN
+  DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+  DECLARE CONTINUE HANDLER FOR 1030 SET @err_1030 = @err_1030 + 1;
+  SET @i = 1;
+  SET @err_1030 = 0;
+  WHILE @i <= 200 DO
+    START TRANSACTION;
+    UPDATE t1 SET k = @i + base_k WHERE id = 1;
+    UPDATE t1 SET k = @i + base_k WHERE id = 2;
+    UPDATE t1 SET k = @i + base_k WHERE id = 3;
+    COMMIT;
+    SET @i = @i + 1;
+  END WHILE;
+END|
+delimiter ;|
+
 --disable_query_log
 --disable_result_log
 
 connection c1;
-delimiter |;
-send
-  SET @i = 1;
-  SET @err_1030 = 0;
-  WHILE @i <= 200 DO
-    BEGIN NOT ATOMIC
-      DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205
-        BEGIN END;
-      DECLARE CONTINUE HANDLER FOR 1030
-        SET @err_1030 = @err_1030 + 1;
-      START TRANSACTION;
-      UPDATE t1 SET k = @i WHERE id = 1;
-      UPDATE t1 SET k = @i WHERE id = 2;
-      UPDATE t1 SET k = @i WHERE id = 3;
-      COMMIT;
-    END;
-    SET @i = @i + 1;
-  END WHILE;
-|
-delimiter ;|
+send CALL p_storm(0);
 
 connection c2;
-delimiter |;
-send
-  SET @i = 1;
-  SET @err_1030 = 0;
-  WHILE @i <= 200 DO
-    BEGIN NOT ATOMIC
-      DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205
-        BEGIN END;
-      DECLARE CONTINUE HANDLER FOR 1030
-        SET @err_1030 = @err_1030 + 1;
-      START TRANSACTION;
-      UPDATE t1 SET k = @i + 10000 WHERE id = 1;
-      UPDATE t1 SET k = @i + 10000 WHERE id = 2;
-      UPDATE t1 SET k = @i + 10000 WHERE id = 3;
-      COMMIT;
-    END;
-    SET @i = @i + 1;
-  END WHILE;
-|
-delimiter ;|
+send CALL p_storm(10000);
 
 connection c3;
-delimiter |;
-send
-  SET @i = 1;
-  SET @err_1030 = 0;
-  WHILE @i <= 200 DO
-    BEGIN NOT ATOMIC
-      DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205
-        BEGIN END;
-      DECLARE CONTINUE HANDLER FOR 1030
-        SET @err_1030 = @err_1030 + 1;
-      START TRANSACTION;
-      UPDATE t1 SET k = @i + 20000 WHERE id = 1;
-      UPDATE t1 SET k = @i + 20000 WHERE id = 2;
-      UPDATE t1 SET k = @i + 20000 WHERE id = 3;
-      COMMIT;
-    END;
-    SET @i = @i + 1;
-  END WHILE;
-|
-delimiter ;|
+send CALL p_storm(20000);
 
 connection c4;
-delimiter |;
-send
-  SET @i = 1;
-  SET @err_1030 = 0;
-  WHILE @i <= 200 DO
-    BEGIN NOT ATOMIC
-      DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205
-        BEGIN END;
-      DECLARE CONTINUE HANDLER FOR 1030
-        SET @err_1030 = @err_1030 + 1;
-      START TRANSACTION;
-      UPDATE t1 SET k = @i + 30000 WHERE id = 1;
-      UPDATE t1 SET k = @i + 30000 WHERE id = 2;
-      UPDATE t1 SET k = @i + 30000 WHERE id = 3;
-      COMMIT;
-    END;
-    SET @i = @i + 1;
-  END WHILE;
-|
-delimiter ;|
+send CALL p_storm(30000);
 
 connection c1;
 reap;
@@ -366,6 +305,12 @@ disconnect c1;
 disconnect c2;
 disconnect c3;
 disconnect c4;
+
+DROP PROCEDURE p_c1;
+DROP PROCEDURE p_c2;
+DROP PROCEDURE p_c3;
+DROP PROCEDURE p_c4;
+DROP PROCEDURE p_storm;
 
 DROP TABLE t1;
 

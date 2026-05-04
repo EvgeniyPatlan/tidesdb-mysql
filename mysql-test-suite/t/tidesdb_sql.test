@@ -608,7 +608,17 @@ ORDER BY emp_id;
 --echo # ============================================
 --echo #
 
-CREATE TABLE dept_summary ENGINE=TIDESDB AS
+# CREATE TABLE ... AS SELECT trips ER_GTID_UNSAFE_CREATE_SELECT under
+# default --enforce-gtid-consistency=ON (MTR default in MySQL 8+).
+# Split into explicit CREATE + INSERT...SELECT so GTID stays consistent.
+CREATE TABLE dept_summary (
+  dept_id   INT,
+  dept_name VARCHAR(50),
+  headcount BIGINT,
+  total_sal DECIMAL(32,2)
+) ENGINE=TIDESDB;
+
+INSERT INTO dept_summary
 SELECT d.dept_id, d.dept_name, COUNT(e.emp_id) AS headcount, SUM(e.salary) AS total_sal
 FROM departments d
 LEFT JOIN employees e ON d.dept_id = e.dept_id

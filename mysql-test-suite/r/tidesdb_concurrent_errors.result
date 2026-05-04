@@ -12,7 +12,7 @@ c   CHAR(120) NOT NULL DEFAULT '',
 pad CHAR(60) NOT NULL DEFAULT '',
 PRIMARY KEY (id),
 KEY k_1 (k)
-) ENGINE=TIDESDB SYNC_MODE='NONE';
+) ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"sync_mode":"NONE"}';
 #
 # === Populate: 2000 rows ===
 #
@@ -28,34 +28,99 @@ row_count
 #   After fix: error 1213 (deadlock, retryable)
 # ============================================
 #
-connect  c1, localhost, root,,;
-connect  c2, localhost, root,,;
-connect  c3, localhost, root,,;
-connect  c4, localhost, root,,;
+DROP PROCEDURE IF EXISTS p_c1|
+Warnings:
+Note	1305	PROCEDURE test.p_c1 does not exist
+CREATE PROCEDURE p_c1()
+BEGIN
+DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+DECLARE CONTINUE HANDLER FOR 1030 SET @err_1030 = @err_1030 + 1;
+SET @i = 1;
+SET @err_1030 = 0;
+WHILE @i <= 300 DO
+START TRANSACTION;
+SELECT k INTO @dummy FROM t1 WHERE id = 1 + (@i % 500) LIMIT 1;
+UPDATE t1 SET k = k + 1 WHERE id = 1 + (@i % 500);
+UPDATE t1 SET c = REPEAT(CHAR(65 + (@i % 26)), 120) WHERE id = 1 + ((@i + 100) % 500);
+DELETE FROM t1 WHERE id = 1 + ((@i + 200) % 2000);
+INSERT INTO t1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('w',120), REPEAT('z',60));
+COMMIT;
+SET @i = @i + 1;
+END WHILE;
+END|
+DROP PROCEDURE IF EXISTS p_c2|
+Warnings:
+Note	1305	PROCEDURE test.p_c2 does not exist
+CREATE PROCEDURE p_c2()
+BEGIN
+DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+DECLARE CONTINUE HANDLER FOR 1030 SET @err_1030 = @err_1030 + 1;
+SET @i = 1;
+SET @err_1030 = 0;
+WHILE @i <= 300 DO
+START TRANSACTION;
+SELECT k INTO @dummy FROM t1 WHERE id = 1 + ((@i + 50) % 500) LIMIT 1;
+UPDATE t1 SET k = k + 1 WHERE id = 1 + ((@i + 50) % 500);
+UPDATE t1 SET c = REPEAT(CHAR(65 + (@i % 26)), 120) WHERE id = 1 + ((@i + 150) % 500);
+DELETE FROM t1 WHERE id = 1 + ((@i + 250) % 2000);
+INSERT INTO t1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('x',120), REPEAT('y',60));
+COMMIT;
+SET @i = @i + 1;
+END WHILE;
+END|
+DROP PROCEDURE IF EXISTS p_c3|
+Warnings:
+Note	1305	PROCEDURE test.p_c3 does not exist
+CREATE PROCEDURE p_c3()
+BEGIN
+DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+DECLARE CONTINUE HANDLER FOR 1030 SET @err_1030 = @err_1030 + 1;
+SET @i = 1;
+SET @err_1030 = 0;
+WHILE @i <= 300 DO
+START TRANSACTION;
+SELECT k INTO @dummy FROM t1 WHERE id = 500 + (@i % 500) LIMIT 1;
+UPDATE t1 SET k = k + 1 WHERE id = 500 + (@i % 500);
+UPDATE t1 SET c = REPEAT(CHAR(65 + (@i % 26)), 120) WHERE id = 500 + ((@i + 100) % 500);
+DELETE FROM t1 WHERE id = 500 + ((@i + 200) % 1500);
+INSERT INTO t1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('v',120), REPEAT('u',60));
+COMMIT;
+SET @i = @i + 1;
+END WHILE;
+END|
+DROP PROCEDURE IF EXISTS p_c4|
+Warnings:
+Note	1305	PROCEDURE test.p_c4 does not exist
+CREATE PROCEDURE p_c4()
+BEGIN
+DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+DECLARE CONTINUE HANDLER FOR 1030 SET @err_1030 = @err_1030 + 1;
+SET @i = 1;
+SET @err_1030 = 0;
+WHILE @i <= 300 DO
+UPDATE t1 SET k = k + 1 WHERE id = 1 + (@i % 2000);
+SET @i = @i + 1;
+END WHILE;
+END|
 #
 # === Verify: no error 1030 (HA_ERR_GENERIC) was produced ===
 #
-connection c1;
 # c1 error_1030 count:
 SELECT @err_1030 AS err_1030_c1;
 err_1030_c1
 0
-connection c2;
 # c2 error_1030 count:
 SELECT @err_1030 AS err_1030_c2;
 err_1030_c2
 0
-connection c3;
 # c3 error_1030 count:
 SELECT @err_1030 AS err_1030_c3;
 err_1030_c3
 0
-connection c4;
 # c4 error_1030 count:
 SELECT @err_1030 AS err_1030_c4;
 err_1030_c4
 0
-connection default;
 #
 # === Verify data integrity (PK count == index count) ===
 #
@@ -67,37 +132,51 @@ Data integrity: OK
 #   error 1030; after fix they are error 1213 (retryable).
 # ============================================
 #
+DROP PROCEDURE IF EXISTS p_storm|
+Warnings:
+Note	1305	PROCEDURE test.p_storm does not exist
+CREATE PROCEDURE p_storm(IN base_k INT)
+BEGIN
+DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+DECLARE CONTINUE HANDLER FOR 1030 SET @err_1030 = @err_1030 + 1;
+SET @i = 1;
+SET @err_1030 = 0;
+WHILE @i <= 200 DO
+START TRANSACTION;
+UPDATE t1 SET k = @i + base_k WHERE id = 1;
+UPDATE t1 SET k = @i + base_k WHERE id = 2;
+UPDATE t1 SET k = @i + base_k WHERE id = 3;
+COMMIT;
+SET @i = @i + 1;
+END WHILE;
+END|
 #
 # === Verify: no error 1030 in conflict storm ===
 #
-connection c1;
 # c1 error_1030 count:
 SELECT @err_1030 AS err_1030_c1;
 err_1030_c1
 0
-connection c2;
 # c2 error_1030 count:
 SELECT @err_1030 AS err_1030_c2;
 err_1030_c2
 0
-connection c3;
 # c3 error_1030 count:
 SELECT @err_1030 AS err_1030_c3;
 err_1030_c3
 0
-connection c4;
 # c4 error_1030 count:
 SELECT @err_1030 AS err_1030_c4;
 err_1030_c4
 0
-connection default;
 Conflict storm: OK
 #
 # === Cleanup ===
 #
-disconnect c1;
-disconnect c2;
-disconnect c3;
-disconnect c4;
+DROP PROCEDURE p_c1;
+DROP PROCEDURE p_c2;
+DROP PROCEDURE p_c3;
+DROP PROCEDURE p_c4;
+DROP PROCEDURE p_storm;
 DROP TABLE t1;
 # Done.

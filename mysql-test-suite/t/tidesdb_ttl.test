@@ -186,9 +186,12 @@ CREATE TABLE t_ttl_stmt (
   val VARCHAR(50)
 ) ENGINE=TIDESDB;
 
-# Row 1: inserted with 2-second TTL via SET STATEMENT
-SET STATEMENT tidesdb_ttl=2 FOR
-  INSERT INTO t_ttl_stmt VALUES (1, 'short_lived');
+# Row 1: inserted with 2-second TTL.
+# (MariaDB has SET STATEMENT...FOR; MySQL doesn't, so save/restore session var.)
+SET @saved_ttl = @@SESSION.tidesdb_ttl;
+SET SESSION tidesdb_ttl = 2;
+INSERT INTO t_ttl_stmt VALUES (1, 'short_lived');
+SET SESSION tidesdb_ttl = @saved_ttl;
 
 # Row 2: inserted with default (no TTL)
 INSERT INTO t_ttl_stmt VALUES (2, 'permanent');

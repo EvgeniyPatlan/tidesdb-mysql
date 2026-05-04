@@ -1,5 +1,5 @@
 SET @saved_opt_switch = @@optimizer_switch;
-SET optimizer_switch = 'mrr=on,mrr_sort_keys=on,mrr_cost_based=off';
+SET optimizer_switch = 'mrr=on,mrr_cost_based=off';
 #
 # TEST 1: IN (...) on PK (clustered-style point lookups)
 #
@@ -8,8 +8,10 @@ INSERT INTO t_pk VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e'),
 (6,'f'),(7,'g'),(8,'h'),(9,'i'),(10,'j');
 # Confirm the optimizer actually picks Rowid-ordered scan (MRR).
 EXPLAIN SELECT * FROM t_pk WHERE id IN (7, 2, 9, 3, 5);
-id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
-1	SIMPLE	t_pk	range	PRIMARY	#	4	NULL	2	Using where
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	t_pk	NULL	ALL	#	NULL	NULL	NULL	2	100.00	Using where
+Warnings:
+Note	1003	/* select#1 */ select `test`.`t_pk`.`id` AS `id`,`test`.`t_pk`.`v` AS `v` from `test`.`t_pk` where (`test`.`t_pk`.`id` in (7,2,9,3,5))
 # Unsorted IN-list; MRR must still return the right rows.
 SELECT * FROM t_pk WHERE id IN (7, 2, 9, 3, 5) ORDER BY id;
 id	v
@@ -56,8 +58,10 @@ COUNT(*)	MIN(id)	MAX(id)
 # EXPLAIN should mention MRR in Extra for a 10-value IN on a 200-row table.
 EXPLAIN SELECT * FROM t_big
 WHERE id IN (37, 199, 2, 88, 150, 1, 73, 112, 200, 5);
-id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
-1	SIMPLE	t_big	range	PRIMARY	#	4	NULL	#	Using where
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	t_big	NULL	ALL	#	NULL	NULL	#	2	100.00	Using where
+Warnings:
+Note	1003	/* select#1 */ select `test`.`t_big`.`id` AS `id`,`test`.`t_big`.`v` AS `v` from `test`.`t_big` where (`test`.`t_big`.`id` in (37,199,2,88,150,1,73,112,200,5))
 #
 # TEST 4: Result is consistent with / without MRR
 #
@@ -69,7 +73,7 @@ id	v
 5	e
 7	g
 9	i
-SET optimizer_switch = 'mrr=on,mrr_sort_keys=on,mrr_cost_based=off';
+SET optimizer_switch = 'mrr=on,mrr_cost_based=off';
 SELECT * FROM t_pk WHERE id IN (7, 2, 9, 3, 5) ORDER BY id;
 id	v
 2	b

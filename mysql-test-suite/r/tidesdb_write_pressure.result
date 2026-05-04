@@ -12,7 +12,7 @@ c   CHAR(120) NOT NULL DEFAULT '',
 pad CHAR(60) NOT NULL DEFAULT '',
 PRIMARY KEY (id),
 KEY k_1 (k)
-) ENGINE=TIDESDB SYNC_MODE='NONE';
+) ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"sync_mode":"NONE"}';
 CREATE TABLE sbtest2 (
 id  INT NOT NULL AUTO_INCREMENT,
 k   INT NOT NULL DEFAULT 0,
@@ -20,7 +20,7 @@ c   CHAR(120) NOT NULL DEFAULT '',
 pad CHAR(60) NOT NULL DEFAULT '',
 PRIMARY KEY (id),
 KEY k_1 (k)
-) ENGINE=TIDESDB SYNC_MODE='NONE';
+) ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"sync_mode":"NONE"}';
 #
 # === Populate: 5000 rows per table ===
 #
@@ -47,11 +47,82 @@ after_single
 #   hitting both tables. Conflicts are expected.
 # ============================================
 #
-connect  wr1, localhost, root,,;
-connect  wr2, localhost, root,,;
-connect  wr3, localhost, root,,;
-connect  wr4, localhost, root,,;
-connection default;
+DROP PROCEDURE IF EXISTS p_wr1|
+Warnings:
+Note	1305	PROCEDURE test.p_wr1 does not exist
+CREATE PROCEDURE p_wr1()
+BEGIN
+DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+SET @i = 1;
+WHILE @i <= 500 DO
+START TRANSACTION;
+UPDATE sbtest1 SET k = k + 1 WHERE id = 1 + (@i % 5000);
+UPDATE sbtest1 SET c = REPEAT('A', 120) WHERE id = 1 + ((@i + 500) % 5000);
+UPDATE sbtest1 SET k = k - 1 WHERE id = 1 + ((@i + 1000) % 5000);
+UPDATE sbtest1 SET c = REPEAT('B', 120) WHERE id = 1 + ((@i + 1500) % 5000);
+DELETE FROM sbtest1 WHERE id = 1 + ((@i + 2000) % 5000);
+INSERT INTO sbtest1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('w',120), REPEAT('z',60));
+COMMIT;
+SET @i = @i + 1;
+END WHILE;
+END|
+DROP PROCEDURE IF EXISTS p_wr2|
+Warnings:
+Note	1305	PROCEDURE test.p_wr2 does not exist
+CREATE PROCEDURE p_wr2()
+BEGIN
+DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+SET @i = 1;
+WHILE @i <= 500 DO
+START TRANSACTION;
+UPDATE sbtest1 SET k = k + 1 WHERE id = 1 + ((@i + 250) % 5000);
+UPDATE sbtest1 SET c = REPEAT('C', 120) WHERE id = 1 + ((@i + 750) % 5000);
+UPDATE sbtest1 SET k = k - 1 WHERE id = 1 + ((@i + 1250) % 5000);
+UPDATE sbtest1 SET c = REPEAT('D', 120) WHERE id = 1 + ((@i + 1750) % 5000);
+DELETE FROM sbtest1 WHERE id = 1 + ((@i + 2250) % 5000);
+INSERT INTO sbtest1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('w',120), REPEAT('z',60));
+COMMIT;
+SET @i = @i + 1;
+END WHILE;
+END|
+DROP PROCEDURE IF EXISTS p_wr3|
+Warnings:
+Note	1305	PROCEDURE test.p_wr3 does not exist
+CREATE PROCEDURE p_wr3()
+BEGIN
+DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+SET @i = 1;
+WHILE @i <= 500 DO
+START TRANSACTION;
+UPDATE sbtest2 SET k = k + 1 WHERE id = 1 + (@i % 5000);
+UPDATE sbtest2 SET c = REPEAT('E', 120) WHERE id = 1 + ((@i + 500) % 5000);
+UPDATE sbtest2 SET k = k - 1 WHERE id = 1 + ((@i + 1000) % 5000);
+UPDATE sbtest2 SET c = REPEAT('F', 120) WHERE id = 1 + ((@i + 1500) % 5000);
+DELETE FROM sbtest2 WHERE id = 1 + ((@i + 2000) % 5000);
+INSERT INTO sbtest2 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('w',120), REPEAT('z',60));
+COMMIT;
+SET @i = @i + 1;
+END WHILE;
+END|
+DROP PROCEDURE IF EXISTS p_wr4|
+Warnings:
+Note	1305	PROCEDURE test.p_wr4 does not exist
+CREATE PROCEDURE p_wr4()
+BEGIN
+DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+SET @i = 1;
+WHILE @i <= 500 DO
+START TRANSACTION;
+UPDATE sbtest2 SET k = k + 1 WHERE id = 1 + ((@i + 250) % 5000);
+UPDATE sbtest2 SET c = REPEAT('G', 120) WHERE id = 1 + ((@i + 750) % 5000);
+UPDATE sbtest2 SET k = k - 1 WHERE id = 1 + ((@i + 1250) % 5000);
+UPDATE sbtest2 SET c = REPEAT('H', 120) WHERE id = 1 + ((@i + 1750) % 5000);
+DELETE FROM sbtest2 WHERE id = 1 + ((@i + 2250) % 5000);
+INSERT INTO sbtest2 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('w',120), REPEAT('z',60));
+COMMIT;
+SET @i = @i + 1;
+END WHILE;
+END|
 #
 # === Verify data integrity after concurrent writes ===
 #
@@ -63,6 +134,50 @@ PK/index consistency: OK
 #   Tests rapid txn_begin/txn_free cycling without BEGIN/COMMIT
 # ============================================
 #
+DROP PROCEDURE IF EXISTS p_loop_upd1_plus|
+Warnings:
+Note	1305	PROCEDURE test.p_loop_upd1_plus does not exist
+CREATE PROCEDURE p_loop_upd1_plus()
+BEGIN
+SET @i = 1;
+WHILE @i <= 1000 DO
+UPDATE sbtest1 SET k = k + 1 WHERE id = 1 + (@i % 5000);
+SET @i = @i + 1;
+END WHILE;
+END|
+DROP PROCEDURE IF EXISTS p_loop_upd1_minus|
+Warnings:
+Note	1305	PROCEDURE test.p_loop_upd1_minus does not exist
+CREATE PROCEDURE p_loop_upd1_minus()
+BEGIN
+SET @i = 1;
+WHILE @i <= 1000 DO
+UPDATE sbtest1 SET k = k - 1 WHERE id = 1 + ((@i + 500) % 5000);
+SET @i = @i + 1;
+END WHILE;
+END|
+DROP PROCEDURE IF EXISTS p_loop_ins1|
+Warnings:
+Note	1305	PROCEDURE test.p_loop_ins1 does not exist
+CREATE PROCEDURE p_loop_ins1()
+BEGIN
+SET @i = 1;
+WHILE @i <= 1000 DO
+INSERT INTO sbtest1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('q',120), REPEAT('r',60));
+SET @i = @i + 1;
+END WHILE;
+END|
+DROP PROCEDURE IF EXISTS p_loop_ins2|
+Warnings:
+Note	1305	PROCEDURE test.p_loop_ins2 does not exist
+CREATE PROCEDURE p_loop_ins2()
+BEGIN
+SET @i = 1;
+WHILE @i <= 1000 DO
+INSERT INTO sbtest2 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('q',120), REPEAT('r',60));
+SET @i = @i + 1;
+END WHILE;
+END|
 #
 # ============================================
 # TEST 4: Conflict storm -- all 4 connections hit same rows
@@ -70,16 +185,36 @@ PK/index consistency: OK
 #   Exercises the failed-commit -> txn_free -> new txn_begin path.
 # ============================================
 #
-connection default;
+DROP PROCEDURE IF EXISTS p_storm|
+Warnings:
+Note	1305	PROCEDURE test.p_storm does not exist
+CREATE PROCEDURE p_storm(IN base_k INT)
+BEGIN
+DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+SET @i = 1;
+WHILE @i <= 500 DO
+START TRANSACTION;
+UPDATE sbtest1 SET k = @i + base_k WHERE id = 1;
+UPDATE sbtest1 SET k = @i + base_k WHERE id = 2;
+UPDATE sbtest1 SET k = @i + base_k WHERE id = 3;
+COMMIT;
+SET @i = @i + 1;
+END WHILE;
+END|
 SELECT COUNT(*) FROM sbtest1 WHERE id IN (1, 2, 3);
 Conflict storm: OK
 #
 # === Cleanup ===
 #
-disconnect wr1;
-disconnect wr2;
-disconnect wr3;
-disconnect wr4;
+DROP PROCEDURE p_wr1;
+DROP PROCEDURE p_wr2;
+DROP PROCEDURE p_wr3;
+DROP PROCEDURE p_wr4;
+DROP PROCEDURE p_loop_upd1_plus;
+DROP PROCEDURE p_loop_upd1_minus;
+DROP PROCEDURE p_loop_ins1;
+DROP PROCEDURE p_loop_ins2;
+DROP PROCEDURE p_storm;
 DROP TABLE sbtest1;
 DROP TABLE sbtest2;
 # Done.

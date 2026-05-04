@@ -1,5 +1,11 @@
 --source suite/tidesdb/include/have_tidesdb.inc
---source include/have_file_key_management.inc
+
+# MariaDB's file_key_management keyring plugin doesn't exist on MySQL --
+# MySQL ships keyring_file / keyring_okv / etc. Re-enabling this test
+# requires bootstrapping a MySQL keyring (e.g., keyring_file with
+# --early-plugin-load and --keyring-file-data) and porting the per-table
+# ENCRYPTED= grammar. Out of scope for the initial port.
+--skip MariaDB-only file_key_management keyring plugin; needs MySQL keyring port
 
 --echo #
 --echo # ============================================

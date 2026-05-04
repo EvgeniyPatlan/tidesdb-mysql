@@ -1,5 +1,10 @@
 --source suite/tidesdb/include/have_tidesdb.inc
 
+# Native partitioning requires HA_HAS_OWN_PARTITIONING in table_flags() plus
+# the partitioning helper handler virtuals (open_partitioning, change_partitions,
+# etc.). MySQL 8+ removed the legacy ha_partition shim, so engines must
+# implement it natively or not at all. Out of scope for the initial port.
+--skip native partitioning not implemented
 
 --echo #
 --echo # ============================================

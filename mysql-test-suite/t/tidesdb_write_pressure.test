@@ -115,100 +115,97 @@ connect (wr2, localhost, root,,);
 connect (wr3, localhost, root,,);
 connect (wr4, localhost, root,,);
 
+# MySQL doesn't support BEGIN NOT ATOMIC outside a stored program; convert
+# each connection's body to its own stored procedure (table name can't be a
+# parameter, so 4 separate procs).
+delimiter |;
+DROP PROCEDURE IF EXISTS p_wr1|
+CREATE PROCEDURE p_wr1()
+BEGIN
+  DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+  SET @i = 1;
+  WHILE @i <= 500 DO
+    START TRANSACTION;
+    UPDATE sbtest1 SET k = k + 1 WHERE id = 1 + (@i % 5000);
+    UPDATE sbtest1 SET c = REPEAT('A', 120) WHERE id = 1 + ((@i + 500) % 5000);
+    UPDATE sbtest1 SET k = k - 1 WHERE id = 1 + ((@i + 1000) % 5000);
+    UPDATE sbtest1 SET c = REPEAT('B', 120) WHERE id = 1 + ((@i + 1500) % 5000);
+    DELETE FROM sbtest1 WHERE id = 1 + ((@i + 2000) % 5000);
+    INSERT INTO sbtest1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('w',120), REPEAT('z',60));
+    COMMIT;
+    SET @i = @i + 1;
+  END WHILE;
+END|
+
+DROP PROCEDURE IF EXISTS p_wr2|
+CREATE PROCEDURE p_wr2()
+BEGIN
+  DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+  SET @i = 1;
+  WHILE @i <= 500 DO
+    START TRANSACTION;
+    UPDATE sbtest1 SET k = k + 1 WHERE id = 1 + ((@i + 250) % 5000);
+    UPDATE sbtest1 SET c = REPEAT('C', 120) WHERE id = 1 + ((@i + 750) % 5000);
+    UPDATE sbtest1 SET k = k - 1 WHERE id = 1 + ((@i + 1250) % 5000);
+    UPDATE sbtest1 SET c = REPEAT('D', 120) WHERE id = 1 + ((@i + 1750) % 5000);
+    DELETE FROM sbtest1 WHERE id = 1 + ((@i + 2250) % 5000);
+    INSERT INTO sbtest1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('w',120), REPEAT('z',60));
+    COMMIT;
+    SET @i = @i + 1;
+  END WHILE;
+END|
+
+DROP PROCEDURE IF EXISTS p_wr3|
+CREATE PROCEDURE p_wr3()
+BEGIN
+  DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+  SET @i = 1;
+  WHILE @i <= 500 DO
+    START TRANSACTION;
+    UPDATE sbtest2 SET k = k + 1 WHERE id = 1 + (@i % 5000);
+    UPDATE sbtest2 SET c = REPEAT('E', 120) WHERE id = 1 + ((@i + 500) % 5000);
+    UPDATE sbtest2 SET k = k - 1 WHERE id = 1 + ((@i + 1000) % 5000);
+    UPDATE sbtest2 SET c = REPEAT('F', 120) WHERE id = 1 + ((@i + 1500) % 5000);
+    DELETE FROM sbtest2 WHERE id = 1 + ((@i + 2000) % 5000);
+    INSERT INTO sbtest2 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('w',120), REPEAT('z',60));
+    COMMIT;
+    SET @i = @i + 1;
+  END WHILE;
+END|
+
+DROP PROCEDURE IF EXISTS p_wr4|
+CREATE PROCEDURE p_wr4()
+BEGIN
+  DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+  SET @i = 1;
+  WHILE @i <= 500 DO
+    START TRANSACTION;
+    UPDATE sbtest2 SET k = k + 1 WHERE id = 1 + ((@i + 250) % 5000);
+    UPDATE sbtest2 SET c = REPEAT('G', 120) WHERE id = 1 + ((@i + 750) % 5000);
+    UPDATE sbtest2 SET k = k - 1 WHERE id = 1 + ((@i + 1250) % 5000);
+    UPDATE sbtest2 SET c = REPEAT('H', 120) WHERE id = 1 + ((@i + 1750) % 5000);
+    DELETE FROM sbtest2 WHERE id = 1 + ((@i + 2250) % 5000);
+    INSERT INTO sbtest2 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('w',120), REPEAT('z',60));
+    COMMIT;
+    SET @i = @i + 1;
+  END WHILE;
+END|
+delimiter ;|
+
 --disable_query_log
 --disable_result_log
 
-# ---- Connection wr1: writes to sbtest1 ----
 connection wr1;
-delimiter |;
-send
-  SET @i = 1;
-  WHILE @i <= 500 DO
-    BEGIN NOT ATOMIC
-      DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205
-        BEGIN END;
-      START TRANSACTION;
-      UPDATE sbtest1 SET k = k + 1 WHERE id = 1 + (@i % 5000);
-      UPDATE sbtest1 SET c = REPEAT('A', 120) WHERE id = 1 + ((@i + 500) % 5000);
-      UPDATE sbtest1 SET k = k - 1 WHERE id = 1 + ((@i + 1000) % 5000);
-      UPDATE sbtest1 SET c = REPEAT('B', 120) WHERE id = 1 + ((@i + 1500) % 5000);
-      DELETE FROM sbtest1 WHERE id = 1 + ((@i + 2000) % 5000);
-      INSERT INTO sbtest1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('w',120), REPEAT('z',60));
-      COMMIT;
-    END;
-    SET @i = @i + 1;
-  END WHILE;
-|
-delimiter ;|
+send CALL p_wr1();
 
-# ---- Connection wr2: writes to sbtest1 (overlapping with wr1 -> conflicts) ----
 connection wr2;
-delimiter |;
-send
-  SET @i = 1;
-  WHILE @i <= 500 DO
-    BEGIN NOT ATOMIC
-      DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205
-        BEGIN END;
-      START TRANSACTION;
-      UPDATE sbtest1 SET k = k + 1 WHERE id = 1 + ((@i + 250) % 5000);
-      UPDATE sbtest1 SET c = REPEAT('C', 120) WHERE id = 1 + ((@i + 750) % 5000);
-      UPDATE sbtest1 SET k = k - 1 WHERE id = 1 + ((@i + 1250) % 5000);
-      UPDATE sbtest1 SET c = REPEAT('D', 120) WHERE id = 1 + ((@i + 1750) % 5000);
-      DELETE FROM sbtest1 WHERE id = 1 + ((@i + 2250) % 5000);
-      INSERT INTO sbtest1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('w',120), REPEAT('z',60));
-      COMMIT;
-    END;
-    SET @i = @i + 1;
-  END WHILE;
-|
-delimiter ;|
+send CALL p_wr2();
 
-# ---- Connection wr3: writes to sbtest2 ----
 connection wr3;
-delimiter |;
-send
-  SET @i = 1;
-  WHILE @i <= 500 DO
-    BEGIN NOT ATOMIC
-      DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205
-        BEGIN END;
-      START TRANSACTION;
-      UPDATE sbtest2 SET k = k + 1 WHERE id = 1 + (@i % 5000);
-      UPDATE sbtest2 SET c = REPEAT('E', 120) WHERE id = 1 + ((@i + 500) % 5000);
-      UPDATE sbtest2 SET k = k - 1 WHERE id = 1 + ((@i + 1000) % 5000);
-      UPDATE sbtest2 SET c = REPEAT('F', 120) WHERE id = 1 + ((@i + 1500) % 5000);
-      DELETE FROM sbtest2 WHERE id = 1 + ((@i + 2000) % 5000);
-      INSERT INTO sbtest2 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('w',120), REPEAT('z',60));
-      COMMIT;
-    END;
-    SET @i = @i + 1;
-  END WHILE;
-|
-delimiter ;|
+send CALL p_wr3();
 
-# ---- Connection wr4: writes to sbtest2 (overlapping with wr3 -> conflicts) ----
 connection wr4;
-delimiter |;
-send
-  SET @i = 1;
-  WHILE @i <= 500 DO
-    BEGIN NOT ATOMIC
-      DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205
-        BEGIN END;
-      START TRANSACTION;
-      UPDATE sbtest2 SET k = k + 1 WHERE id = 1 + ((@i + 250) % 5000);
-      UPDATE sbtest2 SET c = REPEAT('G', 120) WHERE id = 1 + ((@i + 750) % 5000);
-      UPDATE sbtest2 SET k = k - 1 WHERE id = 1 + ((@i + 1250) % 5000);
-      UPDATE sbtest2 SET c = REPEAT('H', 120) WHERE id = 1 + ((@i + 1750) % 5000);
-      DELETE FROM sbtest2 WHERE id = 1 + ((@i + 2250) % 5000);
-      INSERT INTO sbtest2 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('w',120), REPEAT('z',60));
-      COMMIT;
-    END;
-    SET @i = @i + 1;
-  END WHILE;
-|
-delimiter ;|
+send CALL p_wr4();
 
 # ---- Reap all ----
 connection wr1;
@@ -259,52 +256,64 @@ if ($pk2 != $idx2)
 --echo # ============================================
 --echo #
 
---disable_query_log
---disable_result_log
-
-connection wr1;
+# Test 3 helpers (raw autocommit loops -- no inner BEGIN block needed,
+# so a simple stored procedure suffices).
 delimiter |;
-send
+DROP PROCEDURE IF EXISTS p_loop_upd1_plus|
+CREATE PROCEDURE p_loop_upd1_plus()
+BEGIN
   SET @i = 1;
   WHILE @i <= 1000 DO
     UPDATE sbtest1 SET k = k + 1 WHERE id = 1 + (@i % 5000);
     SET @i = @i + 1;
   END WHILE;
-|
-delimiter ;|
+END|
 
-connection wr2;
-delimiter |;
-send
+DROP PROCEDURE IF EXISTS p_loop_upd1_minus|
+CREATE PROCEDURE p_loop_upd1_minus()
+BEGIN
   SET @i = 1;
   WHILE @i <= 1000 DO
     UPDATE sbtest1 SET k = k - 1 WHERE id = 1 + ((@i + 500) % 5000);
     SET @i = @i + 1;
   END WHILE;
-|
-delimiter ;|
+END|
 
-connection wr3;
-delimiter |;
-send
+DROP PROCEDURE IF EXISTS p_loop_ins1|
+CREATE PROCEDURE p_loop_ins1()
+BEGIN
   SET @i = 1;
   WHILE @i <= 1000 DO
     INSERT INTO sbtest1 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('q',120), REPEAT('r',60));
     SET @i = @i + 1;
   END WHILE;
-|
-delimiter ;|
+END|
 
-connection wr4;
-delimiter |;
-send
+DROP PROCEDURE IF EXISTS p_loop_ins2|
+CREATE PROCEDURE p_loop_ins2()
+BEGIN
   SET @i = 1;
   WHILE @i <= 1000 DO
     INSERT INTO sbtest2 (k, c, pad) VALUES (FLOOR(RAND()*100000), REPEAT('q',120), REPEAT('r',60));
     SET @i = @i + 1;
   END WHILE;
-|
+END|
 delimiter ;|
+
+--disable_query_log
+--disable_result_log
+
+connection wr1;
+send CALL p_loop_upd1_plus();
+
+connection wr2;
+send CALL p_loop_upd1_minus();
+
+connection wr3;
+send CALL p_loop_ins1();
+
+connection wr4;
+send CALL p_loop_ins2();
 
 connection wr1;
 reap;
@@ -326,84 +335,38 @@ reap;
 --echo # ============================================
 --echo #
 
+# Conflict storm -- parameterized on base_k offset.
+delimiter |;
+DROP PROCEDURE IF EXISTS p_storm|
+CREATE PROCEDURE p_storm(IN base_k INT)
+BEGIN
+  DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205 BEGIN END;
+  SET @i = 1;
+  WHILE @i <= 500 DO
+    START TRANSACTION;
+    UPDATE sbtest1 SET k = @i + base_k WHERE id = 1;
+    UPDATE sbtest1 SET k = @i + base_k WHERE id = 2;
+    UPDATE sbtest1 SET k = @i + base_k WHERE id = 3;
+    COMMIT;
+    SET @i = @i + 1;
+  END WHILE;
+END|
+delimiter ;|
+
 --disable_query_log
 --disable_result_log
 
 connection wr1;
-delimiter |;
-send
-  SET @i = 1;
-  WHILE @i <= 500 DO
-    BEGIN NOT ATOMIC
-      DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205
-        BEGIN END;
-      START TRANSACTION;
-      UPDATE sbtest1 SET k = @i WHERE id = 1;
-      UPDATE sbtest1 SET k = @i WHERE id = 2;
-      UPDATE sbtest1 SET k = @i WHERE id = 3;
-      COMMIT;
-    END;
-    SET @i = @i + 1;
-  END WHILE;
-|
-delimiter ;|
+send CALL p_storm(0);
 
 connection wr2;
-delimiter |;
-send
-  SET @i = 1;
-  WHILE @i <= 500 DO
-    BEGIN NOT ATOMIC
-      DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205
-        BEGIN END;
-      START TRANSACTION;
-      UPDATE sbtest1 SET k = @i + 10000 WHERE id = 1;
-      UPDATE sbtest1 SET k = @i + 10000 WHERE id = 2;
-      UPDATE sbtest1 SET k = @i + 10000 WHERE id = 3;
-      COMMIT;
-    END;
-    SET @i = @i + 1;
-  END WHILE;
-|
-delimiter ;|
+send CALL p_storm(10000);
 
 connection wr3;
-delimiter |;
-send
-  SET @i = 1;
-  WHILE @i <= 500 DO
-    BEGIN NOT ATOMIC
-      DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205
-        BEGIN END;
-      START TRANSACTION;
-      UPDATE sbtest1 SET k = @i + 20000 WHERE id = 1;
-      UPDATE sbtest1 SET k = @i + 20000 WHERE id = 2;
-      UPDATE sbtest1 SET k = @i + 20000 WHERE id = 3;
-      COMMIT;
-    END;
-    SET @i = @i + 1;
-  END WHILE;
-|
-delimiter ;|
+send CALL p_storm(20000);
 
 connection wr4;
-delimiter |;
-send
-  SET @i = 1;
-  WHILE @i <= 500 DO
-    BEGIN NOT ATOMIC
-      DECLARE CONTINUE HANDLER FOR 1180, 1213, 1205
-        BEGIN END;
-      START TRANSACTION;
-      UPDATE sbtest1 SET k = @i + 30000 WHERE id = 1;
-      UPDATE sbtest1 SET k = @i + 30000 WHERE id = 2;
-      UPDATE sbtest1 SET k = @i + 30000 WHERE id = 3;
-      COMMIT;
-    END;
-    SET @i = @i + 1;
-  END WHILE;
-|
-delimiter ;|
+send CALL p_storm(30000);
 
 connection wr1;
 reap;
@@ -434,6 +397,16 @@ disconnect wr1;
 disconnect wr2;
 disconnect wr3;
 disconnect wr4;
+
+DROP PROCEDURE p_wr1;
+DROP PROCEDURE p_wr2;
+DROP PROCEDURE p_wr3;
+DROP PROCEDURE p_wr4;
+DROP PROCEDURE p_loop_upd1_plus;
+DROP PROCEDURE p_loop_upd1_minus;
+DROP PROCEDURE p_loop_ins1;
+DROP PROCEDURE p_loop_ins2;
+DROP PROCEDURE p_storm;
 
 DROP TABLE sbtest1;
 DROP TABLE sbtest2;

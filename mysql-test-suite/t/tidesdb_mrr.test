@@ -9,7 +9,7 @@
 #
 
 SET @saved_opt_switch = @@optimizer_switch;
-SET optimizer_switch = 'mrr=on,mrr_sort_keys=on,mrr_cost_based=off';
+SET optimizer_switch = 'mrr=on,mrr_cost_based=off';
 
 --echo #
 --echo # TEST 1: IN (...) on PK (clustered-style point lookups)
@@ -75,7 +75,7 @@ EXPLAIN SELECT * FROM t_big
 
 SET optimizer_switch = 'mrr=off';
 SELECT * FROM t_pk WHERE id IN (7, 2, 9, 3, 5) ORDER BY id;
-SET optimizer_switch = 'mrr=on,mrr_sort_keys=on,mrr_cost_based=off';
+SET optimizer_switch = 'mrr=on,mrr_cost_based=off';
 SELECT * FROM t_pk WHERE id IN (7, 2, 9, 3, 5) ORDER BY id;
 
 --echo #

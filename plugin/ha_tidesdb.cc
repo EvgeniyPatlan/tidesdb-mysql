@@ -5861,13 +5861,19 @@ int ha_tidesdb::index_init(uint idx, bool sorted)
     scan_dir_ = DIR_NONE;
     spatial_scan_active_ = false;
 
-    /* Drop any stale ICP state left over from a previous scan on this same
-       handler instance for a different key. If we don't, in_range_check_pushed_down
-       may still be true from the prior scan -- handler::compare_key short-circuits
-       to 0 when it's set, so read_range_next stops enforcing end_range and rows
-       past the upper bound leak through (same shape as the PK push bug, but
-       triggered by handler reuse rather than a cross-key push). */
-    if (pushed_idx_cond_keyno != MAX_KEY && pushed_idx_cond_keyno != idx)
+    /* Drop stale ICP state left over from prior scans on this handler.
+       Clear when:
+        (a) the previous push targeted a different key, OR
+        (b) the optimizer cleared pushed_idx_cond but left
+            in_range_check_pushed_down set (stale push after
+            cancel_pushed_idx_cond was partially run, or after the engine
+            consumed the condition).
+       Without this, handler::compare_key short-circuits to 0 because
+       in_range_check_pushed_down is true, read_range_next stops enforcing
+       end_range, and rows past the upper bound leak through (UNION ALL on
+       the same secondary index reproduces this). */
+    if ((pushed_idx_cond_keyno != MAX_KEY && pushed_idx_cond_keyno != idx) ||
+        (pushed_idx_cond == nullptr && in_range_check_pushed_down))
         cancel_pushed_idx_cond();
 
     /* Cache is_pk for the duration of the scan so navigation methods can
