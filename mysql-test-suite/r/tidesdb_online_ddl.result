@@ -87,11 +87,8 @@ Note	1003	/* select#1 */ select `test`.`t_ddl`.`id` AS `id`,`test`.`t_ddl`.`a` A
 SELECT id, a FROM t_ddl WHERE a = 20;
 id	a
 2	20
-# ---- COPY: add column (NOT NULL DEFAULT). INSTANT ADD COLUMN
-#          is not yet implemented -- our row-format default
-#          back-fill has a bug for the INSTANT path; ALGORITHM=COPY
-#          rewrites all rows correctly with the default applied.
-ALTER TABLE t_ddl ADD COLUMN d INT NOT NULL DEFAULT 0, ALGORITHM=COPY;
+# ---- INSTANT: add column (NOT NULL DEFAULT) ----
+ALTER TABLE t_ddl ADD COLUMN d INT NOT NULL DEFAULT 0, ALGORITHM=INSTANT;
 SELECT id, d FROM t_ddl WHERE id = 1;
 id	d
 1	0
@@ -110,7 +107,9 @@ SELECT id, d FROM t_ddl WHERE id IN (1, 7) ORDER BY id;
 id	d
 1	0
 7	42
-# ---- COPY: drop column (INSTANT path symmetric with ADD COLUMN above) ----
+# ---- COPY: drop column. INSTANT DROP would need per-row schema
+#          versioning to track which positions were dropped; we don't
+#          have that, so DROP falls back to ALGORITHM=COPY.
 ALTER TABLE t_ddl DROP COLUMN d, ALGORITHM=COPY;
 SELECT * FROM t_ddl WHERE id = 1;
 id	a	b_name	c

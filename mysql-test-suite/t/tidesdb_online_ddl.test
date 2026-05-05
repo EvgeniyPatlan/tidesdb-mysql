@@ -59,11 +59,8 @@ SHOW INDEX FROM t_ddl;
 EXPLAIN SELECT id, a FROM t_ddl WHERE a = 20;
 SELECT id, a FROM t_ddl WHERE a = 20;
 
---echo # ---- COPY: add column (NOT NULL DEFAULT). INSTANT ADD COLUMN
---echo #          is not yet implemented -- our row-format default
---echo #          back-fill has a bug for the INSTANT path; ALGORITHM=COPY
---echo #          rewrites all rows correctly with the default applied.
-ALTER TABLE t_ddl ADD COLUMN d INT NOT NULL DEFAULT 0, ALGORITHM=COPY;
+--echo # ---- INSTANT: add column (NOT NULL DEFAULT) ----
+ALTER TABLE t_ddl ADD COLUMN d INT NOT NULL DEFAULT 0, ALGORITHM=INSTANT;
 SELECT id, d FROM t_ddl WHERE id = 1;
 
 --echo # ---- Verify old rows readable after ADD COLUMN ----
@@ -73,7 +70,9 @@ SELECT id, a, b_name, c, d FROM t_ddl ORDER BY id;
 INSERT INTO t_ddl VALUES (7, 70, 'eta', 700, 42);
 SELECT id, d FROM t_ddl WHERE id IN (1, 7) ORDER BY id;
 
---echo # ---- COPY: drop column (INSTANT path symmetric with ADD COLUMN above) ----
+--echo # ---- COPY: drop column. INSTANT DROP would need per-row schema
+--echo #          versioning to track which positions were dropped; we don't
+--echo #          have that, so DROP falls back to ALGORITHM=COPY.
 ALTER TABLE t_ddl DROP COLUMN d, ALGORITHM=COPY;
 SELECT * FROM t_ddl WHERE id = 1;
 

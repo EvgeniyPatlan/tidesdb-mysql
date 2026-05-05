@@ -78,7 +78,7 @@ Server-level system variables: `tidesdb_flush_threads`, `tidesdb_compaction_thre
 
 | Test layer | Result |
 |---|---|
-| `test-plugin.sh` (hand-rolled CRUD, 34 cases)        | **34/34 ✓** |
+| `test-plugin.sh` (hand-rolled CRUD, 35 cases)        | **35/35 ✓** |
 | `test-persistence.sh` (cross-restart durability)     | **PASS** |
 | `smoke-test.sh` (end-to-end pipeline)                | **all phases ✓** |
 | MTR suite lifted from TideSQL (52 tests)             | **48/48 executed pass, 4 skipped** |
@@ -91,6 +91,7 @@ What works:
 - `AUTO_INCREMENT`, `TRUNCATE TABLE`, `REPLACE INTO`, `INSERT … ON DUPLICATE KEY UPDATE`
 - **Secondary indexes (single-column AND composite)** with ICP; `UNIQUE KEY (a, b)` enforced even on tables with `AUTO_INCREMENT` PK
 - **Online DDL: `ALTER TABLE … ADD/DROP INDEX, ALGORITHM=INPLACE`** (concurrent reads OK; writes blocked while index populates)
+- **`ALGORITHM=INSTANT ADD COLUMN`** with NULL or NOT NULL DEFAULT — existing rows back-fill from `default_values` on read, no row rewrite
 - 2-phase commit via `prepare` hook → `ER_LOCK_DEADLOCK` surfaces cleanly to user code
 - Cross-restart persistence
 - `ALTER TABLE x ENGINE=TIDESDB` (engine conversion from InnoDB)
@@ -109,7 +110,7 @@ Skipped MTR tests (specific feature gaps, each documented inline):
 
 Not yet, but in-scope for follow-up work:
 
-- **`ALGORITHM=INSTANT` ADD/DROP COLUMN** — `ALGORITHM=COPY` works correctly (rewrites all rows), but the INSTANT path's row-format default-back-fill has a bug that mis-fills new column values for older rows. Falling back to COPY until the deserialize_row default-fill is fixed.
+- **`ALGORITHM=INSTANT DROP COLUMN`** — needs per-row schema versioning (à la InnoDB's INSTANT DROP) to remember which positions were dropped; without it, rows written under the old schema can't be unpacked under the new layout. `ALGORITHM=COPY` rewrites every row correctly and is the fallback.
 - **Atomic DDL via SDI** — registered but not exercised; restart-safe DDL is tracked in [phase4-atomic-ddl-investigation.md](docs/phase4-atomic-ddl-investigation.md).
 - **Replication, FK constraints, savepoint nesting** — not in scope yet.
 

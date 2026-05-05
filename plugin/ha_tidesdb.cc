@@ -5165,17 +5165,38 @@ void ha_tidesdb::deserialize_row(uchar *buf, const uchar *data, size_t len)
     uint unpack_count = MY_MIN(stored_fields, table->s->fields);
 
     /* Pre-fill default values for columns added after this row was written.
-       Copy each new field's bytes from default_values into buf so that
-       they have the correct DEFAULT even when the field is NOT NULL. */
+       For each newly-added field:
+        (1) copy the field's bytes from default_values into buf,
+        (2) re-derive the null bit from default_values and SET or CLEAR the
+            corresponding bit in buf's null bitmap.
+       Step (2) is critical: MySQL pre-initializes unused null-bitmap bits
+       to 1 in default_values, so existing rows already carry "1" in bit
+       positions that later become a new column's null bit. Just copying
+       the stored null bitmap leaves the new column marked NULL even when
+       its default is non-NULL. */
     if (stored_fields < table->s->fields)
     {
         my_ptrdiff_t def_off = (my_ptrdiff_t)(table->s->default_values - table->record[0]);
+        my_ptrdiff_t buf_off = (my_ptrdiff_t)(buf - table->record[0]);
         for (uint i = stored_fields; i < table->s->fields; i++)
         {
             Field *f = table->field[i];
             uchar *to = buf + (uintptr_t)(f->field_ptr() - table->record[0]);
             const uchar *def_src = (const uchar *)f->field_ptr() + def_off;
             memcpy(to, def_src, f->pack_length());
+
+            /* Restore the new column's null bit from default_values.
+               get_null_ptr() returns the field's null byte in record[0];
+               offset to default_values for the read, and offset to buf for
+               the write. */
+            if (f->is_nullable())
+            {
+                uchar *buf_null_byte = f->get_null_ptr() + buf_off;
+                if (f->is_real_null(def_off))
+                    *buf_null_byte |= f->null_bit;
+                else
+                    *buf_null_byte &= ~f->null_bit;
+            }
         }
     }
 
@@ -8943,13 +8964,16 @@ enum_alter_inplace_result ha_tidesdb::check_if_supported_inplace_alter(
     Alter_inplace_info::HA_ALTER_FLAGS flags = ha_alter_info->handler_flags;
 
     /* Pure-metadata operations -- INSTANT (no data rewrite, no index work).
-       Note: ADD/DROP COLUMN is intentionally NOT here. While our row format
-       carries field_count and deserialize_row can fill missing trailing
-       columns from default_values, the path doesn't currently round-trip
-       cleanly across DEFAULT + UPDATE + DROP COLUMN sequences (see hand-
-       rolled test 31_alter_add_drop_column). Falling back to ALGORITHM=COPY
-       guarantees correct rewrite. INSTANT here is reserved for changes that
-       genuinely don't touch row bytes. */
+       Our row format carries its own field_count + null_bytes header, so
+       deserialize_row can adapt to schema changes by back-filling missing
+       trailing columns from table->s->default_values.
+       Note: DROP COLUMN is NOT in this set. INSTANT DROP would shift
+       remaining field positions, but our row format records only
+       field_count -- not which fields were dropped -- so a row written
+       under the old schema can't be unpacked under the new one without
+       per-row schema versioning (InnoDB-style "instant DROP" metadata).
+       Falling back to ALGORITHM=COPY for DROP COLUMN rewrites every row
+       with the new layout, which is correct. */
     static const Alter_inplace_info::HA_ALTER_FLAGS TIDESDB_INSTANT =
         Alter_inplace_info::ALTER_COLUMN_NAME |
         Alter_inplace_info::ALTER_COLUMN_DEFAULT |
@@ -8958,7 +8982,10 @@ enum_alter_inplace_result ha_tidesdb::check_if_supported_inplace_alter(
         Alter_inplace_info::ALTER_VIRTUAL_GCOL_EXPR |
         Alter_inplace_info::ALTER_RENAME |
         Alter_inplace_info::RENAME_INDEX |
-        Alter_inplace_info::CHANGE_INDEX_OPTION;
+        Alter_inplace_info::CHANGE_INDEX_OPTION |
+        Alter_inplace_info::ADD_COLUMN |
+        Alter_inplace_info::ALTER_STORED_COLUMN_ORDER |
+        Alter_inplace_info::ALTER_VIRTUAL_COLUMN_ORDER;
 
     /* Operations we can do inplace (add/drop secondary indexes). */
     static const Alter_inplace_info::HA_ALTER_FLAGS TIDESDB_INPLACE_INDEX =
