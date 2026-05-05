@@ -2,7 +2,7 @@
 
 A **MySQL 9.7 storage engine plugin** that uses [TidesDB](https://github.com/tidesdb/tidesdb) — an LSM-tree key/value engine — as the row store. Builds as a loadable `ha_tidesdb.so`; install at runtime with `INSTALL PLUGIN`.
 
-> **Status: experimental / proof-of-concept.** Single-node CRUD works, type coverage is wide, and the lifted MTR suite is **fully green — 47/47 executed tests pass with 5 cleanly skipped** (each marked with the specific feature gap that prevents it: native partitioning, inplace ALTER, MySQL keyring, MySQL vector API, libtidesdb OCC granularity). See [Status](#status) for the full breakdown.
+> **Status: experimental / proof-of-concept.** Single-node CRUD works, type coverage is wide, and the lifted MTR suite is **fully green — 48/48 executed tests pass with 4 cleanly skipped** (each marked with the specific feature gap that prevents it: native partitioning, MySQL keyring, MySQL vector API, libtidesdb OCC granularity). See [Status](#status) for the full breakdown.
 
 This is a port of [TideSQL](https://github.com/tidesdb/tidesql) (TidesDB + MariaDB) to MySQL 9.7. Despite the family resemblance, MariaDB and MySQL have diverged enough at the handler API and data-dictionary layers that this is a rewrite-by-replay rather than a drop-in.
 
@@ -78,7 +78,7 @@ Server-level system variables: `tidesdb_flush_threads`, `tidesdb_compaction_thre
 
 | Test layer | Result |
 |---|---|
-| `test-plugin.sh` (hand-rolled CRUD, 35 cases)        | **35/35 ✓** |
+|  `test-plugin.sh` (hand-rolled CRUD, 36 cases)        | **36/36 ✓** |
 | `test-persistence.sh` (cross-restart durability)     | **PASS** |
 | `smoke-test.sh` (end-to-end pipeline)                | **all phases ✓** |
 | MTR suite lifted from TideSQL (52 tests)             | **48/48 executed pass, 4 skipped** |
@@ -92,6 +92,7 @@ What works:
 - **Secondary indexes (single-column AND composite)** with ICP; `UNIQUE KEY (a, b)` enforced even on tables with `AUTO_INCREMENT` PK
 - **Online DDL: `ALTER TABLE … ADD/DROP INDEX, ALGORITHM=INPLACE`** (concurrent reads OK; writes blocked while index populates)
 - **`ALGORITHM=INSTANT ADD COLUMN`** with NULL or NOT NULL DEFAULT — existing rows back-fill from `default_values` on read, no row rewrite
+- **`ALGORITHM=INSTANT DROP COLUMN`** when the dropped column is at the end of the table — no row rewrite. Mid-column drops fall back to `ALGORITHM=COPY` (still correct, just slower).
 - 2-phase commit via `prepare` hook → `ER_LOCK_DEADLOCK` surfaces cleanly to user code
 - Cross-restart persistence
 - `ALTER TABLE x ENGINE=TIDESDB` (engine conversion from InnoDB)
@@ -110,7 +111,7 @@ Skipped MTR tests (specific feature gaps, each documented inline):
 
 Not yet, but in-scope for follow-up work:
 
-- **`ALGORITHM=INSTANT DROP COLUMN`** — needs per-row schema versioning (à la InnoDB's INSTANT DROP) to remember which positions were dropped; without it, rows written under the old schema can't be unpacked under the new layout. `ALGORITHM=COPY` rewrites every row correctly and is the fallback.
+- **`ALGORITHM=INSTANT DROP COLUMN` for non-trailing columns** — currently falls back to `ALGORITHM=COPY` for middle-of-table drops. Lifting this requires per-row schema versioning (à la InnoDB's INSTANT DROP) so old rows can be remapped to the new layout. Trailing drops already work as INSTANT.
 - **Atomic DDL via SDI** — registered but not exercised; restart-safe DDL is tracked in [phase4-atomic-ddl-investigation.md](docs/phase4-atomic-ddl-investigation.md).
 - **Replication, FK constraints, savepoint nesting** — not in scope yet.
 

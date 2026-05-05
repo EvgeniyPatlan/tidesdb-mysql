@@ -1,0 +1,24 @@
++----+-------+-------+
+| id | name  | extra |
++----+-------+-------+
+|  1 | alice |    10 |
+|  2 | bob   |    20 |
+|  3 | carol |    30 |
++----+-------+-------+
++----+-------+-------+
+| id | name  | extra |
++----+-------+-------+
+|  1 | alice |    10 |
+|  2 | bob   |    20 |
+|  3 | carol |    30 |
+|  4 | dave  |    40 |
++----+-------+-------+
++----+-------+
+| id | name  |
++----+-------+
+|  1 | alice |
+|  2 | bob   |
+|  3 | carol |
+|  4 | dave  |
++----+-------+
+ERROR 1846 (0A000) at line 51: ALGORITHM=INSTANT is not supported. Reason: TidesDB INSTANT DROP COLUMN supports trailing columns only; use ALGORITHM=COPY for non-trailing drops. Try ALGORITHM=COPY/INPLACE.

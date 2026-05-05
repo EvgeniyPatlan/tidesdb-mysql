@@ -8967,13 +8967,12 @@ enum_alter_inplace_result ha_tidesdb::check_if_supported_inplace_alter(
        Our row format carries its own field_count + null_bytes header, so
        deserialize_row can adapt to schema changes by back-filling missing
        trailing columns from table->s->default_values.
-       Note: DROP COLUMN is NOT in this set. INSTANT DROP would shift
-       remaining field positions, but our row format records only
-       field_count -- not which fields were dropped -- so a row written
-       under the old schema can't be unpacked under the new one without
-       per-row schema versioning (InnoDB-style "instant DROP" metadata).
-       Falling back to ALGORITHM=COPY for DROP COLUMN rewrites every row
-       with the new layout, which is correct. */
+       DROP COLUMN is included here ONLY for the trailing-drop case --
+       that's safe because deserialize_row's unpack loop runs MIN(stored,
+       current) iterations and silently ignores extra trailing bytes from
+       the old format. Mid-column drops would shift remaining field
+       positions and need per-row schema versioning we don't have, so we
+       downgrade those to ALGORITHM=COPY below. */
     static const Alter_inplace_info::HA_ALTER_FLAGS TIDESDB_INSTANT =
         Alter_inplace_info::ALTER_COLUMN_NAME |
         Alter_inplace_info::ALTER_COLUMN_DEFAULT |
@@ -8984,6 +8983,7 @@ enum_alter_inplace_result ha_tidesdb::check_if_supported_inplace_alter(
         Alter_inplace_info::RENAME_INDEX |
         Alter_inplace_info::CHANGE_INDEX_OPTION |
         Alter_inplace_info::ADD_COLUMN |
+        Alter_inplace_info::DROP_COLUMN |
         Alter_inplace_info::ALTER_STORED_COLUMN_ORDER |
         Alter_inplace_info::ALTER_VIRTUAL_COLUMN_ORDER;
 
@@ -8997,7 +8997,30 @@ enum_alter_inplace_result ha_tidesdb::check_if_supported_inplace_alter(
 
     /* Pure-INSTANT (data-dictionary update only) */
     if (!(flags & ~TIDESDB_INSTANT))
+    {
+        /* Special-case DROP COLUMN: only safe as INSTANT when ALL dropped
+           columns are at the END of the table -- otherwise field positions
+           shift and rows written under the old schema unpack into the wrong
+           field slots. Detect this by comparing the first N field names of
+           the altered table against the original; any mismatch means a
+           non-trailing column was removed and we must rebuild via COPY. */
+        if (flags & Alter_inplace_info::DROP_COLUMN)
+        {
+            for (uint i = 0; i < altered_table->s->fields; i++)
+            {
+                if (i >= table->s->fields ||
+                    strcmp(altered_table->field[i]->field_name,
+                           table->field[i]->field_name) != 0)
+                {
+                    ha_alter_info->unsupported_reason =
+                        "TidesDB INSTANT DROP COLUMN supports trailing columns only; "
+                        "use ALGORITHM=COPY for non-trailing drops";
+                    DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
+                }
+            }
+        }
         DBUG_RETURN(HA_ALTER_INPLACE_INSTANT);
+    }
 
     /* INSTANT + secondary-index changes -- INPLACE with shared lock.
        Concurrent reads OK; concurrent writes blocked while the index
