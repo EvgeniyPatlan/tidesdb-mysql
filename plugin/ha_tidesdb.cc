@@ -1973,6 +1973,19 @@ static MYSQL_SYSVAR_STR(data_home_dir, srv_data_home_dir, PLUGIN_VAR_RQCMDARG | 
                         "must be set before server startup (read-only)",
                         NULL, NULL, NULL);
 
+/* tidesdb_master_key_file: path to a 32-byte file holding the AES-256
+   master key used by every encrypted CREATE TABLE. Read once at plugin
+   init; if absent, missing, or wrong size, encryption stays unavailable
+   and any CREATE TABLE ... ENGINE_ATTRIBUTE='{"encrypted":true}' fails
+   with a clear error. */
+static char *srv_master_key_file = NULL;
+static MYSQL_SYSVAR_STR(master_key_file, srv_master_key_file,
+                        PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                        "Path to a 32-byte AES-256 master key file. Loaded once "
+                        "at plugin init; required for any table created with "
+                        "ENGINE_ATTRIBUTE='{\"encrypted\":true}'.",
+                        NULL, NULL, NULL);
+
 /* ******************** Object Store Configuration ******************** */
 
 /* Object store backend (0=LOCAL (no object store), 1=S3) */
@@ -2251,6 +2264,7 @@ static SYS_VAR *tidesdb_system_variables[] = {
     MYSQL_SYSVAR(ft_stopword_table),
     MYSQL_SYSVAR(fts_blend_chars),
     MYSQL_SYSVAR(data_home_dir),
+    MYSQL_SYSVAR(master_key_file),
     MYSQL_SYSVAR(ttl),
     MYSQL_SYSVAR(skip_unique_check),
     MYSQL_SYSVAR(single_delete_primary),
@@ -3665,6 +3679,18 @@ static void tidesdb_hton_kill_query(handlerton *, THD *thd, enum thd_kill_levels
 static int tidesdb_init_func(void *p)
 {
     DBUG_ENTER("tidesdb_init_func");
+
+    /* Bootstrap the master key for at-rest encryption if the DBA pointed
+       us at a key file. Failures are non-fatal at init -- they just mean
+       any CREATE TABLE asking for encryption will return a clear error.
+       Successfully loaded keys are kept in process memory until shutdown. */
+    if (srv_master_key_file && srv_master_key_file[0])
+    {
+        if (tidesdb_master_key_load_from_file(srv_master_key_file))
+            sql_print_warning("[TIDESDB] master key file '%s' could not be loaded; "
+                              "encrypted tables will be unavailable",
+                              srv_master_key_file);
+    }
 
     tidesdb_hton = (handlerton *)p;
     tidesdb_hton->create = tidesdb_create_handler;

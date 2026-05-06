@@ -1,11 +1,12 @@
 --source suite/tidesdb/include/have_tidesdb.inc
 
-# MariaDB's file_key_management keyring plugin doesn't exist on MySQL --
-# MySQL ships keyring_file / keyring_okv / etc. Re-enabling this test
-# requires bootstrapping a MySQL keyring (e.g., keyring_file with
-# --early-plugin-load and --keyring-file-data) and porting the per-table
-# ENCRYPTED= grammar. Out of scope for the initial port.
---skip MariaDB-only file_key_management keyring plugin; needs MySQL keyring port
+# Bootstrap: tidesdb_encryption.opt loads a 32-byte master key from
+# suite/tidesdb/std_data/tidesdb_master.key. Skip if the engine reports
+# the key wasn't loaded (lets us run on configs without the .opt).
+if (`SELECT @@GLOBAL.tidesdb_master_key_file IS NULL OR @@GLOBAL.tidesdb_master_key_file = ''`)
+{
+    --skip Master key file not configured; pass --tidesdb-master-key-file
+}
 
 --echo #
 --echo # ============================================

@@ -162,7 +162,8 @@ IF(TIDESDB_WITH_S3)
 ENDIF()
 
 ############# Define the storage engine using MariaDB's MYSQL_ADD_PLUGIN macro #############
-MYSQL_ADD_PLUGIN(tidesdb ha_tidesdb.cc STORAGE_ENGINE MODULE_ONLY LINK_LIBRARIES ${TIDESDB_LIBS})
+MYSQL_ADD_PLUGIN(tidesdb ha_tidesdb.cc tidesdb_keyring_compat.cc
+                 STORAGE_ENGINE MODULE_ONLY LINK_LIBRARIES ${TIDESDB_LIBS})
 
 ############# S3 compile definition for the plugin #############
 IF(TIDESDB_WITH_S3)

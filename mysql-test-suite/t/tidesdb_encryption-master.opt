@@ -1,0 +1,1 @@
+--tidesdb-master-key-file=$MYSQL_TEST_DIR/suite/tidesdb/std_data/tidesdb_master.key
