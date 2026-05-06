@@ -71,7 +71,7 @@ UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_w_id=1 AND d_id=1;
 # All 4 UPDATEs succeeded through serialized row locks: 5001 + 4 = 5005
 SELECT d_next_o_id FROM district WHERE d_w_id=1 AND d_id=1;
 d_next_o_id
-5002
+5005
 #
 # === Cleanup ===
 #

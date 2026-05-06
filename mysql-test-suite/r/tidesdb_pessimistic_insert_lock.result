@@ -7,25 +7,18 @@ i INT,
 PRIMARY KEY (i)
 ) ENGINE=TidesDB;
 INSERT INTO t VALUES (1), (2), (3), (4), (5);
-connect  conA, localhost, root,,;
-connect  conB, localhost, root,,;
 #
 # TEST 1: SELECT FOR UPDATE on non-existing row blocks DELETE
 #   Connection A locks i=15 (does not exist).
 #   Connection B deletes i=2 (succeeds immediately),
 #   then tries to delete i=15 (must block).
 #
-connection conA;
 BEGIN;
 SELECT * FROM t WHERE i = 15 FOR UPDATE;
 i
-connection conB;
 DELETE FROM t WHERE i = 2;
 DELETE FROM t WHERE i = 15;
-connection conA;
 COMMIT;
-connection conB;
-connection default;
 # i=2 and i=15 both deleted (i=15 was no-op but lock was respected)
 SELECT * FROM t ORDER BY i;
 i
@@ -42,16 +35,11 @@ i
 DROP TABLE t;
 CREATE TABLE t (i INT, PRIMARY KEY (i)) ENGINE=TidesDB;
 INSERT INTO t VALUES (1), (2), (3), (4), (5);
-connection conA;
 BEGIN;
 DELETE FROM t WHERE i = 3;
-connection conB;
 DELETE FROM t WHERE i = 4;
 DELETE FROM t WHERE i = 3;
-connection conA;
 COMMIT;
-connection conB;
-connection default;
 # i=3 and i=4 both deleted
 SELECT * FROM t ORDER BY i;
 i
@@ -64,16 +52,11 @@ i
 DROP TABLE t;
 CREATE TABLE t (i INT, v INT, PRIMARY KEY (i)) ENGINE=TidesDB;
 INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
-connection conA;
 BEGIN;
 UPDATE t SET v = 99 WHERE i = 3;
-connection conB;
 UPDATE t SET v = 88 WHERE i = 2;
 UPDATE t SET v = 77 WHERE i = 3;
-connection conA;
 COMMIT;
-connection conB;
-connection default;
 # conA set v=99, then conB overwrote with v=77
 SELECT * FROM t ORDER BY i;
 i	v
@@ -89,16 +72,11 @@ i	v
 DROP TABLE t;
 CREATE TABLE t (i INT, PRIMARY KEY (i)) ENGINE=TidesDB;
 INSERT INTO t VALUES (1), (2), (3), (4), (5);
-connection conA;
 BEGIN;
 SELECT * FROM t WHERE i = 15 FOR UPDATE;
 i
-connection conB;
 INSERT INTO t VALUES (15);
-connection conA;
 COMMIT;
-connection conB;
-connection default;
 # i=15 now exists (inserted by conB after conA released the lock)
 SELECT * FROM t WHERE i >= 10 ORDER BY i;
 i
@@ -111,15 +89,10 @@ i
 DROP TABLE t;
 CREATE TABLE t (i INT, PRIMARY KEY (i)) ENGINE=TidesDB;
 INSERT INTO t VALUES (1), (2), (3), (4), (5);
-connection conA;
 BEGIN;
 DELETE FROM t WHERE i = 3;
-connection conB;
 INSERT INTO t VALUES (3);
-connection conA;
 COMMIT;
-connection conB;
-connection default;
 # i=3 was deleted by conA, then re-inserted by conB
 SELECT * FROM t ORDER BY i;
 i
@@ -133,14 +106,10 @@ i
 #
 DROP TABLE t;
 CREATE TABLE t (i INT, PRIMARY KEY (i)) ENGINE=TidesDB;
-connection conA;
 BEGIN;
 INSERT INTO t VALUES (100);
-connection conB;
 INSERT INTO t VALUES (200);
-connection conA;
 COMMIT;
-connection default;
 # Both inserts succeeded without blocking
 SELECT * FROM t ORDER BY i;
 i
@@ -152,17 +121,12 @@ i
 DROP TABLE t;
 CREATE TABLE t (i INT, PRIMARY KEY (i)) ENGINE=TidesDB;
 INSERT INTO t VALUES (1), (2), (3), (4), (5);
-connection conA;
 BEGIN;
 SELECT * FROM t WHERE i = 3 FOR UPDATE;
 i
 3
-connection conB;
 UPDATE t SET i = 33 WHERE i = 3;
-connection conA;
 COMMIT;
-connection conB;
-connection default;
 # conA released lock, then conB's autocommit UPDATE renamed i=3 to i=33
 SELECT * FROM t ORDER BY i;
 i
@@ -174,8 +138,5 @@ i
 #
 # Cleanup
 #
-disconnect conA;
-disconnect conB;
-connection default;
 DROP TABLE t;
 # Done.

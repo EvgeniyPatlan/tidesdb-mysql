@@ -1,16 +1,17 @@
 --source suite/tidesdb/include/have_tidesdb.inc
 
-# Multi-connection cross-row commit interaction. The test's TEST 2 has
-# conA delete i=3 inside a txn while conB autocommit-deletes i=4 then
-# blocks on conA's i=3 lock; conA's COMMIT is expected to succeed.
-# Under MySQL 9.7 with the prepare-phase commit (needed to surface
-# ER_LOCK_DEADLOCK to user code -- see tidesdb_concurrent_conflict),
-# TidesDB's OCC flags conA's txn as conflicting with conB's already-
-# committed write on i=4, even though conA never touched i=4. This
-# requires either finer-grained read-set tracking in libtidesdb or
-# a way to opt out of OCC validation when pessimistic locking is on.
-# Out of scope for the initial port.
---skip TidesDB OCC false-positive vs MySQL pessimistic-lock semantics; needs libtidesdb fix
+# Bootstrapping: tidesdb_pessimistic_insert_lock-master.opt sets
+# --tidesdb-pessimistic-locking=ON. With pessimistic locking enabled,
+# the engine downgrades the TidesDB transaction isolation to
+# READ_COMMITTED (no engine-level OCC) -- the SQL-layer row-lock
+# manager already serialises every writer, so commit-time conflict
+# detection just produces false positives on cross-row writes.
+# Skip cleanly if the option wasn't picked up (e.g. running with a
+# config that disables pessimistic locking).
+if (`SELECT @@GLOBAL.tidesdb_pessimistic_locking = 0`)
+{
+    --skip Pessimistic locking not enabled; this test requires --tidesdb-pessimistic-locking=ON
+}
 
 #
 # Test: Pessimistic locking edge cases from GitHub issue

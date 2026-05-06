@@ -2,7 +2,7 @@
 
 A **MySQL 9.7 storage engine plugin** that uses [TidesDB](https://github.com/tidesdb/tidesdb) — an LSM-tree key/value engine — as the row store. Builds as a loadable `ha_tidesdb.so`; install at runtime with `INSTALL PLUGIN`.
 
-> **Status: experimental / proof-of-concept.** Single-node CRUD works, type coverage is wide, and the lifted MTR suite is **fully green — 49/49 executed tests pass with 3 cleanly skipped** (each marked with the specific feature gap that prevents it: native partitioning, MySQL vector API, libtidesdb OCC granularity). See [Status](#status) for the full breakdown.
+> **Status: experimental / proof-of-concept.** Single-node CRUD works, type coverage is wide, and the lifted MTR suite is **fully green — 50/50 executed tests pass with 2 cleanly skipped** (each marked with the specific feature gap that prevents it: native partitioning, MySQL vector API). See [Status](#status) for the full breakdown.
 
 This is a port of [TideSQL](https://github.com/tidesdb/tidesql) (TidesDB + MariaDB) to MySQL 9.7. Despite the family resemblance, MariaDB and MySQL have diverged enough at the handler API and data-dictionary layers that this is a rewrite-by-replay rather than a drop-in.
 
@@ -81,7 +81,7 @@ Server-level system variables: `tidesdb_flush_threads`, `tidesdb_compaction_thre
 |  `test-plugin.sh` (hand-rolled CRUD, 37 cases)        | **37/37 ✓** |
 | `test-persistence.sh` (cross-restart durability)     | **PASS** |
 | `smoke-test.sh` (end-to-end pipeline)                | **all phases ✓** |
-| MTR suite lifted from TideSQL (52 tests)             | **49/49 executed pass, 3 skipped** |
+| MTR suite lifted from TideSQL (52 tests)             | **50/50 executed pass, 2 skipped** |
 
 What works:
 
@@ -94,6 +94,7 @@ What works:
 - **`ALGORITHM=INSTANT ADD COLUMN`** with NULL or NOT NULL DEFAULT — existing rows back-fill from `default_values` on read, no row rewrite
 - **`ALGORITHM=INSTANT DROP COLUMN`** when the dropped column is at the end of the table — no row rewrite. Mid-column drops fall back to `ALGORITHM=COPY` (still correct, just slower).
 - **At-rest encryption (AES-256-CBC)** via a master-key file pointed to by `--tidesdb-master-key-file=<path>` (32 bytes raw key); per-table opt-in with `ENGINE_ATTRIBUTE='{"encrypted":true}'`
+- **Pessimistic row locking** (opt-in via `--tidesdb-pessimistic-locking=ON`) — InnoDB-style row-level locks for write workloads; engine-level OCC is automatically downgraded to TidesDB `READ_COMMITTED` so the SQL-layer lock manager handles serialization without false-positive commit conflicts.
 - 2-phase commit via `prepare` hook → `ER_LOCK_DEADLOCK` surfaces cleanly to user code
 - Cross-restart persistence
 - `ALTER TABLE x ENGINE=TIDESDB` (engine conversion from InnoDB)
@@ -107,7 +108,6 @@ Skipped MTR tests (specific feature gaps, each documented inline):
 
 - **`tidesdb_partition`** — native partitioning (HA_HAS_OWN_PARTITIONING + helper virtuals) not implemented; MySQL 8+ removed the legacy `ha_partition` shim.
 - **`tidesdb_vector`** — uses MariaDB's `VECTOR(N)` column type / `VECTOR INDEX` DDL; needs rewrite against MySQL 9 vector functions.
-- **`tidesdb_pessimistic_insert_lock`** — TidesDB OCC false-positives on cross-row writes when prepare-phase commit surfaces conflicts (was hidden by old "silent commit on conflict" path); needs libtidesdb fix.
 
 Not yet, but in-scope for follow-up work:
 

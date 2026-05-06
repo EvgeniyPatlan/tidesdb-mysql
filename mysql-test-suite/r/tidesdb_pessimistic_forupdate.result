@@ -25,7 +25,7 @@ COMMIT;
 # Both succeeded: 3001 + 1 (conA) + 1 (conB) = 3003
 SELECT d_next_o_id FROM district WHERE d_w_id=1 AND d_id=1;
 d_next_o_id
-3002
+3003
 #
 # TEST 2: Stored procedure with SELECT FOR UPDATE
 #   Mimics TPC-C NEWORD pattern inside a CALL

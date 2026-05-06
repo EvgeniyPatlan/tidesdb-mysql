@@ -2549,6 +2549,21 @@ static const int tdb_isolation_map[] = {TDB_ISOLATION_READ_UNCOMMITTED,
 static tidesdb_isolation_level_t resolve_effective_isolation(THD *thd,
                                                              tidesdb_isolation_level_t table_iso)
 {
+    /* Pessimistic locking serialises every writer through the row-lock
+       manager at the SQL layer, so TidesDB's commit-time conflict
+       detection is not just unnecessary but actively harmful: it sees
+       every committed write since txn start as a "conflict candidate"
+       even when our SQL-layer locks already guaranteed the write was
+       safe. TidesDB's READ_COMMITTED has no conflict detection, which
+       is exactly what we want -- mirrors how InnoDB's pessimistic-lock
+       path runs without OCC validation. Without this, the
+       tidesdb_pessimistic_insert_lock pattern (conA holds row lock on
+       i=3 while conB autocommit-deletes i=4 then blocks on i=3)
+       false-positives on conA's COMMIT because conB's i=4 commit
+       advances the global commit sequence. */
+    if (srv_pessimistic_locking)
+        return TDB_ISOLATION_READ_COMMITTED;
+
     int session_iso = thd_tx_isolation(thd);
 
     switch (session_iso)
