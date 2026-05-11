@@ -22,6 +22,7 @@ mtr-tmp/
 test-data/
 tidesdb_data/
 tidesdb-prefix/
+tests/results-*/
 
 # Logs
 *.log

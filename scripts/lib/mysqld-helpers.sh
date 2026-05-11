@@ -6,12 +6,12 @@
 #   REPO       - repo root (default /work)
 #   DATA       - mysqld data dir (default /tmp/tidesdb-data)
 #   PORT       - tcp port for mysqld (default 3307; --skip-networking by default)
-#   PLUGIN_DIR - default $REPO/mysql-server/build/plugin_output_directory
+#   PLUGIN_DIR - default $REPO/vendor/mysql-server/build/plugin_output_directory
 
 set -uo pipefail
 
 : "${REPO:=/work}"
-: "${BUILD:=$REPO/mysql-server/build}"
+: "${BUILD:=$REPO/vendor/mysql-server/build}"
 : "${MYSQLD:=$BUILD/runtime_output_directory/mysqld}"
 : "${MYSQL:=$BUILD/runtime_output_directory/mysql}"
 : "${PLUGIN_DIR:=$BUILD/plugin_output_directory}"
