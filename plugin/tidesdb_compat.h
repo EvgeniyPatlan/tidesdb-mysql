@@ -24,6 +24,7 @@
 #pragma once
 
 #include <cassert>
+#include <cerrno>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
@@ -50,8 +51,9 @@ using my_ptrdiff_t = ptrdiff_t;
 
 /* MariaDB cost type used in scan_time() / read_time(). MySQL uses plain double.
  * Stub as a struct that decays to double via implicit conversion so call sites
- * that do `cost.io + cost.cpu` keep compiling. Round 4 will replace the real
- * scan_time/read_time bodies with double returns. */
+ * that do `cost.io + cost.cpu` keep compiling. scan_time() already returns a
+ * plain double; the struct is kept for the non-virtual cost helpers
+ * (keyread_time / rnd_pos_time) that still use it internally. */
 struct IO_AND_CPU_COST {
     double io;
     double cpu;
@@ -188,7 +190,7 @@ struct page_range {
 
 /* MariaDB exposes thd_kill_levels enum at top scope; MySQL has it inside
  * the THD class. Forward-declare it as a simple enum so engines that
- * compare against it compile. Phase 4: use THD::Killed_state. */
+ * compare against it compile. TODO: switch to THD::Killed_state. */
 enum thd_kill_levels {
     THD_IS_NOT_KILLED = 0,
     THD_ABORT_SOFTLY = 50,
@@ -203,7 +205,9 @@ inline int handler_index_cond_check(void * /*opaque*/) { return 0; }
  * mysql_mutex_t (C++17 inline variable for single-instance) so TideSQL's
  * { mysql_mutex_lock(&LOCK_global_system_variables); ... } sites compile.
  * Initialized lazily on first use; never destroyed (deliberate — short-lived
- * server lifecycle). Phase 4: replace with proper sysvar serialization. */
+ * server lifecycle). Currently unused in the MySQL port: all global sysvar
+ * reads happen under MySQL's own LOCK_global_system_variables before the
+ * engine ever runs. Kept for compilation of any future ported call sites. */
 #include "mysql/psi/mysql_mutex.h"
 inline mysql_mutex_t LOCK_global_system_variables{};
 
@@ -217,7 +221,30 @@ inline struct stat *mysql_file_stat(unsigned int /*key*/, const char *path,
 #endif
 
 #ifndef my_rmtree
-inline int my_rmtree(const char* /*path*/, int /*flags*/) { return 0; }  /* TODO: real impl */
+/* Recursive directory removal. Walks `path` depth-first and unlinks every
+ * regular file / directory found, then removes `path` itself. Used by
+ * force_remove_cf_dir() to wipe a column-family's on-disk SSTables and
+ * WAL after the underlying CF was dropped but stale fds (block cache,
+ * background workers) kept the directory partially populated.
+ *
+ * Returns 0 on success, non-zero on the first unrecoverable error.
+ * Missing path is treated as success (caller already stat()'d). Symlinks
+ * are not followed (FTW_PHYS). */
+#include <ftw.h>
+inline int my_rmtree_visit_(const char *fpath, const struct stat * /*sb*/,
+                            int /*typeflag*/, struct FTW * /*ftwbuf*/) {
+    /* remove() handles both files (unlink) and empty dirs (rmdir).
+     * FTW_DEPTH guarantees children are visited before their parent. */
+    return ::remove(fpath);
+}
+inline int my_rmtree(const char *path, int /*flags*/) {
+    if (!path) return -1;
+    /* nopenfd=64 caps concurrent fd usage during the walk. */
+    if (nftw(path, my_rmtree_visit_, 64, FTW_DEPTH | FTW_PHYS) != 0) {
+        return (errno == ENOENT) ? 0 : -1;
+    }
+    return 0;
+}
 #endif
 
 #ifndef my_random_bytes
@@ -277,16 +304,18 @@ struct ha_create_table_option {
 #endif
 
 /* HA_ERR_* values that MariaDB defines but MySQL doesn't. Map to the closest
- * generic MySQL error so the engine can still report failure. Refine in
- * Round 4 when we audit error reporting end-to-end. */
+ * generic MySQL error so the engine can still report failure. TODO: audit
+ * error reporting end-to-end and use a more specific MySQL HA_ERR_* code
+ * where the original MariaDB code carried distinct semantics. */
 #ifndef HA_ERR_ABORTED_BY_USER
 #define HA_ERR_ABORTED_BY_USER HA_ERR_GENERIC
 #endif
 
 /* MariaDB row-status code used in iterator/scan paths. MySQL has nothing
  * equivalent at this layer — rnd_next returns HA_ERR_END_OF_FILE. Map to
- * the engine-internal value -1 so comparisons stop failing. Use sites
- * may need real edits in Round 4. */
+ * the engine-internal value -1 so comparisons stop failing. (Some use
+ * sites may want explicit HA_ERR_END_OF_FILE handling instead of the
+ * generic sentinel; not a correctness issue today.) */
 #ifndef STATUS_NOT_FOUND
 #define STATUS_NOT_FOUND (-1)
 #endif
@@ -309,8 +338,8 @@ struct ha_create_table_option {
 /* CHECK_* enum values from MariaDB's check_result_t.
  * MySQL uses HA_ADMIN_* return codes; semantics are similar. The literal
  * integers below are arbitrary — TideSQL only compares them, never sends
- * them to MySQL. We can refine in Round 4 if a test actually depends on
- * specific bit patterns. */
+ * them to MySQL. Worth refining if a test ever depends on specific
+ * bit patterns. */
 #ifndef CHECK_ABORTED_BY_USER
 #define CHECK_ABORTED_BY_USER 1
 #endif
@@ -325,8 +354,8 @@ struct ha_create_table_option {
 #endif
 
 /* HA_CAN_* table-flags advertisements: MariaDB-only capabilities. Set to 0
- * so they contribute nothing to the table_flags() bitmap. We re-enable
- * specific flags in Phase 4 when (and if) we add the underlying support. */
+ * so they contribute nothing to the table_flags() bitmap. Re-enable
+ * specific flags if/when the underlying support is added. */
 #ifndef HA_CAN_ONLINE_BACKUPS
 #define HA_CAN_ONLINE_BACKUPS 0
 #endif
@@ -364,8 +393,9 @@ struct ha_create_table_option {
 
 /* ----- Category 7: Logging stubs -----
  * MariaDB has free functions sql_print_{information,warning,error}.
- * MySQL 8.0+ removed them in favor of LogErr() / LogPlugin*(). For Phase 2,
- * stub to fprintf(stderr) — switch to LogErr in Phase 4. */
+ * MySQL 8.0+ removed them in favor of LogErr() / LogPlugin*(). For now
+ * the engine writes to stderr — TODO: switch to MySQL's LogErr() /
+ * LogPlugin*() for structured log output. */
 inline void sql_print_information(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     std::fputs("[Note] [tidesdb] ", stderr);

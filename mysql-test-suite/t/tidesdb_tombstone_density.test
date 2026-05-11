@@ -1,6 +1,6 @@
 --source suite/tidesdb/include/have_tidesdb.inc
 #
-# Coverage for the new TidesDB 9.1 capabilities exposed in TideSQL 4.4.0:
+# Coverage for TidesDB 9.1 tombstone-density features exposed by this plugin:
 # - per-table TOMBSTONE_DENSITY_TRIGGER and TOMBSTONE_DENSITY_MIN_ENTRIES
 # - tidesdb_default_tombstone_density_* THDVAR defaults
 # - tidesdb_compact_after_range_delete_min_rows auto-trigger session variable

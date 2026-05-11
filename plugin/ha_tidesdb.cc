@@ -47,14 +47,16 @@ extern "C"
 /* MariaDB exposes per-table options via TABLE_SHARE::option_struct (an
  * engine-defined struct populated from CREATE TABLE syntax via
  * ha_create_table_option[] registration). MySQL 9.7 has no equivalent —
- * engine-specific table options come through SQL COMMENTs or the newer
- * ENGINE_ATTRIBUTE/SECONDARY_ENGINE_ATTRIBUTE JSON fields, neither of which
- * we wire up in Phase 2.
+ * engine-specific table options come through the ENGINE_ATTRIBUTE /
+ * SECONDARY_ENGINE_ATTRIBUTE JSON fields.
  *
  * Stub the option accessor to nullptr so existing `if (opts && opts->X)`
  * null-checks throughout TideSQL short-circuit cleanly, giving every table
- * the engine's compiled defaults. Phase 4 work: parse the user-supplied
- * options out of ENGINE_ATTRIBUTE JSON. */
+ * the engine's compiled defaults.
+ *
+ * TODO: wire tidesdb_engine_attribute_to_options() (defined further down)
+ * into create()/open() so per-table ENGINE_ATTRIBUTE JSON actually reaches
+ * the column-family config. The parser exists; the call site does not. */
 #define TDB_TABLE_OPTIONS(tbl) (static_cast<ha_table_option_struct *>(nullptr))
 #define TDB_INDEX_OPTIONS(keyref) (static_cast<ha_index_option_struct *>(nullptr))
 #define TDB_FIELD_OPTIONS(fldref) (static_cast<ha_field_option_struct *>(nullptr))
@@ -71,11 +73,11 @@ static constexpr size_t LAST_CONFLICT_INFO_LEN = 1024;
 static char last_conflict_info[LAST_CONFLICT_INFO_LEN] = "";
 
 /*
-  Map TidesDB library error codes to MariaDB handler error codes.
+  Map TidesDB library error codes to MySQL handler error codes.
   Transient errors (conflict, lock contention, memory pressure) are mapped
-  to HA_ERR_LOCK_DEADLOCK so that MariaDB's deadlock-retry logic kicks in
-  and applications can retry automatically instead of
-  receiving the opaque HA_ERR_GENERIC / ER_GET_ERRNO 1030.
+  to HA_ERR_LOCK_DEADLOCK so that the application receives ER_LOCK_DEADLOCK
+  (1213) and can retry in its own retry loop, instead of seeing the opaque
+  HA_ERR_GENERIC / ER_GET_ERRNO 1030.
 */
 static int tdb_rc_to_ha(int rc, const char *ctx)
 {
@@ -84,7 +86,7 @@ static int tdb_rc_to_ha(int rc, const char *ctx)
         case TDB_SUCCESS:
             return 0;
 
-        /* Transient concurrency errors -- mapped to deadlock so MariaDB
+        /* Transient concurrency errors -- mapped to deadlock so MySQL
            rolls back the transaction and the application can retry. */
         case TDB_ERR_CONFLICT:
             if (unlikely(srv_print_all_conflicts))
@@ -2370,7 +2372,10 @@ struct ha_table_option_struct
  *   "write_buffer_size"     : <number bytes>
  *   "ttl"                   : <number seconds>
  *   "block_indexes"         : bool
- *   "encrypted"             : bool   (compile-time stubbed; runtime errors)
+ *   "encrypted"             : bool   (parsed here, but currently ineffective —
+ *                              TDB_TABLE_OPTIONS() returns nullptr at the
+ *                              create()/open() call sites, so the value is
+ *                              never forwarded to the CF config)
  *   "encryption_key_id"     : <number>
  *
  * Returns true if the JSON parsed cleanly (or attr was empty); false on
@@ -2421,11 +2426,12 @@ static bool tidesdb_engine_attribute_to_options(LEX_CSTRING attr,
 }
 
 
-#if 0  /* MariaDB-only ha_create_table_option DSL — stubbed for MySQL Phase 2.
+#if 0  /* MariaDB-only ha_create_table_option DSL — stubbed for MySQL.
         * MySQL 9.7 has no equivalent macro family (HA_TOPTION_*); per-table
-        * options come through ENGINE_ATTRIBUTE JSON instead. Phase 4 will
-        * port this list to MySQL's mechanism. Until then TDB_TABLE_OPTIONS()
-        * returns nullptr and every table uses compiled defaults. */
+        * options come through ENGINE_ATTRIBUTE JSON instead. TODO: port
+        * this list to MySQL's ENGINE_ATTRIBUTE path. Until then
+        * TDB_TABLE_OPTIONS() returns nullptr and every table uses compiled
+        * defaults. */
 ha_create_table_option tidesdb_table_option_list[] = {
     /* Options with SYSVAR defaults inherit from session variables
        (e.g. SET SESSION tidesdb_default_write_buffer_size=64*1024*1024).
@@ -2476,7 +2482,7 @@ struct ha_field_option_struct
     bool ttl; /* marks this column as the per-row TTL source (seconds) */
 };
 
-#if 0  /* same Phase-2 stubbing as tidesdb_table_option_list */
+#if 0  /* same MariaDB-only stubbing as tidesdb_table_option_list */
 ha_create_table_option tidesdb_field_option_list[] = {HA_FOPTION_BOOL("TTL", ttl, 0),
                                                       HA_FOPTION_END};
 #endif
@@ -2488,7 +2494,7 @@ struct ha_index_option_struct
     bool use_btree; /* per-index B-tree override; -1 = inherit from table */
 };
 
-#if 0  /* same Phase-2 stubbing as tidesdb_table_option_list */
+#if 0  /* same MariaDB-only stubbing as tidesdb_table_option_list */
 ha_create_table_option tidesdb_index_option_list[] = {HA_IOPTION_BOOL("USE_BTREE", use_btree, 0),
                                                       HA_IOPTION_END};
 #endif
@@ -3226,9 +3232,13 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
 
 /* ******************** Schema discovery (object store mode) ******************** */
 /*
-  The __tidesql_schema column family stores .frm binaries so that replicas
-  can discover table definitions via the handlerton discovery API.  On
-  local-only mode schema_cf is NULL and all helpers are no-ops.
+  The __tidesql_schema column family records table CF-names so DROP TABLE
+  can find the underlying CF, and (in object-store mode) which database
+  directories to create on replicas. The MariaDB discover_table /
+  discover_table_names hooks that originally consumed .frm binaries from
+  this CF are #if 0'd for MySQL -- MySQL uses the Data Dictionary instead,
+  so no .frm bytes are stored here. On local-only mode schema_cf is NULL
+  and all helpers are no-ops.
 */
 
 /*
@@ -3514,7 +3524,8 @@ static int tidesdb_discover_table(handlerton *, THD *thd, TABLE_SHARE *share)
 
     /* MySQL has no init_from_binary_frm_image — schema discovery from
      * stored .frm bytes is a MariaDB feature; MySQL uses the Data Dictionary.
-     * Phase 4: re-implement schema rediscovery via DD's SDI mechanism. */
+     * TODO: re-implement schema rediscovery via MySQL's Data Dictionary
+     * SDI mechanism for object-store replica mode. */
     rc = HA_ERR_GENERIC;
     (void)thd; (void)val; (void)val_len;
 
@@ -3613,11 +3624,13 @@ static int tidesdb_discover_table_existence(handlerton *, const char *db, const 
 
 /*
   Scan the schema CF for all unique database names and create any missing
-  database directories under mysql_real_data_home.  This ensures that
-  replicas (which receive table definitions via S3) have the database
-  directory present so MariaDB will call discover_table_names for them.
-  Without the directory, MariaDB doesn't know the database exists and
-  never asks TidesDB about its tables.
+  database directories under mysql_real_data_home. In object-store mode,
+  replicas may receive tables whose database directory was never created
+  locally; this ensures the directory exists.
+  (Note: the MariaDB discover_table_names hook that would consume these
+  directories is #if 0'd for MySQL. MySQL's Data Dictionary handles
+  discovery centrally, so this is currently dormant infrastructure kept
+  for the object-store replica path.)
 */
 static void schema_cf_ensure_databases()
 {
@@ -3713,8 +3726,9 @@ static int tidesdb_init_func(void *p)
     tidesdb_hton->savepoint_offset = sizeof(tidesdb_savepoint_t);
     tidesdb_hton->file_extensions = ha_tidesdb_exts;  /* MariaDB: tablefile_extensions */
     /* MariaDB-only handlerton members (table_options/field_options/index_options).
-     * MySQL 9.7 has no equivalents — see TDB_TABLE_OPTIONS comment. Phase 4 will
-     * port to ENGINE_ATTRIBUTE / handler::ha_create_options() instead. */
+     * MySQL 9.7 has no equivalents — see TDB_TABLE_OPTIONS comment. TODO: wire
+     * tidesdb_engine_attribute_to_options() into create()/open() so the JSON
+     * ENGINE_ATTRIBUTE path actually reaches the CF config. */
     /* tidesdb_hton->drop_table = tidesdb_hton_drop_table;  -- MariaDB-only handlerton hook;
      * MySQL drops tables through ha_tidesdb::delete_table() at the handler level. */
     tidesdb_hton->drop_database = tidesdb_hton_drop_database;
@@ -3876,12 +3890,12 @@ static int tidesdb_init_func(void *p)
         {
             /* MariaDB-only discover_* hooks for engine-driven table discovery
              * (used with object-store mode). MySQL's Data Dictionary handles
-             * table discovery centrally — no engine hook needed. Phase 4
-             * work to support object-store-driven discovery via SDI. The
-             * underlying discover_* functions are #if 0'd elsewhere. */
+             * table discovery centrally — no engine hook needed. TODO: add
+             * object-store-driven discovery via MySQL SDI when adding replica
+             * support. The underlying discover_* functions are #if 0'd. */
 
-            /* We ensure database directories exist for all tables in the schema
-               CF so MariaDB discovers them (relevant for replicas). */
+            /* Ensure database directories exist for all tables in the schema
+               CF so the server can open them on replicas. */
             schema_cf_ensure_databases();
 
             sql_print_information("[TIDESDB] Schema discovery enabled (object store mode)");
@@ -3893,11 +3907,11 @@ static int tidesdb_init_func(void *p)
 
 /*
   Handlerton-level FLUSH LOGS callback.  Called on FLUSH LOGS and by
-  mariadb-backup before copying files so the on-disk WAL is a consistent
-  snapshot.  With unified-memtable mode one sync covers all CFs.  In
-  per-CF mode we sync the schema CF (always present in object-store
-  mode; otherwise we try the first registered CF).  Returns false on
-  success (handlerton convention).
+  backup tools (XtraBackup, MySQL Enterprise Backup) before copying files
+  so the on-disk WAL is a consistent snapshot.  With unified-memtable mode
+  one sync covers all CFs.  In per-CF mode we sync the schema CF (always
+  present in object-store mode; otherwise we try the first registered CF).
+  Returns false on success (handlerton convention).
 */
 static bool tidesdb_hton_flush_logs(handlerton *)
 {
@@ -3928,9 +3942,9 @@ static bool tidesdb_hton_flush_logs(handlerton *)
 }
 
 /*
-  Handlerton-level panic callback.  MariaDB calls this on signal-driven or
-  abnormal shutdown paths where tidesdb_deinit_func may not run.  We only
-  react to HA_PANIC_CLOSE -- the other flags are legacy ISAM-era.
+  Handlerton-level panic callback. Invoked on signal-driven or abnormal
+  shutdown paths where tidesdb_deinit_func may not run. We only react to
+  HA_PANIC_CLOSE -- the other flags are legacy ISAM-era.
 */
 static int tidesdb_hton_panic(handlerton *, enum ha_panic_function flag)
 {
@@ -3960,10 +3974,10 @@ static void tidesdb_hton_pre_shutdown(void)
 }
 
 /*
-  Handlerton-level kill_query callback.  MariaDB calls this when the user
-  runs KILL QUERY <id> or when the connection is killed.  Our job is to
-  wake the victim if it is currently blocked in row_lock_acquire so that
-  the wait loop observes thd_killed() and bails out promptly.
+  Handlerton-level kill_query callback. Invoked when the user runs
+  KILL QUERY <id> or when the connection is killed. Our job is to wake
+  the victim if it is currently blocked in row_lock_acquire so that the
+  wait loop observes thd_killed() and bails out promptly.
 
   The trx's waiting_on pointer is the lock entry being waited on; a
   broadcast on that entry's cond var wakes the waiter.  False wake-ups
@@ -4988,8 +5002,9 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
     }
 
     /* MySQL has no TABLE_SHARE::frm_image (no .frm files; metadata lives in
-     * the Data Dictionary). Schema persistence to TidesDB itself is Phase 4
-     * work — for now just record the table name so DROP can find the CF. */
+     * the Data Dictionary). TODO: persist full schema to TidesDB itself for
+     * object-store replica recovery. For now just record the table name so
+     * DROP TABLE can locate the underlying CF. */
     schema_cf_store_frm(name);
 
     DBUG_RETURN(0);
@@ -7323,7 +7338,7 @@ int ha_tidesdb::tdb_end_bulk_update() /* override removed: MariaDB-only */
 }
 
 /*
-  MariaDB calls bulk_update_row instead of update_row when start_bulk_update
+  The server calls bulk_update_row instead of update_row when start_bulk_update
   returned 0.  We don't actually buffer rows (TidesDB's txn is the buffer);
   we just delegate so the standard update_row path runs and its tail-side
   mid-commit block batches.  dup_key_found tracks duplicate-key collisions
@@ -8950,13 +8965,13 @@ int ha_tidesdb::external_lock(THD *thd, int lock_type)
 
 THR_LOCK_DATA **ha_tidesdb::store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lock_type lock_type)
 {
-    /* With lock_count()=0 MariaDB skips THR_LOCK entirely.
+    /* With lock_count()=0 MySQL skips THR_LOCK entirely.
        store_lock is still called for informational purposes but we
        do not push into the 'to' array (same pattern as InnoDB).
 
        However, we use this callback to detect locking reads
        (SELECT ... FOR UPDATE, SELECT ... IN SHARE MODE) and
-       data-modifying statements.  MariaDB calls store_lock() before
+       data-modifying statements.  MySQL calls store_lock() before
        external_lock(), so we can set stmt_has_write_lock_ here for
        the pessimistic row lock path.
 
@@ -9617,17 +9632,19 @@ bool ha_tidesdb::commit_inplace_alter_table(
     share->stats_refresh_us.store(0, std::memory_order_relaxed);
     unlock_shared_ha_data();
 
-    /* We update .frm in schema CF after ALTER.  When discover_table is
-       registered MariaDB may skip writing .frm to disk -- N/A in MySQL. */
+    /* Refresh the schema-CF entry after ALTER. (Originally cached .frm
+       bytes for MariaDB discover_table; under MySQL it just records the
+       table name so DROP TABLE can find the CF.) */
     schema_cf_store_frm(table->s->path.str);
 
     DBUG_RETURN(false);
 }
 
 /*
-  Tell MariaDB whether changing table options requires a rebuild.
-  For TidesDB, changing options like SYNC_MODE, TTL, etc. is always
-  compatible -- the .frm is rewritten and re-read on next open().
+  Tell MySQL whether changing table options requires a full table rebuild.
+  For TidesDB, option changes (SYNC_MODE, TTL, etc.) are compatible at the
+  data level -- no row rewrite is needed; the new options take effect on
+  next open().
 */
 bool ha_tidesdb::check_if_incompatible_data(HA_CREATE_INFO *create_info, uint table_changes)
 {
@@ -9711,8 +9728,7 @@ static void force_remove_cf_dir(const std::string &cf_name)
     MY_STAT st;
     if (!my_stat(dir, &st, MYF(0))) return; /* already gone */
 
-    /* my_rmtree() is MariaDB's portable recursive directory removal
-       (handles Windows, symlinks, read-only attrs, etc.). */
+    /* Recursive removal via nftw(); see my_rmtree() in tidesdb_compat.h. */
     if (my_rmtree(dir, MYF(0)) != 0)
         sql_print_warning("[TIDESDB] force_remove_cf_dir failed for %s", dir);
 }
@@ -9774,8 +9790,11 @@ static int tidesdb_drop_table_impl(const char *path)
 }
 
 /*
-  Handlerton-level drop_table callback.  MariaDB 12.x calls hton->drop_table
-  instead of handler::delete_table.  Must return 0 on success, not -1.
+  Handlerton-level drop_table callback. Dead code under MySQL: the hook
+  exists in MariaDB 12.x (hton->drop_table) but the callback registration
+  below is commented out, so MySQL always routes drops through
+  ha_tidesdb::delete_table() at the handler level. Kept compiled-in only
+  to ease a future MariaDB compatibility build.
 */
 static int tidesdb_hton_drop_table(handlerton *, const char *path)
 {
@@ -9798,11 +9817,11 @@ static std::string tidesdb_path_to_db_name(const char *path)
 }
 
 /*
-  Handlerton-level drop_database callback.  MariaDB calls this when the
-  server-side DROP DATABASE has finished removing .frm files from the db
-  directory.  Without this hook, TidesDB column families whose .frm was
-  already unlinked (and any object-store-mode entries in schema_cf) would
-  outlive the database and accumulate on disk.
+  Handlerton-level drop_database callback. Invoked when the server-side
+  DROP DATABASE has finished removing the database files. Without this
+  hook, TidesDB column families belonging to the dropped database (and
+  any object-store-mode entries in schema_cf) would outlive the database
+  and accumulate on disk.
 
   We enumerate every CF whose name starts with "<db_name>__" (the prefix
   path_to_cf_name builds for a table in that database -- which also

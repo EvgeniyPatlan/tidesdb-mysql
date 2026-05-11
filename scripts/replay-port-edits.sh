@@ -61,14 +61,16 @@ old = '''/* MariaDB 12.3.1 (MDEV-37815) renamed TABLE_SHARE::option_struct to
 new = '''/* MariaDB exposes per-table options via TABLE_SHARE::option_struct (an
  * engine-defined struct populated from CREATE TABLE syntax via
  * ha_create_table_option[] registration). MySQL 9.7 has no equivalent —
- * engine-specific table options come through SQL COMMENTs or the newer
- * ENGINE_ATTRIBUTE/SECONDARY_ENGINE_ATTRIBUTE JSON fields, neither of which
- * we wire up in Phase 2.
+ * engine-specific table options come through the ENGINE_ATTRIBUTE /
+ * SECONDARY_ENGINE_ATTRIBUTE JSON fields.
  *
  * Stub the option accessor to nullptr so existing `if (opts && opts->X)`
  * null-checks throughout TideSQL short-circuit cleanly, giving every table
- * the engine's compiled defaults. Phase 4 work: parse the user-supplied
- * options out of ENGINE_ATTRIBUTE JSON. */
+ * the engine's compiled defaults.
+ *
+ * TODO: wire tidesdb_engine_attribute_to_options() (defined further down)
+ * into create()/open() so per-table ENGINE_ATTRIBUTE JSON actually reaches
+ * the column-family config. The parser exists; the call site does not. */
 #define TDB_TABLE_OPTIONS(tbl) (static_cast<ha_table_option_struct *>(nullptr))
 #define TDB_INDEX_OPTIONS(keyref) (static_cast<ha_index_option_struct *>(nullptr))
 #define TDB_FIELD_OPTIONS(fldref) (static_cast<ha_field_option_struct *>(nullptr))'''
@@ -88,11 +90,12 @@ src = open(p).read()
 
 # table option list
 o = 'ha_create_table_option tidesdb_table_option_list[] = {'
-n = '''#if 0  /* MariaDB-only ha_create_table_option DSL — stubbed for MySQL Phase 2.
+n = '''#if 0  /* MariaDB-only ha_create_table_option DSL — stubbed for MySQL.
         * MySQL 9.7 has no equivalent macro family (HA_TOPTION_*); per-table
-        * options come through ENGINE_ATTRIBUTE JSON instead. Phase 4 will
-        * port this list to MySQL's mechanism. Until then TDB_TABLE_OPTIONS()
-        * returns nullptr and every table uses compiled defaults. */
+        * options come through ENGINE_ATTRIBUTE JSON instead. TODO: port
+        * this list to MySQL's ENGINE_ATTRIBUTE path. Until then
+        * TDB_TABLE_OPTIONS() returns nullptr and every table uses compiled
+        * defaults. */
 ha_create_table_option tidesdb_table_option_list[] = {'''
 if o in src and '#if 0  /* MariaDB-only ha_create_table_option' not in src:
     src = src.replace(o, n)
@@ -118,7 +121,7 @@ struct ha_index_option_struct
 
 ha_create_table_option tidesdb_index_option_list[] = {HA_IOPTION_BOOL("USE_BTREE", use_btree, 0),
                                                       HA_IOPTION_END};'''
-n3 = '''#if 0  /* same Phase-2 stubbing as tidesdb_table_option_list */
+n3 = '''#if 0  /* same MariaDB-only stubbing as tidesdb_table_option_list */
 ha_create_table_option tidesdb_field_option_list[] = {HA_FOPTION_BOOL("TTL", ttl, 0),
                                                       HA_FOPTION_END};
 #endif
@@ -130,7 +133,7 @@ struct ha_index_option_struct
     bool use_btree; /* per-index B-tree override; -1 = inherit from table */
 };
 
-#if 0  /* same Phase-2 stubbing as tidesdb_table_option_list */
+#if 0  /* same MariaDB-only stubbing as tidesdb_table_option_list */
 ha_create_table_option tidesdb_index_option_list[] = {HA_IOPTION_BOOL("USE_BTREE", use_btree, 0),
                                                       HA_IOPTION_END};
 #endif'''
@@ -144,8 +147,9 @@ o4 = '''    tidesdb_hton->tablefile_extensions = ha_tidesdb_exts;
     tidesdb_hton->index_options = tidesdb_index_option_list;'''
 n4 = '''    tidesdb_hton->file_extensions = ha_tidesdb_exts;  /* MariaDB: tablefile_extensions */
     /* MariaDB-only handlerton members (table_options/field_options/index_options).
-     * MySQL 9.7 has no equivalents — see TDB_TABLE_OPTIONS comment. Phase 4 will
-     * port to ENGINE_ATTRIBUTE / handler::ha_create_options() instead. */'''
+     * MySQL 9.7 has no equivalents — see TDB_TABLE_OPTIONS comment. TODO: wire
+     * tidesdb_engine_attribute_to_options() into create()/open() so the JSON
+     * ENGINE_ATTRIBUTE path actually reaches the CF config. */'''
 if o4 in src:
     src = src.replace(o4, n4)
 
@@ -173,9 +177,9 @@ o7 = '''            tidesdb_hton->discover_table = tidesdb_discover_table;
             tidesdb_hton->discover_table_existence = tidesdb_discover_table_existence;'''
 n7 = '''            /* MariaDB-only discover_* hooks for engine-driven table discovery
              * (used with object-store mode). MySQL's Data Dictionary handles
-             * table discovery centrally — no engine hook needed. Phase 4
-             * work to support object-store-driven discovery via SDI. The
-             * underlying discover_* functions are #if 0'd elsewhere. */'''
+             * table discovery centrally — no engine hook needed. TODO: add
+             * object-store-driven discovery via MySQL SDI when adding replica
+             * support. The underlying discover_* functions are #if 0'd. */'''
 if o7 in src:
     src = src.replace(o7, n7)
 
@@ -229,8 +233,9 @@ o1 = '''    /* We store .frm in schema CF for object store discovery.
     else
         schema_cf_store_frm(name);'''
 n1 = '''    /* MySQL has no TABLE_SHARE::frm_image (no .frm files; metadata lives in
-     * the Data Dictionary). Schema persistence to TidesDB itself is Phase 4
-     * work — for now just record the table name so DROP can find the CF. */
+     * the Data Dictionary). TODO: persist full schema to TidesDB itself for
+     * object-store replica recovery. For now just record the table name so
+     * DROP TABLE can locate the underlying CF. */
     schema_cf_store_frm(name);'''
 if o1 in src: src = src.replace(o1, n1)
 
@@ -241,7 +246,8 @@ o2 = '''       registered MariaDB may skip writing .frm to disk, so prefer the
                             altered_table->s->frm_image->length);
     else
         schema_cf_store_frm(table->s->path.str);'''
-n2 = '''       registered MariaDB may skip writing .frm to disk -- N/A in MySQL. */
+n2 = '''       (Originally cached .frm bytes for MariaDB discover_table; under
+        MySQL it just records the table name so DROP TABLE can find the CF.) */
     schema_cf_store_frm(table->s->path.str);'''
 if o2 in src: src = src.replace(o2, n2)
 
@@ -251,7 +257,8 @@ o3 = '''    /* We parse .frm binary into TABLE_SHARE.
     rc = share->init_from_binary_frm_image(thd, true, val, val_len);'''
 n3 = '''    /* MySQL has no init_from_binary_frm_image — schema discovery from
      * stored .frm bytes is a MariaDB feature; MySQL uses the Data Dictionary.
-     * Phase 4: re-implement schema rediscovery via DD's SDI mechanism. */
+     * TODO: re-implement schema rediscovery via MySQL's Data Dictionary
+     * SDI mechanism for object-store replica mode. */
     rc = HA_ERR_GENERIC;
     (void)thd; (void)val; (void)val_len;'''
 if o3 in src: src = src.replace(o3, n3)
@@ -395,11 +402,13 @@ src = src.replace(
     '            return tdb_rc_to_ha(rc, "hton_commit");\n'
     '        }',
     '            row_locks_release_all(trx);\n'
-    '            /* Phase 4 workaround: return 0 instead of error so MySQL\n'
-    '             * Debug build does not assert in MYSQL_BIN_LOG::finish_commit.\n'
-    '             * Phase 5 should implement 2PC and surface the error\n'
-    '             * properly. The txn IS rolled back here so data correctness\n'
-    '             * is preserved -- only the user-visible error is hidden. */\n'
+    '            /* Return 0 instead of error so MySQL Debug build does not\n'
+    '             * assert in MYSQL_BIN_LOG::finish_commit. With prepare()\n'
+    '             * hook now doing the actual commit, conflicts surface there\n'
+    '             * before binlog ordered-commit; this commit hook only needs\n'
+    '             * to roll back on the rare late-failure path. The txn IS\n'
+    '             * rolled back here so data correctness is preserved -- only\n'
+    '             * the user-visible error is hidden. */\n'
     '            (void)tdb_rc_to_ha(rc, "hton_commit");\n'
     '            return 0;\n'
     '        }')
@@ -424,7 +433,7 @@ PY
 # tidesdb_txn_commit itself (the lib was loaded without symbols in our
 # build, so frames 3-4 of the trace are <unknown>).
 #
-# This is real engine work, not a config change. Phase 5 should:
+# This is real engine work, not a config change. To re-tackle atomic DDL:
 #  1. Build TidesDB with -g and link to mysqld with full symbols.
 #  2. Reproduce under gdb to find which internal field is NULL at offset 0x20.
 #  3. Either patch tidesdb_txn_commit upstream to be idempotent / safe-to-call
@@ -502,8 +511,8 @@ src = re.sub(r'IO_AND_CPU_COST\s+ha_tidesdb::read_time\s*\(([^)]*)\)',
              r'double ha_tidesdb::read_time(\1)', src)
 
 # inplace_alter_table family: MySQL has a different last argument shape — drop
-# override so they remain engine-internal helpers (TideSQL can still call them
-# from its own Phase 4 wiring).
+# override so they remain engine-internal helpers (the real MySQL-shaped
+# overrides live in plugin/ha_tidesdb.cc and ha_tidesdb.h).
 for m in ['inplace_alter_table', 'prepare_inplace_alter_table',
           'commit_inplace_alter_table', 'check_if_supported_inplace_alter']:
     src = re.sub(
@@ -565,7 +574,7 @@ src = src.replace(
     '{\n    return new (mem_root) ha_tidesdb(hton, table);\n}')
 
 # ha_tidesdb::create asserts that opts != null, but our TDB_TABLE_OPTIONS
-# stub always returns nullptr (table options API is gated to Phase 4).
+# stub always returns nullptr (per-table options not yet wired through ENGINE_ATTRIBUTE).
 # build_cf_config(opts) already handles `if (!opts) return defaults;` cleanly,
 # so the assertion is the only blocker. Drop it.
 src = src.replace(

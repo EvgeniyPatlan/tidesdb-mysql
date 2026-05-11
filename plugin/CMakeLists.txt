@@ -161,7 +161,7 @@ IF(TIDESDB_WITH_S3)
   MESSAGE(STATUS "TidesDB: S3 object store connector enabled")
 ENDIF()
 
-############# Define the storage engine using MariaDB's MYSQL_ADD_PLUGIN macro #############
+############# Define the storage engine using MySQL's MYSQL_ADD_PLUGIN macro #############
 MYSQL_ADD_PLUGIN(tidesdb ha_tidesdb.cc tidesdb_keyring_compat.cc
                  STORAGE_ENGINE MODULE_ONLY LINK_LIBRARIES ${TIDESDB_LIBS})
 
@@ -175,11 +175,12 @@ ENDIF()
 ############# Soften strictness while we port from MariaDB to MySQL.       #############
 ############# These are noise during the port — restore for production.    #############
 IF(TARGET tidesdb)
-  # During the MariaDB->MySQL port, MySQL's stock build flags include -Werror
-  # which turns every warning into a hard fail. We turn -Werror OFF for the
-  # plugin target only — the rest of the server keeps strict warnings. Also
-  # add -fpermissive so C/C++ linkage mismatches on plugin var-update callbacks
-  # become warnings rather than errors. Restore strict flags in Phase 4.
+  # MySQL's stock build flags include -Werror which turns every warning into
+  # a hard fail. We turn -Werror OFF for the plugin target only — the rest of
+  # the server keeps strict warnings. Also add -fpermissive so C/C++ linkage
+  # mismatches on plugin var-update callbacks become warnings rather than
+  # errors. TODO: drop -Wno-error / -fpermissive once all remaining
+  # MariaDB-port warnings are resolved.
   TARGET_COMPILE_OPTIONS(tidesdb PRIVATE
     -Wno-error
     -fpermissive

@@ -1,6 +1,6 @@
 --source suite/tidesdb/include/have_tidesdb.inc
 --echo #
---echo # Issue #70: ALTER TABLE sometimes crashes MariaDB
+--echo # Issue #70: ALTER TABLE crash regression (originally seen on MariaDB)
 --echo # The crash was caused by unbounded read-set growth during
 --echo # ALTER TABLE's copy-phase scan under REPEATABLE_READ.
 --echo #

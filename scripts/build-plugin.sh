@@ -13,7 +13,7 @@ BOOST_DIR="$REPO/vendor/boost"
 
 [ -d "$MYSQL_SRC" ]      || { echo "ERROR: $MYSQL_SRC not found"; exit 1; }
 [ -d "$TIDESDB_PREFIX" ] || { echo "ERROR: $TIDESDB_PREFIX not found — run build-tidesdb.sh first"; exit 1; }
-[ -f "$MYSQL_SRC/storage/tidesdb/ha_tidesdb.cc" ] || { echo "ERROR: storage/tidesdb/ha_tidesdb.cc missing — vendor TideSQL source first"; exit 1; }
+[ -f "$MYSQL_SRC/storage/tidesdb/ha_tidesdb.cc" ] || { echo "ERROR: storage/tidesdb/ha_tidesdb.cc missing — run scripts/setup-workspace.sh first to install the plugin source"; exit 1; }
 
 mkdir -p "$BOOST_DIR"
 

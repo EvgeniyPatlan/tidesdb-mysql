@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 1 smoke test: bring up mysqld, INSTALL PLUGIN, run a quick CRUD round-trip.
+# Smoke test: bring up mysqld, INSTALL PLUGIN, run a quick CRUD round-trip.
 # This is the minimum bar for "does the plugin even load."
 #
 # Usage (inside tides-builder container):
