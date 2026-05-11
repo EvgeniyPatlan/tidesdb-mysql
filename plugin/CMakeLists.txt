@@ -172,19 +172,26 @@ IF(TIDESDB_WITH_S3)
   ENDIF()
 ENDIF()
 
-############# Soften strictness while we port from MariaDB to MySQL.       #############
-############# These are noise during the port — restore for production.    #############
+############# Soften strictness for the plugin target.                     #############
+############# Tracked work item -- run scripts/check-strict-build.sh        #############
+############# to enumerate the warnings these flags hide.                   #############
 IF(TARGET tidesdb)
   # MySQL's stock build flags include -Werror which turns every warning into
-  # a hard fail. We turn -Werror OFF for the plugin target only — the rest of
-  # the server keeps strict warnings. Also add -fpermissive so C/C++ linkage
+  # a hard fail. We turn -Werror OFF for the plugin target only -- the rest
+  # of the server keeps strict warnings. -fpermissive lets C/C++ linkage
   # mismatches on plugin var-update callbacks become warnings rather than
-  # errors. TODO: drop -Wno-error / -fpermissive once all remaining
-  # MariaDB-port warnings are resolved.
-  TARGET_COMPILE_OPTIONS(tidesdb PRIVATE
-    -Wno-error
-    -fpermissive
-  )
+  # errors.
+  #
+  # Auditable work item (not blocked by anything; just needs a full build):
+  # set TIDESDB_STRICT_BUILD=ON when configuring CMake to drop both flags
+  # and see every remaining warning. Fix in batches, then make strict the
+  # default.
+  IF(NOT TIDESDB_STRICT_BUILD)
+    TARGET_COMPILE_OPTIONS(tidesdb PRIVATE
+      -Wno-error
+      -fpermissive
+    )
+  ENDIF()
   # MySQL's data-dictionary headers (pulled in transitively from sql/handler.h
   # via sql/table.h -> sql/dd/types/foreign_key.h -> sql/dd/sdi_fwd.h) include
   # <rapidjson/fwd.h>. MYSQL_ADD_PLUGIN does not put the bundled rapidjson on

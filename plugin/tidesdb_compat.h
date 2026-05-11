@@ -188,14 +188,20 @@ struct page_range {
 #define ALTER_ADD_COLUMN 0
 #endif
 
-/* MariaDB exposes thd_kill_levels enum at top scope; MySQL has it inside
- * the THD class. Forward-declare it as a simple enum so engines that
- * compare against it compile. TODO: switch to THD::Killed_state. */
+/* Both MariaDB and MySQL expose `enum thd_kill_levels` at top scope with
+ * the same three constants (THD_IS_NOT_KILLED / THD_ABORT_SOFTLY /
+ * THD_ABORT_ASAP), but MySQL defines it in a deep header
+ * (include/mysql/components/services/bits/thd.h) that is not always
+ * reachable at the points TideSQL's code refers to the enum. The guard
+ * below makes this a no-op once MySQL's real enum has been pulled in
+ * transitively, and provides a compatible definition otherwise. */
+#ifndef THD_IS_NOT_KILLED
 enum thd_kill_levels {
     THD_IS_NOT_KILLED = 0,
     THD_ABORT_SOFTLY = 50,
     THD_ABORT_ASAP = 100
 };
+#endif
 
 /* MariaDB-only handler_index_cond_check pushdown helper. Stub. */
 inline int handler_index_cond_check(void * /*opaque*/) { return 0; }
@@ -303,21 +309,14 @@ struct ha_create_table_option {
 };
 #endif
 
-/* HA_ERR_* values that MariaDB defines but MySQL doesn't. Map to the closest
- * generic MySQL error so the engine can still report failure. TODO: audit
- * error reporting end-to-end and use a more specific MySQL HA_ERR_* code
- * where the original MariaDB code carried distinct semantics. */
+/* HA_ERR_* values that MariaDB defines but MySQL doesn't. Map each to the
+ * MySQL code that carries the same operational meaning so the application
+ * sees a useful errno instead of the opaque HA_ERR_GENERIC / 1030.
+ *
+ *   HA_ERR_ABORTED_BY_USER -> HA_ERR_QUERY_INTERRUPTED (errno 1317 / ER_QUERY_INTERRUPTED)
+ *     Returned from row reads when thd_killed() observes a KILL QUERY. */
 #ifndef HA_ERR_ABORTED_BY_USER
-#define HA_ERR_ABORTED_BY_USER HA_ERR_GENERIC
-#endif
-
-/* MariaDB row-status code used in iterator/scan paths. MySQL has nothing
- * equivalent at this layer — rnd_next returns HA_ERR_END_OF_FILE. Map to
- * the engine-internal value -1 so comparisons stop failing. (Some use
- * sites may want explicit HA_ERR_END_OF_FILE handling instead of the
- * generic sentinel; not a correctness issue today.) */
-#ifndef STATUS_NOT_FOUND
-#define STATUS_NOT_FOUND (-1)
+#define HA_ERR_ABORTED_BY_USER HA_ERR_QUERY_INTERRUPTED
 #endif
 
 /* ----- Category 2: MariaDB-only flag values ----- */

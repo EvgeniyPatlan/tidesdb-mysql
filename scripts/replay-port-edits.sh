@@ -214,8 +214,8 @@ sed -i \
     -e 's/->real_maybe_null()/->is_nullable()/g' \
     -e 's/\bf->ptr\b/f->field_ptr()/g' \
     -e 's/\bfield->ptr\b/field->field_ptr()/g' \
-    -e 's|^\(\s*\)table->status = STATUS_NOT_FOUND;|\1/* table->status = STATUS_NOT_FOUND; -- not in MySQL, return code carries the info */|g' \
-    -e 's|^\(\s*\)table->status = 0;|\1/* table->status = 0; -- not in MySQL */|g' \
+    -e '/^\s*table->status = STATUS_NOT_FOUND;\s*$/d' \
+    -e '/^\s*table->status = 0;\s*$/d' \
     -e 's/errkey = lookup_errkey = /errkey = /g' \
     "$SRC"
 
@@ -757,10 +757,8 @@ src = src.replace('SHOW_ULONG', 'SHOW_LONG')
 # MySQL doesn't have it. Replace with !! (logical-not-not coercion).
 src = re.sub(r'\bMY_TEST\(([^()]*)\)', r'(!!(\1))', src)
 
-# strxnmov: MariaDB string concat helper. MySQL has my_stpncpy / snprintf.
-# Replace strxnmov(dst, len, a, b, NullS) -> snprintf(dst, len, "%s%s", a, b).
-# Hard to generalize — sites are few; mark as TODO and stub a function.
-# (We'll add an inline strxnmov shim in tidesdb_compat.h instead.)
+# strxnmov: MariaDB string concat helper. MySQL has no equivalent.
+# Handled by the inline strxnmov shim in tidesdb_compat.h; no source edit needed.
 
 # mysql_cond_init: MariaDB takes 3 args (key, cond, attr); MySQL 2 args.
 # Drop the 3rd argument when present.

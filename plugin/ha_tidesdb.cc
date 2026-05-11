@@ -6031,11 +6031,14 @@ int ha_tidesdb::ensure_scan_iter()
 
     if (!scan_txn || !scan_cf_)
     {
+        /* Invariant violation -- a scan was kicked off without an open txn
+         * or column family. Programmer error, not a runtime failure;
+         * HA_ERR_INTERNAL_ERROR makes that distinction visible upstream. */
         sql_print_error("[TIDESDB] ensure_scan_iter: no txn or CF");
-        scan_iter_last_err_ = HA_ERR_GENERIC;
+        scan_iter_last_err_ = HA_ERR_INTERNAL_ERROR;
         scan_iter_last_err_cf_ = scan_cf_;
         scan_iter_last_err_txn_ = scan_txn;
-        return HA_ERR_GENERIC;
+        return HA_ERR_INTERNAL_ERROR;
     }
     int rc = tidesdb_iter_new(scan_txn, scan_cf_, &scan_iter);
     if (rc == TDB_SUCCESS)
@@ -8381,12 +8384,10 @@ int ha_tidesdb::spatial_scan_next(uchar *buf)
             }
             if (ret)
             {
-                /* table->status = STATUS_NOT_FOUND; -- not in MySQL, return code carries the info */
                 DBUG_RETURN(ret);
             }
 
             scan_dir_ = DIR_FORWARD;
-            /* table->status = 0; -- not in MySQL */
             DBUG_RETURN(0);
         }
 
@@ -8400,7 +8401,6 @@ int ha_tidesdb::spatial_scan_next(uchar *buf)
         }
     }
 
-    /* table->status = STATUS_NOT_FOUND; -- not in MySQL, return code carries the info */
     DBUG_RETURN(HA_ERR_END_OF_FILE);
 }
 
@@ -8733,7 +8733,6 @@ int ha_tidesdb::ft_read(uchar *buf)
     tdb_ft_info_t *info = reinterpret_cast<tdb_ft_info_t *>(ft_handler);
     if (!info)
     {
-        /* table->status = STATUS_NOT_FOUND; -- not in MySQL, return code carries the info */
         DBUG_RETURN(HA_ERR_END_OF_FILE);
     }
 
@@ -8757,16 +8756,13 @@ int ha_tidesdb::ft_read(uchar *buf)
         }
         if (err)
         {
-            /* table->status = STATUS_NOT_FOUND; -- not in MySQL, return code carries the info */
             DBUG_RETURN(err);
         }
 
         info->current_idx++;
-        /* table->status = 0; -- not in MySQL */
         DBUG_RETURN(0);
     }
 
-    /* table->status = STATUS_NOT_FOUND; -- not in MySQL, return code carries the info */
     DBUG_RETURN(HA_ERR_END_OF_FILE);
 }
 
