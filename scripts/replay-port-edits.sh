@@ -60,18 +60,24 @@ old = '''/* MariaDB 12.3.1 (MDEV-37815) renamed TABLE_SHARE::option_struct to
 #endif'''
 new = '''/* MariaDB exposes per-table options via TABLE_SHARE::option_struct (an
  * engine-defined struct populated from CREATE TABLE syntax via
- * ha_create_table_option[] registration). MySQL 9.7 has no equivalent —
+ * ha_create_table_option[] registration). MySQL 9.7 has no equivalent;
  * engine-specific table options come through the ENGINE_ATTRIBUTE /
  * SECONDARY_ENGINE_ATTRIBUTE JSON fields.
  *
- * Stub the option accessor to nullptr so existing `if (opts && opts->X)`
- * null-checks throughout TideSQL short-circuit cleanly, giving every table
- * the engine's compiled defaults.
+ * TDB_TABLE_OPTIONS(tbl) delegates to tidesdb_opts_for_table() which
+ * seeds the result from session defaults and then applies the JSON
+ * overrides parsed from TABLE_SHARE::engine_attribute. The pointer is
+ * thread-local and valid until the next TDB_TABLE_OPTIONS call on the
+ * same thread; every use site consumes it immediately, so this is safe.
  *
- * TODO: wire tidesdb_engine_attribute_to_options() (defined further down)
- * into create()/open() so per-table ENGINE_ATTRIBUTE JSON actually reaches
- * the column-family config. The parser exists; the call site does not. */
-#define TDB_TABLE_OPTIONS(tbl) (static_cast<ha_table_option_struct *>(nullptr))
+ * Returns NULL only for tables without a TABLE_SHARE -- existing
+ * `if (opts && opts->X)` null-checks throughout the engine still
+ * short-circuit cleanly in that edge case. */
+struct ha_table_option_struct;
+struct ha_index_option_struct;
+struct ha_field_option_struct;
+static ha_table_option_struct *tidesdb_opts_for_table(const TABLE *table);
+#define TDB_TABLE_OPTIONS(tbl)    tidesdb_opts_for_table(tbl)
 #define TDB_INDEX_OPTIONS(keyref) (static_cast<ha_index_option_struct *>(nullptr))
 #define TDB_FIELD_OPTIONS(fldref) (static_cast<ha_field_option_struct *>(nullptr))'''
 if old in src:
@@ -90,12 +96,13 @@ src = open(p).read()
 
 # table option list
 o = 'ha_create_table_option tidesdb_table_option_list[] = {'
-n = '''#if 0  /* MariaDB-only ha_create_table_option DSL — stubbed for MySQL.
-        * MySQL 9.7 has no equivalent macro family (HA_TOPTION_*); per-table
-        * options come through ENGINE_ATTRIBUTE JSON instead. TODO: port
-        * this list to MySQL's ENGINE_ATTRIBUTE path. Until then
-        * TDB_TABLE_OPTIONS() returns nullptr and every table uses compiled
-        * defaults. */
+n = '''#if 0  /* MariaDB-only ha_create_table_option DSL -- preserved as historical
+        * reference. MySQL has no HA_TOPTION_* macro family; the equivalent
+        * surface is the ENGINE_ATTRIBUTE JSON path
+        * (tidesdb_engine_attribute_to_options + tidesdb_seed_opts_from_session
+        * + tidesdb_opts_for_table). Every option listed below is reachable
+        * either via the JSON keys handled in the parser or via the
+        * tidesdb_default_* session variables that the seed helper reads. */
 ha_create_table_option tidesdb_table_option_list[] = {'''
 if o in src and '#if 0  /* MariaDB-only ha_create_table_option' not in src:
     src = src.replace(o, n)
@@ -146,10 +153,9 @@ o4 = '''    tidesdb_hton->tablefile_extensions = ha_tidesdb_exts;
     tidesdb_hton->field_options = tidesdb_field_option_list;
     tidesdb_hton->index_options = tidesdb_index_option_list;'''
 n4 = '''    tidesdb_hton->file_extensions = ha_tidesdb_exts;  /* MariaDB: tablefile_extensions */
-    /* MariaDB-only handlerton members (table_options/field_options/index_options).
-     * MySQL 9.7 has no equivalents — see TDB_TABLE_OPTIONS comment. TODO: wire
-     * tidesdb_engine_attribute_to_options() into create()/open() so the JSON
-     * ENGINE_ATTRIBUTE path actually reaches the CF config. */'''
+    /* MariaDB-only handlerton members (table_options/field_options/index_options)
+     * have no MySQL equivalents -- per-table options reach the CF config
+     * through the ENGINE_ATTRIBUTE JSON path; see tidesdb_opts_for_table. */'''
 if o4 in src:
     src = src.replace(o4, n4)
 

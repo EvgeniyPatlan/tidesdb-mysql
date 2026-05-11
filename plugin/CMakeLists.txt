@@ -200,6 +200,20 @@ IF(TARGET tidesdb)
   TARGET_INCLUDE_DIRECTORIES(tidesdb PRIVATE
     ${CMAKE_SOURCE_DIR}/extra/rapidjson/include
   )
+  # ABI alignment: MySQL builds rapidjson with these compile definitions
+  # everywhere it's used (see cmake/rapidjson.cmake's extra::rapidjson
+  # INTERFACE target). Forgetting them in the plugin causes rapidjson's
+  # internal types (SizeType, std::string overloads) to mismatch between
+  # the plugin's translation unit and the server's, which manifests as a
+  # `stackTop_` Debug-build assertion inside rapidjson's internal Stack
+  # when the plugin parses ENGINE_ATTRIBUTE JSON. Keep these in lock-step
+  # with cmake/rapidjson.cmake.
+  TARGET_COMPILE_DEFINITIONS(tidesdb PRIVATE
+    RAPIDJSON_NO_SIZETYPEDEFINE
+    RAPIDJSON_SCHEMA_USE_INTERNALREGEX=0
+    RAPIDJSON_SCHEMA_USE_STDREGEX=1
+    RAPIDJSON_HAS_STDSTRING=1
+  )
 ENDIF()
 
 ############# Apply sanitizer flags to the plugin target only #############

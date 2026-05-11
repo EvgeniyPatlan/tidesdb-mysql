@@ -46,18 +46,24 @@ extern "C"
 
 /* MariaDB exposes per-table options via TABLE_SHARE::option_struct (an
  * engine-defined struct populated from CREATE TABLE syntax via
- * ha_create_table_option[] registration). MySQL 9.7 has no equivalent —
+ * ha_create_table_option[] registration). MySQL 9.7 has no equivalent;
  * engine-specific table options come through the ENGINE_ATTRIBUTE /
  * SECONDARY_ENGINE_ATTRIBUTE JSON fields.
  *
- * Stub the option accessor to nullptr so existing `if (opts && opts->X)`
- * null-checks throughout TideSQL short-circuit cleanly, giving every table
- * the engine's compiled defaults.
+ * TDB_TABLE_OPTIONS(tbl) delegates to tidesdb_opts_for_table() which
+ * seeds the result from session defaults and then applies the JSON
+ * overrides parsed from TABLE_SHARE::engine_attribute. The pointer is
+ * thread-local and valid until the next TDB_TABLE_OPTIONS call on the
+ * same thread; every use site consumes it immediately, so this is safe.
  *
- * TODO: wire tidesdb_engine_attribute_to_options() (defined further down)
- * into create()/open() so per-table ENGINE_ATTRIBUTE JSON actually reaches
- * the column-family config. The parser exists; the call site does not. */
-#define TDB_TABLE_OPTIONS(tbl) (static_cast<ha_table_option_struct *>(nullptr))
+ * Returns NULL only for tables without a TABLE_SHARE -- existing
+ * `if (opts && opts->X)` null-checks throughout the engine still
+ * short-circuit cleanly in that edge case. */
+struct ha_table_option_struct;
+struct ha_index_option_struct;
+struct ha_field_option_struct;
+static ha_table_option_struct *tidesdb_opts_for_table(const TABLE *table);
+#define TDB_TABLE_OPTIONS(tbl)    tidesdb_opts_for_table(tbl)
 #define TDB_INDEX_OPTIONS(keyref) (static_cast<ha_index_option_struct *>(nullptr))
 #define TDB_FIELD_OPTIONS(fldref) (static_cast<ha_field_option_struct *>(nullptr))
 
@@ -2355,6 +2361,14 @@ struct ha_table_option_struct
 };
 
 
+/* my_rapidjson_size_t.h MUST precede any rapidjson header so the
+ * typedef of rapidjson::SizeType matches what the rest of MySQL is
+ * built with. The plugin's CMakeLists sets RAPIDJSON_NO_SIZETYPEDEFINE
+ * to keep the typedef site under our control; if this include is
+ * missing, the plugin's rapidjson templates instantiate against an
+ * unsigned-int SizeType and the resulting ABI mismatch crashes
+ * Document::Parse with a `stackTop_` assertion in Debug builds. */
+#include "my_rapidjson_size_t.h"
 #include <rapidjson/document.h>
 #include <cstring>
 #include <cstdlib>
@@ -2372,18 +2386,23 @@ struct ha_table_option_struct
  *   "write_buffer_size"     : <number bytes>
  *   "ttl"                   : <number seconds>
  *   "block_indexes"         : bool
- *   "encrypted"             : bool   (parsed here, but currently ineffective —
- *                              TDB_TABLE_OPTIONS() returns nullptr at the
- *                              create()/open() call sites, so the value is
- *                              never forwarded to the CF config)
+ *   "encrypted"             : bool   (per-table data-at-rest encryption opt-in)
  *   "encryption_key_id"     : <number>
  *
  * Returns true if the JSON parsed cleanly (or attr was empty); false on
  * malformed JSON. On false, opts is left zeroed and create() falls back to
  * compiled defaults (build_cf_config(nullptr) path). */
+/* Parse an ENGINE_ATTRIBUTE JSON blob into an ha_table_option_struct.
+ * The caller is expected to have already seeded *opts with session/global
+ * defaults (see tidesdb_seed_opts_from_session); this function only
+ * overrides the fields the JSON explicitly specifies. That preserves the
+ * MariaDB DSL's SYSVAR-inherits-from-session semantics: omitting a key
+ * means "use the session default," not "use zero."
+ *
+ * Returns true on parse success (empty / NULL attr is also success — no
+ * overrides). False on malformed JSON; *opts is left as the caller seeded. */
 static bool tidesdb_engine_attribute_to_options(LEX_CSTRING attr,
                                                 ha_table_option_struct *opts) {
-    std::memset(opts, 0, sizeof(*opts));
     if (!attr.str || attr.length == 0) return true;  /* nothing supplied */
 
     rapidjson::Document doc;
@@ -2425,13 +2444,81 @@ static bool tidesdb_engine_attribute_to_options(LEX_CSTRING attr,
     return true;
 }
 
+/* Populate *opts with the session/global defaults that MariaDB's
+ * HA_TOPTION_SYSVAR() pulled in automatically. We do this so the JSON
+ * parser only has to override the keys the user actually set; omitting
+ * a key means "use the session default," matching the MariaDB semantics.
+ *
+ * Passing a NULL thd is supported -- THDVAR falls back to the global
+ * value in that case, which is what tidesdb_opts_for_table needs when
+ * called from a background thread that has no THD attached. */
+static void tidesdb_seed_opts_from_session(THD *thd, ha_table_option_struct *opts) {
+    opts->write_buffer_size       = THDVAR(thd, default_write_buffer_size);
+    opts->min_disk_space          = THDVAR(thd, default_min_disk_space);
+    opts->klog_value_threshold    = THDVAR(thd, default_klog_value_threshold);
+    opts->sync_interval_us        = THDVAR(thd, default_sync_interval_us);
+    opts->index_sample_ratio      = THDVAR(thd, default_index_sample_ratio);
+    opts->block_index_prefix_len  = THDVAR(thd, default_block_index_prefix_len);
+    opts->level_size_ratio        = THDVAR(thd, default_level_size_ratio);
+    opts->min_levels              = THDVAR(thd, default_min_levels);
+    opts->dividing_level_offset   = THDVAR(thd, default_dividing_level_offset);
+    opts->skip_list_max_level     = THDVAR(thd, default_skip_list_max_level);
+    opts->skip_list_probability   = THDVAR(thd, default_skip_list_probability);
+    opts->bloom_fpr               = THDVAR(thd, default_bloom_fpr);
+    opts->l1_file_count_trigger   = THDVAR(thd, default_l1_file_count_trigger);
+    opts->l0_queue_stall_threshold= THDVAR(thd, default_l0_queue_stall_threshold);
+    opts->compression             = THDVAR(thd, default_compression);
+    opts->sync_mode               = THDVAR(thd, default_sync_mode);
+    opts->isolation_level         = THDVAR(thd, default_isolation_level);
+    opts->bloom_filter            = THDVAR(thd, default_bloom_filter);
+    opts->block_indexes           = THDVAR(thd, default_block_indexes);
+    opts->use_btree               = THDVAR(thd, default_use_btree);
+    opts->object_lazy_compaction  = THDVAR(thd, default_object_lazy_compaction);
+    opts->object_prefetch_compaction = THDVAR(thd, default_object_prefetch_compaction);
+    opts->tombstone_density_trigger      = THDVAR(thd, default_tombstone_density_trigger);
+    opts->tombstone_density_min_entries  = THDVAR(thd, default_tombstone_density_min_entries);
+    /* Per-table opt-in keys with no session default. */
+    opts->ttl                = 0;
+    opts->encrypted          = false;
+    opts->encryption_key_id  = 1;
+}
 
-#if 0  /* MariaDB-only ha_create_table_option DSL — stubbed for MySQL.
-        * MySQL 9.7 has no equivalent macro family (HA_TOPTION_*); per-table
-        * options come through ENGINE_ATTRIBUTE JSON instead. TODO: port
-        * this list to MySQL's ENGINE_ATTRIBUTE path. Until then
-        * TDB_TABLE_OPTIONS() returns nullptr and every table uses compiled
-        * defaults. */
+/* Resolve effective ha_table_option_struct* for an already-opened table.
+ *
+ * Reads TABLE_SHARE::engine_attribute (where MySQL persists ENGINE_ATTRIBUTE
+ * across server restarts via the Data Dictionary), seeds from session
+ * defaults, then layers JSON overrides on top.
+ *
+ * Storage is a thread-local struct -- single-handler-instance call paths
+ * use the result before issuing the next call, so concurrent handlers on
+ * different threads do not contend. Same-thread back-to-back calls for
+ * different tables refresh the buffer; this is fine because each TDB_TABLE_OPTIONS
+ * use site consumes the pointer immediately.
+ *
+ * Returns NULL only when called with a NULL table or one without a share. */
+static ha_table_option_struct *tidesdb_opts_for_table(const TABLE *table) {
+    if (!table || !table->s) return nullptr;
+    static thread_local ha_table_option_struct tls;
+    tidesdb_seed_opts_from_session(current_thd, &tls);
+    LEX_CSTRING attr = table->s->engine_attribute;
+    if (attr.str && attr.length) {
+        if (!tidesdb_engine_attribute_to_options(attr, &tls)) {
+            sql_print_warning("[TIDESDB] ENGINE_ATTRIBUTE on table '%s' is "
+                              "malformed JSON; falling back to session defaults",
+                              table->s->table_name.str ? table->s->table_name.str : "?");
+        }
+    }
+    return &tls;
+}
+
+
+#if 0  /* MariaDB-only ha_create_table_option DSL -- preserved as historical
+        * reference. MySQL has no HA_TOPTION_* macro family; the equivalent
+        * surface is the ENGINE_ATTRIBUTE JSON path implemented above
+        * (tidesdb_engine_attribute_to_options + tidesdb_seed_opts_from_session
+        * + tidesdb_opts_for_table). Every option listed below is reachable
+        * either via the JSON keys handled in the parser or via the
+        * tidesdb_default_* session variables that the seed helper reads. */
 ha_create_table_option tidesdb_table_option_list[] = {
     /* Options with SYSVAR defaults inherit from session variables
        (e.g. SET SESSION tidesdb_default_write_buffer_size=64*1024*1024).
@@ -3725,10 +3812,9 @@ static int tidesdb_init_func(void *p)
     tidesdb_hton->flags = HTON_SUPPORTS_ENGINE_ATTRIBUTE;
     tidesdb_hton->savepoint_offset = sizeof(tidesdb_savepoint_t);
     tidesdb_hton->file_extensions = ha_tidesdb_exts;  /* MariaDB: tablefile_extensions */
-    /* MariaDB-only handlerton members (table_options/field_options/index_options).
-     * MySQL 9.7 has no equivalents — see TDB_TABLE_OPTIONS comment. TODO: wire
-     * tidesdb_engine_attribute_to_options() into create()/open() so the JSON
-     * ENGINE_ATTRIBUTE path actually reaches the CF config. */
+    /* MariaDB-only handlerton members (table_options/field_options/index_options)
+     * have no MySQL equivalents -- per-table options reach the CF config
+     * through the ENGINE_ATTRIBUTE JSON path; see tidesdb_opts_for_table. */
     /* tidesdb_hton->drop_table = tidesdb_hton_drop_table;  -- MariaDB-only handlerton hook;
      * MySQL drops tables through ha_tidesdb::delete_table() at the handler level. */
     tidesdb_hton->drop_database = tidesdb_hton_drop_database;
@@ -4963,7 +5049,28 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
 
     std::string cf_name = path_to_cf_name(name);
 
-    ha_table_option_struct *opts = TDB_TABLE_OPTIONS(table_arg);  /* may be null — build_cf_config falls back to defaults */
+    /* Build effective per-table options:
+     *   1. Seed from the session's tidesdb_default_* THDVARs.
+     *   2. If the CREATE TABLE statement supplied ENGINE_ATTRIBUTE='{...}',
+     *      overlay those JSON keys on top. Unknown / unspecified keys
+     *      retain their session-default values. Malformed JSON is a hard
+     *      error -- we reject the CREATE TABLE rather than silently
+     *      ignoring user intent.
+     * The local opts_storage backs the pointer; build_cf_config copies
+     * fields it needs into the CF config struct, so the storage can be
+     * stack-local. */
+    ha_table_option_struct opts_storage;
+    tidesdb_seed_opts_from_session(ha_thd(), &opts_storage);
+    if (create_info && create_info->engine_attribute.str &&
+        create_info->engine_attribute.length) {
+        if (!tidesdb_engine_attribute_to_options(create_info->engine_attribute,
+                                                 &opts_storage)) {
+            my_error(ER_WRONG_ARGUMENTS, MYF(0),
+                     "ENGINE_ATTRIBUTE: malformed JSON for ENGINE=TIDESDB");
+            DBUG_RETURN(HA_WRONG_CREATE_OPTION);
+        }
+    }
+    ha_table_option_struct *opts = &opts_storage;
 
     tidesdb_column_family_config_t cfg = build_cf_config(opts);
 
