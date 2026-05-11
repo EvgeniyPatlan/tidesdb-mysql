@@ -7,7 +7,9 @@
  * Categories covered:
  *   1. MariaDB-only types         (range_id_t, check_result_t, my_bool, my_ptrdiff_t)
  *   2. MariaDB-only flag values   (ALTER_*, CHECK_*, HA_CAN_*, TL_FIRST_WRITE, WARN_LEVEL_*)
- *   3. Encryption API stubs       (compile-only — runtime always fails)
+ *   3. Encryption API             (declarations here; real impl in
+ *                                  plugin/tidesdb_keyring_compat.cc, backed
+ *                                  by my_aes_256_cbc + master-key file)
  *   4. Macro renames              (DBUG_ASSERT -> assert)
  *   7. Logging functions          (sql_print_information/warning/error -> stderr)
  *
