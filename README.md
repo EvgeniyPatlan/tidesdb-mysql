@@ -76,6 +76,68 @@ docker exec -it tidesdb mysql -uroot -psecret tidesdb_demo
 
 `docker compose -f docker/runtime/docker-compose.yml up -d` works too if you'd rather use compose.
 
+### Running tests against the Docker image
+
+The repo ships a smoke test that spins up a container, asserts the engine loads, exercises CRUD + composite PK + composite UNIQUE, restarts the container and verifies data persisted. It is the same script CI runs on every push.
+
+```bash
+# Test the image you just built locally:
+./docker/runtime/smoke-test.sh                     # uses tidesdb/mysql:9.7
+
+# Or test an arbitrary tag (e.g. the published Docker Hub image):
+./docker/runtime/smoke-test.sh evgeniypatlan/test-images:mysql-9.7-tidesdb
+
+# Override the temp container name / root password if you have a conflict:
+CONTAINER=tdb-test PASSWORD=hunter2 ./docker/runtime/smoke-test.sh tidesdb/mysql:9.7
+```
+
+The script creates a throwaway container named `tidesdb-smoke` and `docker rm -f`s it on exit (including on failure), so it never pollutes your `docker ps` and is safe to re-run.
+
+Expected output ends with:
+
+```
+[smoke] all checks passed for tidesdb/mysql:9.7
+```
+
+If a step fails, the script prints `FAIL: <what>` plus the last 30 lines of `docker logs` for the container so you can see what mysqld said.
+
+#### Ad-hoc SQL tests against a running container
+
+If the smoke test passes and you want to run your own SQL against the same image (e.g. to reproduce a bug):
+
+```bash
+# Start a clean container in the background:
+docker run -d --name tdb-play -e MYSQL_ROOT_PASSWORD=secret tidesdb/mysql:9.7
+
+# Wait for it to be ready (mysql:9.7 entrypoint does a temp-mysqld bootstrap pass first):
+until docker exec tdb-play mysql -uroot -psecret -e 'SELECT 1' >/dev/null 2>&1; do sleep 2; done
+sleep 5   # let the entrypoint finish its restart
+
+# Run a SQL file from your host:
+docker exec -i tdb-play mysql -uroot -psecret < my_test.sql
+
+# Or pipe inline SQL:
+docker exec -i tdb-play mysql -uroot -psecret <<'SQL'
+CREATE DATABASE t;
+CREATE TABLE t.kv (k INT PRIMARY KEY, v VARCHAR(32)) ENGINE=TIDESDB;
+INSERT INTO t.kv VALUES (1,'hello');
+SELECT * FROM t.kv;
+SQL
+
+# Tear down:
+docker rm -f tdb-play
+```
+
+The phase2 SQL fixtures under `tests/phase2/` are valid input to `mysql` and can be replayed this way (skip the `--source include/...` lines — those are MTR-specific):
+
+```bash
+docker exec -i tdb-play mysql -uroot -psecret < tests/phase2/05_insert_one_row.sql
+```
+
+#### What you *can't* run against just the runtime image
+
+`./scripts/test-plugin.sh` and the MTR suite (`./mtr ...`) need the full MySQL build tree (`vendor/mysql-server/build/`) — they invoke `mysqld` directly with custom data dirs and tooling that don't exist inside the runtime image. To run those, build from source (see below).
+
 ## Building from source
 
 If you want to develop the plugin (run tests, edit code, rebuild fast):
