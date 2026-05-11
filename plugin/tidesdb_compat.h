@@ -4,7 +4,7 @@
  * MySQL 9.7. Include this BEFORE any MySQL header — most shims are #defines
  * and stub inline functions whose definitions need to win over MySQL's own.
  *
- * Categories covered (cross-references docs/port-errors-pass1.md):
+ * Categories covered:
  *   1. MariaDB-only types         (range_id_t, check_result_t, my_bool, my_ptrdiff_t)
  *   2. MariaDB-only flag values   (ALTER_*, CHECK_*, HA_CAN_*, TL_FIRST_WRITE, WARN_LEVEL_*)
  *   3. Encryption API stubs       (compile-only — runtime always fails)

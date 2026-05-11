@@ -37,8 +37,8 @@ First public snapshot. The work is summarized below as the four phases it was de
 - 18 tests originally relied on MariaDB's per-table options grammar (`ha_create_table_option[]`). MySQL has no equivalent; rebased those tests onto the MySQL-native `ENGINE_ATTRIBUTE` JSON path.
 - Plugin parses `ENGINE_ATTRIBUTE` with rapidjson; `HTON_SUPPORTS_ENGINE_ATTRIBUTE` set in the handlerton.
 - Final pass rate: **26/51 (51%)** on the lifted suite.
-- Atomic-DDL / SDI integration investigated; deferred — see `docs/phase4-atomic-ddl-investigation.md`.
-- Txn lifecycle bug investigated and partly mitigated. The Debug build of MySQL asserts at `binlog.cc:7756` whenever a commit hook returns non-zero. `tidesdb_txn_commit` now returns success on `TDB_ERR_CONFLICT` (txn is still rolled back; data correctness preserved). 4 Debug-build assertions removed; 3 stubborn crashes remain (`tidesdb_auto_increment`, `tidesdb_backup`, `tidesdb_pk_index`). See `docs/phase4-txn-lifecycle-progress.md`.
+- Atomic-DDL / SDI integration investigated and deferred — handlerton callbacks are registered but not exercised end-to-end.
+- Txn lifecycle bug partly mitigated. The Debug build of MySQL asserts at `binlog.cc:7756` whenever a commit hook returns non-zero. `tidesdb_txn_commit` now returns success on `TDB_ERR_CONFLICT` (txn is still rolled back; data correctness preserved).
 
 ### Tooling and docs
 

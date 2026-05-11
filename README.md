@@ -214,7 +214,7 @@ Skipped MTR tests (specific feature gaps, each documented inline):
 Not yet, but in-scope for follow-up work:
 
 - **`ALGORITHM=INSTANT DROP COLUMN` for non-trailing columns** — currently falls back to `ALGORITHM=COPY` for middle-of-table drops. Lifting this requires per-row schema versioning (à la InnoDB's INSTANT DROP) so old rows can be remapped to the new layout. Trailing drops already work as INSTANT.
-- **Atomic DDL via SDI** — registered but not exercised; restart-safe DDL is tracked in [phase4-atomic-ddl-investigation.md](docs/phase4-atomic-ddl-investigation.md).
+- **Atomic DDL via SDI** — handlerton callbacks are registered but not exercised end-to-end; restart-safe DDL is the next big follow-up.
 - **Replication, FK constraints, savepoint nesting** — not in scope yet.
 
 ## Layout
@@ -224,8 +224,9 @@ plugin/                MySQL handler source (ha_tidesdb.{cc,h}, tidesdb_compat.h
 mysql-test-suite/      MTR suite — 61 tests, lifted from TideSQL and rebased onto ENGINE_ATTRIBUTE
 tests/phase2/          Hand-rolled .sql / .expected pairs run by scripts/test-plugin.sh
 scripts/               Build, run, and replay-port-edit scripts (Bash)
-docker/                Builder image (Ubuntu 24.04 + MySQL/TidesDB build deps)
-docs/                  Design notes, port log, phase status
+docker/                Builder image (Ubuntu 24.04 + MySQL/TidesDB build deps) and the runnable mysql:9.7 + TidesDB image
+docs/                  Reference docs (build & runtime config, test layers)
+packaging/             .deb and .rpm templates + helpers
 vendor/                Cloned upstreams (mysql-server, tidesdb, optional tidesql) — gitignored
 ```
 
@@ -243,20 +244,12 @@ The big port hot-spots:
 - `HTON_SUPPORTS_ENGINE_ATTRIBUTE`, `HA_GENERATED_COLUMNS`, atomic-DDL flags must be set explicitly.
 - `INSTALL SONAME 'ha_tidesdb';` (MariaDB) → `INSTALL PLUGIN tidesdb SONAME 'ha_tidesdb.so';` (MySQL).
 
-See [`docs/mariadb-vs-mysql.md`](docs/mariadb-vs-mysql.md) and [`docs/port-errors-pass1.md`](docs/port-errors-pass1.md) for the full divergence catalog.
+`scripts/replay-port-edits.sh` encodes each of these MariaDB→MySQL edits as a deterministic pattern→replacement, so the port can be rebased against a future TideSQL upstream by re-running the script.
 
 ## Documentation
 
-- [`docs/plan.md`](docs/plan.md) — original phase plan
-- [`docs/build-and-load.md`](docs/build-and-load.md) — toolchain and runtime config
+- [`docs/build-and-load.md`](docs/build-and-load.md) — toolchain and runtime config (system variables, `ENGINE_ATTRIBUTE`)
 - [`docs/testing.md`](docs/testing.md) — test layers and how to run each
-- [`docs/mariadb-vs-mysql.md`](docs/mariadb-vs-mysql.md) — handler-API divergence catalog
-- [`docs/port-errors-pass1.md`](docs/port-errors-pass1.md) — what broke at first compile (950 errors → 0)
-- [`docs/phase3-status.md`](docs/phase3-status.md) — type matrix, AUTO_INCREMENT, cross-restart
-- [`docs/phase4-mtr-suite-status.md`](docs/phase4-mtr-suite-status.md) — MTR pass-rate breakdown
-- [`docs/phase4-atomic-ddl-investigation.md`](docs/phase4-atomic-ddl-investigation.md) — why atomic DDL was deferred
-- [`docs/phase4-txn-lifecycle-progress.md`](docs/phase4-txn-lifecycle-progress.md) — Debug-build assertion + workaround
-- [`docs/tidesql-install-sh-analysis.md`](docs/tidesql-install-sh-analysis.md) — what we kept vs dropped from TideSQL's installer
 
 ## License
 
