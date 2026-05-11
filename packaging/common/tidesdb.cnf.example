@@ -1,0 +1,47 @@
+#
+# TidesDB storage engine for MySQL -- example config snippet.
+#
+# To enable the engine on every mysqld start, copy this file (or
+# rename it after install) to your config drop-in directory:
+#
+#   /etc/mysql/conf.d/tidesdb.cnf       (Debian / Ubuntu)
+#   /etc/my.cnf.d/tidesdb.cnf           (RHEL / Oracle Linux)
+#
+# Then restart mysqld. Verify with:
+#
+#   mysql -e "SHOW ENGINES;" | grep -i tidesdb
+#
+# Or load the plugin once at runtime instead of at every restart:
+#
+#   mysql -e "INSTALL PLUGIN tidesdb SONAME 'ha_tidesdb.so';"
+#
+
+[mysqld]
+plugin-load-add = ha_tidesdb.so
+
+# Keep TidesDB's column-family data alongside the InnoDB data dir so
+# both get the same volume / permissions / backups treatment.
+# (Default would be /var/lib/tidesdb_data, which the mysql user may
+# not have permission to create on some distributions.)
+#
+# `loose_` prefix: this variable is plugin-defined, so it's unknown
+# during the initial mysqld --initialize step that runs before any
+# plugin loads. Without `loose_`, that step would abort with
+# "unknown variable". `loose_` makes mysqld warn-and-continue.
+loose_tidesdb_data_home_dir = /var/lib/mysql/tidesdb_data/
+
+# ---- Optional tuning ----
+#
+#tidesdb_default_compression       = LZ4         # NONE | SNAPPY | LZ4 | ZSTD | LZ4_FAST
+#tidesdb_default_sync_mode         = INTERVAL    # NONE | INTERVAL | FULL
+#tidesdb_block_cache_size          = 1073741824  # 1 GiB
+#tidesdb_max_open_sstables         = 512
+#tidesdb_compaction_threads        = 4
+#tidesdb_flush_threads             = 2
+
+# ---- Optional: at-rest encryption ----
+#
+# Provide a 32-byte AES-256 master key file (read-only at startup).
+# Per-table opt-in via `ENGINE_ATTRIBUTE='{"encrypted":true}'`.
+#
+#loose_tidesdb_master_key_file = /etc/mysql/tidesdb/master.key

@@ -1,0 +1,22 @@
+#!/bin/sh
+# prerm script for tidesdb-mysql-plugin
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        # No-op. The user has to UNINSTALL PLUGIN tidesdb if they
+        # currently have it loaded, otherwise mysqld will complain on
+        # next start when the .so is gone. We don't try to do that for
+        # them (we don't necessarily have credentials).
+        :
+        ;;
+    failed-upgrade)
+        :
+        ;;
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

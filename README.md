@@ -6,7 +6,47 @@ A **MySQL 9.7 storage engine plugin** that uses [TidesDB](https://github.com/tid
 
 This is a port of [TideSQL](https://github.com/tidesdb/tidesql) (TidesDB + MariaDB) to MySQL 9.7. Despite the family resemblance, MariaDB and MySQL have diverged enough at the handler API and data-dictionary layers that this is a rewrite-by-replay rather than a drop-in.
 
-## Quick start (Docker — recommended for trying it out)
+## Quick start — install alongside your MySQL server
+
+If you already run `mysql-server` from your distro's package manager, you can install the plugin as a sibling package and enable the engine without rebuilding mysqld.
+
+**Debian / Ubuntu** (mysql-server-9.7+):
+
+```bash
+sudo dpkg -i tidesdb-mysql-plugin_<version>_amd64.deb
+# Enable on every restart:
+sudo cp /usr/share/doc/tidesdb-mysql-plugin/tidesdb.cnf.example \
+        /etc/mysql/conf.d/tidesdb.cnf
+sudo systemctl restart mysql
+mysql -uroot -e "SHOW ENGINES;" | grep -i tidesdb
+```
+
+**RHEL / Oracle Linux / Rocky 9** (mysql-server-9.7+):
+
+```bash
+sudo dnf install ./tidesdb-mysql-plugin-<version>-1.x86_64.rpm
+sudo cp /usr/share/doc/tidesdb-mysql-plugin/tidesdb.cnf.example \
+        /etc/my.cnf.d/tidesdb.cnf
+sudo systemctl restart mysqld
+mysql -uroot -e "SHOW ENGINES;" | grep -i tidesdb
+```
+
+Or load the plugin once at runtime instead of at every restart:
+
+```sql
+INSTALL PLUGIN tidesdb SONAME 'ha_tidesdb.so';
+```
+
+**Build packages from source:**
+
+```bash
+./scripts/package-deb.sh 0.1.0       # writes dist/tidesdb-mysql-plugin_0.1.0_amd64.deb
+./scripts/package-rpm.sh 0.1.0       # writes dist/tidesdb-mysql-plugin-0.1.0-1.x86_64.rpm
+```
+
+Both produce a binary package containing `ha_tidesdb.so` plus docs and an example config snippet. The `.deb` is built on Ubuntu 24.04 and the `.rpm` on Oracle Linux 9 (matching the official `mysql:9.7` image's libstdc++ ABI).
+
+## Quick start (Docker — for trying it out without installing on the host)
 
 The fastest way to play with it: build a runnable `mysql:9.7` image with the plugin baked in.
 

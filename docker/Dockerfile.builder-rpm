@@ -1,0 +1,31 @@
+# Oracle Linux 9 builder image for the .rpm package.
+#
+# Mirrors the Stage 1 builder in docker/Dockerfile.mysql but additionally
+# carries rpmbuild + rpmdevtools so the same image both compiles
+# ha_tidesdb.so and assembles the .rpm against it.
+#
+# Built ad hoc by scripts/package-rpm.sh; not used at runtime.
+
+FROM oraclelinux:9
+
+ENV LANG=C.UTF-8
+
+RUN dnf -y install --setopt=install_weak_deps=False \
+        oracle-epel-release-el9 oraclelinux-developer-release-el9 && \
+    dnf -y config-manager --enable ol9_codeready_builder && \
+    dnf -y install --setopt=install_weak_deps=False \
+        gcc-toolset-14-gcc gcc-toolset-14-gcc-c++ gcc-toolset-14-binutils \
+        gcc-toolset-14-annobin-annocheck gcc-toolset-14-annobin-plugin-gcc \
+        make cmake ninja-build bison git pkgconf-pkg-config \
+        diffutils tar which patch findutils gzip rsync \
+        openssl-devel ncurses-devel readline-devel \
+        libtirpc-devel libcurl-devel \
+        libzstd-devel lz4-devel snappy-devel \
+        rpm-build rpmdevtools && \
+    dnf clean all
+
+ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:$PATH \
+    CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc \
+    CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++
+
+WORKDIR /work

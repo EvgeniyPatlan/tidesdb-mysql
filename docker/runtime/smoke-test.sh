@@ -26,14 +26,23 @@ docker run -d --name "$CONTAINER" \
     "$IMAGE" >/dev/null
 
 wait_ready () {
-    local n
+    # The mysql:9.7 entrypoint runs a temporary mysqld (to bootstrap the
+    # data dir + init.d/ scripts) and then restarts the real one. A single
+    # successful "SELECT 1" can hit the temporary mysqld's window; the
+    # next query then lands in the gap before the real mysqld is up.
+    # Require three consecutive successes spaced ~3 seconds apart so we
+    # know we're talking to the *real* server. Total budget ~3 min.
+    local n streak=0
     for n in $(seq 1 60); do
         if docker exec "$CONTAINER" mysql -uroot -p"$PASSWORD" -e "SELECT 1" >/dev/null 2>&1; then
-            return 0
+            streak=$((streak + 1))
+            if [ "$streak" -ge 3 ]; then return 0; fi
+        else
+            streak=0
         fi
-        sleep 2
+        sleep 3
     done
-    echo "FAIL: mysqld did not become ready within 120s"
+    echo "FAIL: mysqld did not become ready within 180s"
     docker logs "$CONTAINER" | tail -30
     return 1
 }

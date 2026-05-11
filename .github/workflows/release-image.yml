@@ -1,0 +1,106 @@
+name: release-image
+
+# Build + publish the runnable tidesdb/mysql:9.7 image to Docker Hub.
+#
+# Triggers:
+#   * Manual: any commit, from the Actions tab. The "version" input
+#     becomes the image tag suffix.
+#   * Tag push:  vN.M.K  (e.g. v0.2.0) -- the leading "v" is stripped,
+#     so v0.2.0 -> evgeniypatlan/test-images:mysql-9.7-tidesdb-0.2.0
+#
+# Always also publishes :mysql-9.7-tidesdb-latest on a successful run.
+#
+# Secrets required on the repo (Settings -> Secrets and variables -> Actions):
+#   DOCKERHUB_USERNAME  -- e.g. evgeniypatlan
+#   DOCKERHUB_TOKEN     -- a Docker Hub access token with write access to
+#                          docker.io/evgeniypatlan/test-images
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version suffix for the image tag (e.g. 0.2.0)'
+        required: true
+        default: 'dev'
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-24.04
+    # Stage 1 of Dockerfile.mysql does a full MySQL 9.7.0 source build.
+    # GitHub runners disk-out around 90 min if Stage 1 is fully cold;
+    # buildx with the GHA cache cuts subsequent runs to ~15 min.
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Derive image tag suffix
+        id: tag
+        shell: bash
+        run: |
+          # Workflow can be triggered by a tag push OR manual dispatch.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Tag is refs/tags/vX.Y.Z — strip the "v"
+            v="${GITHUB_REF##*/}"
+            v="${v#v}"
+          else
+            v="${{ github.event.inputs.version }}"
+          fi
+          echo "version=${v}" >> "$GITHUB_OUTPUT"
+          echo "[tag] image suffix: ${v}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.mysql
+          # linux/amd64 only for now -- the Stage 1 builder + plugin
+          # source has not been validated on arm64.
+          platforms: linux/amd64
+          push: true
+          tags: |
+            evgeniypatlan/test-images:mysql-9.7-tidesdb-${{ steps.tag.outputs.version }}
+            evgeniypatlan/test-images:mysql-9.7-tidesdb-latest
+          # GitHub-Actions-native layer cache; first run populates, later
+          # runs reuse Stage 1 (Oracle Linux deps + MySQL source clone +
+          # convenience libs) and only recompile the plugin .cc.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test pushed image
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG=evgeniypatlan/test-images:mysql-9.7-tidesdb-${{ steps.tag.outputs.version }}
+          echo "[smoke] using image $IMG"
+          # docker/runtime/smoke-test.sh expects to be runnable against
+          # an arbitrary image; pass it as argument.
+          ./docker/runtime/smoke-test.sh "$IMG"
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "### Published image"
+            echo ""
+            echo '```'
+            echo "docker pull evgeniypatlan/test-images:mysql-9.7-tidesdb-${{ steps.tag.outputs.version }}"
+            echo "docker pull evgeniypatlan/test-images:mysql-9.7-tidesdb-latest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

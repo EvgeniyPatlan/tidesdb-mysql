@@ -1,0 +1,29 @@
+Package: tidesdb-mysql-plugin
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: TidesDB MySQL Maintainers <noreply@tidesdb.example>
+Section: database
+Priority: optional
+Homepage: https://github.com/EvgeniyPatlan/tidesdb-mysql
+Depends: libc6, libstdc++6, libsnappy1v5, libzstd1, liblz4-1
+Recommends: mysql-server (>= 9.7) | mysql-community-server (>= 9.7)
+Description: TidesDB LSM-tree storage engine for MySQL 9.7
+ TidesDB-MySQL is a port of the TideSQL storage engine plugin to
+ MySQL 9.7 LTS. It exposes the TidesDB LSM-tree key/value engine
+ as a loadable storage engine: CREATE TABLE ... ENGINE=TIDESDB.
+ .
+ Features:
+  * Single-column and composite primary keys (incl. AUTO_INCREMENT
+    as a non-leading column)
+  * Composite secondary indexes with index-condition pushdown
+  * 2-phase commit; ER_LOCK_DEADLOCK surfaces cleanly
+  * Online DDL: ADD/DROP INDEX (INPLACE), ADD COLUMN /
+    trailing DROP COLUMN (INSTANT)
+  * AES-256-CBC at-rest encryption via a master-key file
+  * Per-table compression: NONE | SNAPPY | LZ4 | ZSTD | LZ4_FAST
+  * Cross-restart persistence
+  * Mixed-engine transactions (TidesDB + InnoDB in the same BEGIN..COMMIT)
+ .
+ Install this package alongside mysql-server, then enable the engine
+ with INSTALL PLUGIN or by dropping the supplied tidesdb.cnf.example
+ into /etc/mysql/conf.d/.

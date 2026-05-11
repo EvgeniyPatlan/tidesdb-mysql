@@ -49,3 +49,4 @@ venv/
 core
 core.*
 .gdb_history
+dist/

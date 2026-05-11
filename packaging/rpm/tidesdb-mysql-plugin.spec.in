@@ -1,0 +1,89 @@
+Name:       tidesdb-mysql-plugin
+Version:    @VERSION@
+Release:    1%{?dist}
+Summary:    TidesDB LSM-tree storage engine for MySQL 9.7
+License:    GPLv2
+URL:        https://github.com/EvgeniyPatlan/tidesdb-mysql
+BuildArch:  x86_64
+
+# Skip build-id processing (we ship a pre-built .so)
+%global debug_package %{nil}
+%global __os_install_post %{nil}
+
+Requires:   snappy
+Requires:   libzstd
+Requires:   lz4-libs
+Requires:   mysql-server >= 9.7
+
+%description
+TidesDB-MySQL is a port of the TideSQL storage engine plugin to
+MySQL 9.7 LTS. It exposes the TidesDB LSM-tree key/value engine as a
+loadable storage engine: CREATE TABLE ... ENGINE=TIDESDB.
+
+Features:
+ * Single-column and composite primary keys (incl. AUTO_INCREMENT
+   as a non-leading column)
+ * Composite secondary indexes with index-condition pushdown
+ * 2-phase commit; ER_LOCK_DEADLOCK surfaces cleanly
+ * Online DDL: ADD/DROP INDEX (INPLACE), ADD COLUMN / trailing
+   DROP COLUMN (INSTANT)
+ * AES-256-CBC at-rest encryption via a master-key file
+ * Per-table compression: NONE | SNAPPY | LZ4 | ZSTD | LZ4_FAST
+ * Cross-restart persistence
+ * Mixed-engine transactions (TidesDB + InnoDB in the same BEGIN..COMMIT)
+
+Install this package alongside mysql-server, then enable the engine
+with INSTALL PLUGIN or by dropping the supplied tidesdb.cnf.example
+into /etc/my.cnf.d/.
+
+%prep
+# nothing to prep -- payload is a pre-built tree
+
+%build
+# nothing to build -- payload is a pre-built tree
+
+%install
+# Files are staged in %{_builddir}/payload/ before rpmbuild runs.
+mkdir -p %{buildroot}/usr/lib64/mysql/plugin
+mkdir -p %{buildroot}/usr/share/doc/%{name}
+install -m 0755 %{_builddir}/payload/ha_tidesdb.so   %{buildroot}/usr/lib64/mysql/plugin/ha_tidesdb.so
+install -m 0644 %{_builddir}/payload/README.md       %{buildroot}/usr/share/doc/%{name}/README.md
+install -m 0644 %{_builddir}/payload/LICENSE         %{buildroot}/usr/share/doc/%{name}/LICENSE
+install -m 0644 %{_builddir}/payload/CHANGELOG.md    %{buildroot}/usr/share/doc/%{name}/CHANGELOG.md
+install -m 0644 %{_builddir}/payload/tidesdb.cnf.example %{buildroot}/usr/share/doc/%{name}/tidesdb.cnf.example
+
+%files
+%license /usr/share/doc/%{name}/LICENSE
+%doc     /usr/share/doc/%{name}/README.md
+%doc     /usr/share/doc/%{name}/CHANGELOG.md
+%doc     /usr/share/doc/%{name}/tidesdb.cnf.example
+/usr/lib64/mysql/plugin/ha_tidesdb.so
+
+%post
+cat <<'EOF'
+
+  ============================================================
+   TidesDB storage engine plugin installed.
+
+   Enable the engine with one of:
+
+     # Auto-load at every mysqld start:
+     sudo cp /usr/share/doc/tidesdb-mysql-plugin/tidesdb.cnf.example \
+             /etc/my.cnf.d/tidesdb.cnf
+     sudo systemctl restart mysqld
+
+     # Or load once at runtime:
+     mysql -e "INSTALL PLUGIN tidesdb SONAME 'ha_tidesdb.so';"
+
+   Verify with:
+
+     mysql -e "SHOW ENGINES;" | grep -i tidesdb
+
+   Docs: https://github.com/EvgeniyPatlan/tidesdb-mysql
+  ============================================================
+
+EOF
+
+%changelog
+* @CHANGELOG_DATE@ TidesDB Maintainers <noreply@tidesdb.example> - @VERSION@-1
+- Packaging release.

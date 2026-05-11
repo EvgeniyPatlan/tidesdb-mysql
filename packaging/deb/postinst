@@ -1,0 +1,39 @@
+#!/bin/sh
+# postinst script for tidesdb-mysql-plugin
+set -e
+
+case "$1" in
+    configure)
+        cat <<'EOF'
+
+  ============================================================
+   TidesDB storage engine plugin installed.
+
+   Enable the engine with one of:
+
+     # Auto-load at every mysqld start:
+     sudo cp /usr/share/doc/tidesdb-mysql-plugin/tidesdb.cnf.example \
+             /etc/mysql/conf.d/tidesdb.cnf
+     sudo systemctl restart mysql
+
+     # Or load once at runtime:
+     mysql -e "INSTALL PLUGIN tidesdb SONAME 'ha_tidesdb.so';"
+
+   Verify with:
+
+     mysql -e "SHOW ENGINES;" | grep -i tidesdb
+
+   Docs: https://github.com/EvgeniyPatlan/tidesdb-mysql
+  ============================================================
+
+EOF
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
