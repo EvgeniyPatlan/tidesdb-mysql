@@ -259,4 +259,4 @@ GPLv2, matching MySQL Server and the upstream TideSQL plugin. See [`LICENSE`](LI
 
 - [TidesDB](https://github.com/tidesdb/tidesdb) — the underlying LSM engine.
 - [TideSQL](https://github.com/tidesdb/tidesql) — the MariaDB integration this port is derived from. The handler scaffolding, system variables, and `ENGINE_ATTRIBUTE` JSON design all trace back to TideSQL.
-- [MySQL Server](https://github.com/mysql/mysql-server) — the host server. This project is *not* affiliated with Oracle.
+- [MySQL Server](https://github.com/mysql/mysql-server) — the host server.
