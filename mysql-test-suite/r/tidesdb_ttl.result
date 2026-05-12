@@ -18,9 +18,6 @@ id	val
 # Rows should now be expired (empty result)
 SELECT * FROM t_ttl_table ORDER BY id;
 id	val
-1	alpha
-2	beta
-3	gamma
 DROP TABLE t_ttl_table;
 #
 # ============================================

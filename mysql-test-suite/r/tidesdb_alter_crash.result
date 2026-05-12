@@ -1,5 +1,5 @@
 #
-# Issue #70: ALTER TABLE sometimes crashes MariaDB
+# Issue #70: ALTER TABLE crash regression (originally seen on MariaDB)
 # The crash was caused by unbounded read-set growth during
 # ALTER TABLE's copy-phase scan under REPEATABLE_READ.
 #
