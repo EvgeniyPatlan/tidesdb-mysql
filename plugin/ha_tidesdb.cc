@@ -44,6 +44,14 @@ extern "C"
 #include "sql/key.h"
 #include "sql/sql_class.h"
 
+/* See plugin/tidesdb_compat.h's "Category 7: Logging shims" comment
+ * for why sql_print_information/warning/error keep their stderr
+ * implementation rather than routing through MySQL's structured log
+ * APIs. Short version: LogEvent / LogPluginErrMsg need the `log_bs`
+ * service registry that MODULE_ONLY plugins do not get linked, and
+ * my_plugin_log_message needs a st_plugin_int* handle that storage-
+ * engine inits never receive (they get the handlerton instead). */
+
 /* MariaDB exposes per-table options via TABLE_SHARE::option_struct (an
  * engine-defined struct populated from CREATE TABLE syntax via
  * ha_create_table_option[] registration). MySQL 9.7 has no equivalent;

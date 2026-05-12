@@ -390,11 +390,26 @@ struct ha_create_table_option {
 #define DBUG_ASSERT(x) assert(x)
 #endif
 
-/* ----- Category 7: Logging stubs -----
- * MariaDB has free functions sql_print_{information,warning,error}.
- * MySQL 8.0+ removed them in favor of LogErr() / LogPlugin*(). For now
- * the engine writes to stderr — TODO: switch to MySQL's LogErr() /
- * LogPlugin*() for structured log output. */
+/* ----- Category 7: Logging shims -----
+ *
+ * MariaDB exposes free functions sql_print_{information,warning,error};
+ * MySQL 8.0+ removed them in favor of LogErr / LogPluginErr / LogEvent.
+ * Those replacements all fan out through the `log_bs` service handle
+ * declared in mysql/components/services/log_builtins.h. MODULE_ONLY
+ * plugins do NOT get that handle linked in automatically -- using them
+ * unconditionally produces an `undefined symbol: log_bs` load failure.
+ *
+ * The older `my_plugin_log_message` API is also unsuitable here: storage
+ * engines' handlerton init receives the `handlerton *` rather than the
+ * `st_plugin_int *` the service expects, so there is no obvious place
+ * to capture a valid plugin handle without registering as a real
+ * component plugin -- a much bigger refactor than this surface needs.
+ *
+ * Pragmatic choice: keep the messages going to stderr. mysqld redirects
+ * stderr to the error log file early in startup, so these lines DO end
+ * up in the operator-visible log -- they're just plain-formatted rather
+ * than structured. Format mimics MySQL's prefix style so grep / log
+ * aggregators can still pick them up by component name. */
 inline void sql_print_information(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     std::fputs("[Note] [tidesdb] ", stderr);
