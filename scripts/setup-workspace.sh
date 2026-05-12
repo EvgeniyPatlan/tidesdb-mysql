@@ -66,7 +66,9 @@ mkdir -p "$SUITE_DST"
 cp -r mysql-test-suite/t          "$SUITE_DST/"
 cp -r mysql-test-suite/r          "$SUITE_DST/"
 cp -r mysql-test-suite/include    "$SUITE_DST/"
-cp    mysql-test-suite/suite.opt  "$SUITE_DST/"
+# Note: suite.opt now lives under mysql-test-suite/t/ (where MTR
+# actually looks for it -- it reads <suite>/t/suite.opt, not the
+# suite root); the cp -r t/ above already brings it along.
 
 echo
 echo "[setup] Done. Workspace ready at $REPO/vendor/."
