@@ -190,8 +190,26 @@ static inline int tidesdb_txn_delete_cf(tidesdb_txn_t *txn, tidesdb_column_famil
 /* MariaDB data directory */
 extern MYSQL_PLUGIN_IMPORT char mysql_real_data_home[];
 
-/* Global TidesDB database handle */
-static tidesdb_t *tdb_global = NULL;
+/* Global TidesDB database handle.
+ *
+ * Stored as std::atomic<tidesdb_t *> so the shutdown clear in
+ * tidesdb_hton_panic / tidesdb_deinit_func is properly synchronized with
+ * concurrent handler-thread reads. MySQL does NOT guarantee all handler
+ * threads have quiesced before panic runs, so the write/read race was
+ * a real null-deref crash risk under shutdown-with-load.
+ *
+ * All call sites read via tdb_get_engine() (acquire load) and write via
+ * tdb_set_engine() (release store). Direct access to g_tdb_engine is
+ * confined to those two helpers. */
+static std::atomic<tidesdb_t *> g_tdb_engine{nullptr};
+static inline tidesdb_t *tdb_get_engine()
+{
+    return g_tdb_engine.load(std::memory_order_acquire);
+}
+static inline void tdb_set_engine(tidesdb_t *p)
+{
+    g_tdb_engine.store(p, std::memory_order_release);
+}
 static std::string tdb_path;
 
 /* Schema discovery CF for object store mode (NULL when local-only) */
@@ -791,8 +809,13 @@ static bool tdb_load_stopwords_from_table_spec(const char *table_spec)
 
     /* We look for a TidesDB CF matching the table path convention */
     std::string cf_name = db_name + "/" + tbl_name;
+    /* Cache the engine pointer locally so the truthy check and the
+       subsequent use are guaranteed to see the same value -- otherwise
+       a concurrent shutdown between the two loads would pass NULL to
+       tidesdb_get_column_family. */
+    tidesdb_t *engine = tdb_get_engine();
     tidesdb_column_family_t *sw_cf =
-        tdb_global ? tidesdb_get_column_family(tdb_global, cf_name.c_str()) : NULL;
+        engine ? tidesdb_get_column_family(engine, cf_name.c_str()) : NULL;
 
     if (!sw_cf)
     {
@@ -806,7 +829,7 @@ static bool tdb_load_stopwords_from_table_spec(const char *table_spec)
     /* We scan the CF for all keys with DATA namespace prefix.
        Each row should have a 'value' field which we extract via full table scan. */
     tidesdb_txn_t *txn = NULL;
-    if (tidesdb_txn_begin(tdb_global, &txn) != TDB_SUCCESS) return false;
+    if (tidesdb_txn_begin(tdb_get_engine(), &txn) != TDB_SUCCESS) return false;
 
     tidesdb_iter_t *iter = NULL;
     if (tidesdb_iter_new(txn, sw_cf, &iter) != TDB_SUCCESS)
@@ -2085,13 +2108,13 @@ static void tidesdb_promote_primary_update(THD *thd, SYS_VAR *, void *var_ptr,
     my_bool val = *static_cast<const my_bool *>(save);
     if (!val) return; /* only act on SET ... = ON */
 
-    if (!tdb_global)
+    if (!tdb_get_engine())
     {
         my_error(ER_UNKNOWN_ERROR, MYF(0));
         return;
     }
 
-    int rc = tidesdb_promote_to_primary(tdb_global);
+    int rc = tidesdb_promote_to_primary(tdb_get_engine());
     if (rc == TDB_SUCCESS)
     {
         sql_print_information("[TIDESDB] Replica promoted to primary successfully");
@@ -2144,7 +2167,7 @@ static int tidesdb_backup_dir_check(THD *thd, SYS_VAR *, void *save,
         return 0;
     }
 
-    if (!tdb_global)
+    if (!tdb_get_engine())
     {
         my_error(ER_UNKNOWN_ERROR, MYF(0), "TidesDB is not open");
         return 1;
@@ -2170,7 +2193,7 @@ static int tidesdb_backup_dir_check(THD *thd, SYS_VAR *, void *save,
        path because val_str's buffer is stack-local. */
     std::string backup_path(new_dir);
 
-    int rc = tidesdb_backup(tdb_global, const_cast<char *>(backup_path.c_str()));
+    int rc = tidesdb_backup(tdb_get_engine(), const_cast<char *>(backup_path.c_str()));
 
     if (rc != TDB_SUCCESS)
     {
@@ -2223,7 +2246,7 @@ static int tidesdb_checkpoint_dir_check(THD *, SYS_VAR *, void *save,
         return 0;
     }
 
-    if (!tdb_global)
+    if (!tdb_get_engine())
     {
         my_error(ER_UNKNOWN_ERROR, MYF(0), "TidesDB is not open");
         return 1;
@@ -2233,7 +2256,7 @@ static int tidesdb_checkpoint_dir_check(THD *, SYS_VAR *, void *save,
 
     /* check runs without LOCK_global_system_variables held, so no
        unlock/relock needed (see tidesdb_backup_dir_check). */
-    int rc = tidesdb_checkpoint(tdb_global, ckpt_path.c_str());
+    int rc = tidesdb_checkpoint(tdb_get_engine(), ckpt_path.c_str());
 
     if (rc != TDB_SUCCESS)
     {
@@ -2783,7 +2806,7 @@ static tidesdb_trx_t *get_or_create_trx(THD *thd, handlerton *hton, tidesdb_isol
     {
         if (!trx->txn)
         {
-            int rc = tidesdb_txn_begin_with_isolation(tdb_global, iso, &trx->txn);
+            int rc = tidesdb_txn_begin_with_isolation(tdb_get_engine(), iso, &trx->txn);
             if (rc != TDB_SUCCESS)
             {
                 (void)tdb_rc_to_ha(rc, "get_or_create_trx txn_begin(reuse)");
@@ -2815,7 +2838,7 @@ static tidesdb_trx_t *get_or_create_trx(THD *thd, handlerton *hton, tidesdb_isol
                     rrc);
                 tidesdb_txn_free(trx->txn);
                 trx->txn = NULL;
-                int rc = tidesdb_txn_begin_with_isolation(tdb_global, iso, &trx->txn);
+                int rc = tidesdb_txn_begin_with_isolation(tdb_get_engine(), iso, &trx->txn);
                 if (rc != TDB_SUCCESS)
                 {
                     (void)tdb_rc_to_ha(rc, "get_or_create_trx txn_begin(reset_fallback)");
@@ -2832,7 +2855,7 @@ static tidesdb_trx_t *get_or_create_trx(THD *thd, handlerton *hton, tidesdb_isol
     trx = (tidesdb_trx_t *)my_malloc(PSI_NOT_INSTRUMENTED, sizeof(tidesdb_trx_t), MYF(MY_ZEROFILL));
     if (!trx) return NULL;
 
-    int rc = tidesdb_txn_begin_with_isolation(tdb_global, iso, &trx->txn);
+    int rc = tidesdb_txn_begin_with_isolation(tdb_get_engine(), iso, &trx->txn);
     if (rc != TDB_SUCCESS)
     {
         my_free(trx);
@@ -3213,7 +3236,7 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
                                 enum ha_stat_type stat)
 {
     if (stat != HA_ENGINE_STATUS) return false;
-    if (!tdb_global) return false;
+    if (!tdb_get_engine()) return false;
 
     /* We refresh SHOW GLOBAL STATUS variables alongside the human-readable output */
     tidesdb_refresh_status_vars();
@@ -3221,12 +3244,12 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
     /* Database-level stats */
     tidesdb_db_stats_t db_st;
     memset(&db_st, 0, sizeof(db_st));
-    tidesdb_get_db_stats(tdb_global, &db_st);
+    tidesdb_get_db_stats(tdb_get_engine(), &db_st);
 
     /* Cache stats */
     tidesdb_cache_stats_t cache_st;
     memset(&cache_st, 0, sizeof(cache_st));
-    tidesdb_get_cache_stats(tdb_global, &cache_st);
+    tidesdb_get_cache_stats(tdb_get_engine(), &cache_st);
 
     /* Output buffer for SHOW ENGINE TIDESDB STATUS.  8 KiB is enough to
        hold the fixed-format sections plus an optional object-store block
@@ -3441,7 +3464,7 @@ static int schema_cf_store_frm(const char *path, const uchar *frm_data = NULL, s
 
     /* We write to schema CF using a dedicated one-shot transaction */
     tidesdb_txn_t *txn = NULL;
-    int rc = tidesdb_txn_begin(tdb_global, &txn);
+    int rc = tidesdb_txn_begin(tdb_get_engine(), &txn);
     if (rc == TDB_SUCCESS)
     {
         rc = tidesdb_txn_put(txn, schema_cf, (const uint8_t *)key.data(), key.size(), frm_data,
@@ -3466,7 +3489,7 @@ static void schema_cf_delete(const char *path)
 
     std::string key = schema_cf_key_from_path(path);
     tidesdb_txn_t *txn = NULL;
-    if (tidesdb_txn_begin(tdb_global, &txn) == TDB_SUCCESS)
+    if (tidesdb_txn_begin(tdb_get_engine(), &txn) == TDB_SUCCESS)
     {
         tidesdb_txn_delete(txn, schema_cf, (const uint8_t *)key.data(), key.size());
         tidesdb_txn_commit(txn);
@@ -3488,7 +3511,7 @@ static void schema_cf_delete_db(const std::string &db_name)
     prefix.push_back(SCHEMA_CF_KEY_SEP);
 
     tidesdb_txn_t *txn = NULL;
-    if (tidesdb_txn_begin(tdb_global, &txn) != TDB_SUCCESS) return;
+    if (tidesdb_txn_begin(tdb_get_engine(), &txn) != TDB_SUCCESS) return;
 
     tidesdb_iter_t *it = NULL;
     if (tidesdb_iter_new(txn, schema_cf, &it) != TDB_SUCCESS)
@@ -3533,7 +3556,7 @@ static void schema_cf_rename(const char *from, const char *to)
     std::string new_key = schema_cf_key_from_path(to);
 
     tidesdb_txn_t *txn = NULL;
-    if (tidesdb_txn_begin(tdb_global, &txn) != TDB_SUCCESS) return;
+    if (tidesdb_txn_begin(tdb_get_engine(), &txn) != TDB_SUCCESS) return;
 
     /* We read existing .frm from old key */
     uint8_t *val = NULL;
@@ -3577,7 +3600,7 @@ static int tidesdb_discover_table(handlerton *, THD *thd, TABLE_SHARE *share)
     std::string key = schema_cf_key(share->db, share->table_name);
 
     tidesdb_txn_t *txn = NULL;
-    int rc = tidesdb_txn_begin(tdb_global, &txn);
+    int rc = tidesdb_txn_begin(tdb_get_engine(), &txn);
     if (rc != TDB_SUCCESS) return HA_ERR_NO_SUCH_TABLE;
 
     uint8_t *val = NULL;
@@ -3610,7 +3633,7 @@ static int tidesdb_discover_table(handlerton *, THD *thd, TABLE_SHARE *share)
     {
         std::string cf_name = std::string(share->db.str, share->db.length) + CF_DB_TABLE_SEP +
                               std::string(share->table_name.str, share->table_name.length);
-        if (!tidesdb_get_column_family(tdb_global, cf_name.c_str()))
+        if (!tidesdb_get_column_family(tdb_get_engine(), cf_name.c_str()))
         {
             free(val);
             return HA_ERR_NO_SUCH_TABLE;
@@ -3651,7 +3674,7 @@ static int tidesdb_discover_table_names(handlerton *, const LEX_CSTRING *db, MY_
     prefix.push_back(SCHEMA_CF_KEY_SEP);
 
     tidesdb_txn_t *txn = NULL;
-    if (tidesdb_txn_begin(tdb_global, &txn) != TDB_SUCCESS) return 0;
+    if (tidesdb_txn_begin(tdb_get_engine(), &txn) != TDB_SUCCESS) return 0;
 
     tidesdb_iter_t *iter = NULL;
     if (tidesdb_iter_new(txn, schema_cf, &iter) != TDB_SUCCESS || !iter)
@@ -3703,7 +3726,7 @@ static int tidesdb_discover_table_existence(handlerton *, const char *db, const 
     std::string key = schema_cf_key(db_lex, tbl_lex);
 
     tidesdb_txn_t *txn = NULL;
-    if (tidesdb_txn_begin(tdb_global, &txn) != TDB_SUCCESS) return 0;
+    if (tidesdb_txn_begin(tdb_get_engine(), &txn) != TDB_SUCCESS) return 0;
 
     uint8_t *val = NULL;
     size_t val_len = 0;
@@ -3732,7 +3755,7 @@ static void schema_cf_ensure_databases()
     if (!schema_cf) return;
 
     tidesdb_txn_t *txn = NULL;
-    if (tidesdb_txn_begin(tdb_global, &txn) != TDB_SUCCESS) return;
+    if (tidesdb_txn_begin(tdb_get_engine(), &txn) != TDB_SUCCESS) return;
 
     tidesdb_iter_t *iter = NULL;
     if (tidesdb_iter_new(txn, schema_cf, &iter) != TDB_SUCCESS || !iter)
@@ -3961,12 +3984,16 @@ static int tidesdb_init_func(void *p)
         cfg.object_store_config = &objstore_cfg;
     }
 
-    int rc = tidesdb_open(&cfg, &tdb_global);
+    tidesdb_t *opened = nullptr;
+    int rc = tidesdb_open(&cfg, &opened);
     if (rc != TDB_SUCCESS)
     {
         sql_print_error("[TIDESDB] Failed to open TidesDB at %s (err=%d)", tdb_path.c_str(), rc);
         DBUG_RETURN(1);
     }
+    /* Publish atomically -- handler threads must observe a fully-constructed
+       engine handle, not a torn write. */
+    tdb_set_engine(opened);
 
     sql_print_information("[TIDESDB] TidesDB opened at %s", tdb_path.c_str());
 
@@ -3975,10 +4002,10 @@ static int tidesdb_init_func(void *p)
     if (objstore_connector)
     {
         tidesdb_column_family_config_t schema_cfg = tidesdb_default_column_family_config();
-        if (!tidesdb_get_column_family(tdb_global, SCHEMA_CF_NAME))
-            tidesdb_create_column_family(tdb_global, SCHEMA_CF_NAME, &schema_cfg);
+        if (!tidesdb_get_column_family(tdb_get_engine(), SCHEMA_CF_NAME))
+            tidesdb_create_column_family(tdb_get_engine(), SCHEMA_CF_NAME, &schema_cfg);
 
-        schema_cf = tidesdb_get_column_family(tdb_global, SCHEMA_CF_NAME);
+        schema_cf = tidesdb_get_column_family(tdb_get_engine(), SCHEMA_CF_NAME);
 
         if (schema_cf)
         {
@@ -4009,16 +4036,16 @@ static int tidesdb_init_func(void *p)
 */
 static bool tidesdb_hton_flush_logs(handlerton *)
 {
-    if (!tdb_global) return false;
+    if (!tdb_get_engine()) return false;
 
     tidesdb_column_family_t *target = schema_cf;
     if (!target)
     {
         char **names = NULL;
         int count = 0;
-        if (tidesdb_list_column_families(tdb_global, &names, &count) == TDB_SUCCESS && names)
+        if (tidesdb_list_column_families(tdb_get_engine(), &names, &count) == TDB_SUCCESS && names)
         {
-            if (count > 0 && names[0]) target = tidesdb_get_column_family(tdb_global, names[0]);
+            if (count > 0 && names[0]) target = tidesdb_get_column_family(tdb_get_engine(), names[0]);
             for (int i = 0; i < count; i++)
                 if (names[i]) free(names[i]);
             free(names);
@@ -4043,10 +4070,13 @@ static bool tidesdb_hton_flush_logs(handlerton *)
 static int tidesdb_hton_panic(handlerton *, enum ha_panic_function flag)
 {
     if (flag != HA_PANIC_CLOSE) return 0;
-    if (tdb_global)
+    /* Take ownership atomically: any handler thread that loads after this
+       point sees nullptr and short-circuits cleanly. We swap rather than
+       load+store so no second caller can race us into a double-close. */
+    tidesdb_t *engine = g_tdb_engine.exchange(nullptr, std::memory_order_acq_rel);
+    if (engine)
     {
-        tidesdb_close(tdb_global);
-        tdb_global = NULL;
+        tidesdb_close(engine);
         schema_cf = NULL;
     }
     return 0;
@@ -4060,7 +4090,7 @@ static int tidesdb_hton_panic(handlerton *, enum ha_panic_function flag)
 */
 static void tidesdb_hton_pre_shutdown(void)
 {
-    if (!tdb_global) return;
+    if (!tdb_get_engine()) return;
 
     /* Sync the unified WAL so durability is preserved if deinit is racing
        a forced exit.  The call is cheap when there's nothing to sync. */
@@ -4105,10 +4135,12 @@ static int tidesdb_deinit_func(void *p)
 
     schema_cf = NULL;
 
-    if (tdb_global)
+    /* Atomic exchange: takes ownership of the engine handle and races
+       cleanly with tidesdb_hton_panic (which uses the same pattern). */
+    tidesdb_t *engine = g_tdb_engine.exchange(nullptr, std::memory_order_acq_rel);
+    if (engine)
     {
-        tidesdb_close(tdb_global);
-        tdb_global = NULL;
+        tidesdb_close(engine);
     }
 
     mysql_mutex_destroy(&last_conflict_mutex);
@@ -4778,7 +4810,7 @@ check_result_t ha_tidesdb::icp_check_secondary(const uint8_t *ik, size_t iks, ui
 void ha_tidesdb::recover_counters()
 {
     tidesdb_txn_t *txn = NULL;
-    if (tidesdb_txn_begin(tdb_global, &txn) != TDB_SUCCESS) return;
+    if (tidesdb_txn_begin(tdb_get_engine(), &txn) != TDB_SUCCESS) return;
 
     tidesdb_iter_t *iter = NULL;
     if (tidesdb_iter_new(txn, share->cf, &iter) == TDB_SUCCESS)
@@ -4862,7 +4894,7 @@ int ha_tidesdb::open(const char *name, int mode, uint test_if_locked, const dd::
     if (!share->cf)
     {
         share->cf_name = path_to_cf_name(name);
-        share->cf = tidesdb_get_column_family(tdb_global, share->cf_name.c_str());
+        share->cf = tidesdb_get_column_family(tdb_get_engine(), share->cf_name.c_str());
         if (!share->cf)
         {
             unlock_shared_ha_data();
@@ -4983,7 +5015,7 @@ int ha_tidesdb::open(const char *name, int mode, uint test_if_locked, const dd::
             }
             std::string idx_name;
             tidesdb_column_family_t *icf =
-                resolve_idx_cf(tdb_global, share->cf_name, table->key_info[i].name, idx_name);
+                resolve_idx_cf(tdb_get_engine(), share->cf_name, table->key_info[i].name, idx_name);
             share->idx_cfs.push_back(icf);
             share->idx_cf_names.push_back(idx_name);
         }
@@ -5083,9 +5115,9 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
     tidesdb_column_family_config_t cfg = build_cf_config(opts);
 
     /* We create main data CF (we simply skip if it already exists, e.g. crash recovery) */
-    if (!tidesdb_get_column_family(tdb_global, cf_name.c_str()))
+    if (!tidesdb_get_column_family(tdb_get_engine(), cf_name.c_str()))
     {
-        int rc = tidesdb_create_column_family(tdb_global, cf_name.c_str(), &cfg);
+        int rc = tidesdb_create_column_family(tdb_get_engine(), cf_name.c_str(), &cfg);
         if (rc != TDB_SUCCESS)
         {
             sql_print_error("[TIDESDB] Failed to create CF '%s' (err=%d)", cf_name.c_str(), rc);
@@ -5100,13 +5132,13 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
         if (table_arg->s->primary_key != MAX_KEY && i == table_arg->s->primary_key) continue;
 
         std::string idx_cf = cf_name + CF_INDEX_INFIX + table_arg->key_info[i].name;
-        if (!tidesdb_get_column_family(tdb_global, idx_cf.c_str()))
+        if (!tidesdb_get_column_family(tdb_get_engine(), idx_cf.c_str()))
         {
             tidesdb_column_family_config_t idx_cfg = cfg;
             ha_index_option_struct *iopts = TDB_INDEX_OPTIONS(&table_arg->key_info[i]);
             if (iopts) idx_cfg.use_btree = iopts->use_btree ? 1 : 0;
 
-            int rc = tidesdb_create_column_family(tdb_global, idx_cf.c_str(), &idx_cfg);
+            int rc = tidesdb_create_column_family(tdb_get_engine(), idx_cf.c_str(), &idx_cfg);
             if (rc != TDB_SUCCESS)
             {
                 sql_print_error("[TIDESDB] Failed to create index CF '%s' (err=%d)", idx_cf.c_str(),
@@ -5127,19 +5159,49 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
 
 /* ******************** Data-at-rest encryption helpers ******************** */
 
+/* Compiler-optimization-resistant memory wipe for key material. A plain
+   memset on a stack local that's about to go out of scope is legitimately
+   removable by the optimizer; iterating through a volatile pointer is not.
+   Equivalent in intent to OpenSSL's OPENSSL_cleanse / glibc's explicit_bzero. */
+static inline void tdb_secure_zero(void *p, size_t n)
+{
+    volatile unsigned char *vp = (volatile unsigned char *)p;
+    while (n--) *vp++ = 0;
+}
+
 /*
   Encrypt plaintext into enc_buf_.  Format is [IV (16 bytes)] [ciphertext].
-  Returns the encrypted blob as a std::string.
+  Returns true on success; out is set to the encrypted blob.  Returns false on
+  any failure (key unavailable, /dev/urandom unreadable, cipher error) so the
+  caller MUST NOT write `out` to disk -- doing so previously produced rows
+  encrypted with uninitialized stack bytes as key or IV, breaking both
+  recoverability and IND-CPA confidentiality (CVE-class: silent encryption
+  bypass under failure mode).
 */
 static bool tidesdb_encrypt_row_into(const std::string &plain, uint key_id, uint key_version,
                                      std::string &out)
 {
     unsigned char key[TIDESDB_ENC_KEY_LEN];
     unsigned int klen = sizeof(key);
-    encryption_key_get(key_id, key_version, key, &klen);
+    if (encryption_key_get(key_id, key_version, key, &klen) != 0)
+    {
+        tdb_secure_zero(key, sizeof(key));
+        sql_print_error("[TIDESDB] encryption_key_get failed (key_id=%u version=%u); "
+                        "refusing to encrypt with uninitialized key material",
+                        key_id, key_version);
+        out.clear();
+        return false;
+    }
 
     unsigned char iv[TIDESDB_ENC_IV_LEN];
-    my_random_bytes(iv, TIDESDB_ENC_IV_LEN);
+    if (my_random_bytes(iv, TIDESDB_ENC_IV_LEN) != 0)
+    {
+        tdb_secure_zero(key, sizeof(key));
+        sql_print_error("[TIDESDB] my_random_bytes failed; refusing to encrypt with "
+                        "uninitialized IV (would break CBC IND-CPA)");
+        out.clear();
+        return false;
+    }
 
     unsigned int slen = (unsigned int)plain.size();
     unsigned int enc_len = encryption_encrypted_length(slen, key_id, key_version);
@@ -5151,6 +5213,7 @@ static bool tidesdb_encrypt_row_into(const std::string &plain, uint key_id, uint
     int rc = encryption_crypt((const unsigned char *)plain.data(), slen,
                               (unsigned char *)&out[TIDESDB_ENC_IV_LEN], &dlen, key, klen, iv,
                               TIDESDB_ENC_IV_LEN, ENCRYPTION_FLAG_ENCRYPT, key_id, key_version);
+    tdb_secure_zero(key, sizeof(key));
     if (rc != 0)
     {
         sql_print_error("[TIDESDB] encryption_crypt(encrypt) failed rc=%d", rc);
@@ -5162,7 +5225,11 @@ static bool tidesdb_encrypt_row_into(const std::string &plain, uint key_id, uint
 }
 
 /*
-  Decrypt a row stored as [IV (16)] [ciphertext] back to plaintext.
+  Decrypt a row stored as [IV (16)] [ciphertext] back to plaintext.  Returns
+  an empty string on any failure (key unavailable, ciphertext truncated,
+  cipher error).  Caller must check for empty -- previously the function
+  proceeded with uninitialized key bytes when encryption_key_get failed,
+  which on some failure modes silently returned junk plaintext.
 */
 static std::string tidesdb_decrypt_row(const char *data, size_t len, uint key_id, uint key_version)
 {
@@ -5174,7 +5241,14 @@ static std::string tidesdb_decrypt_row(const char *data, size_t len, uint key_id
 
     unsigned char key[TIDESDB_ENC_KEY_LEN];
     unsigned int klen = sizeof(key);
-    encryption_key_get(key_id, key_version, key, &klen);
+    if (encryption_key_get(key_id, key_version, key, &klen) != 0)
+    {
+        tdb_secure_zero(key, sizeof(key));
+        sql_print_error("[TIDESDB] encryption_key_get failed (key_id=%u version=%u); "
+                        "cannot decrypt row",
+                        key_id, key_version);
+        return std::string();
+    }
 
     const unsigned char *iv = (const unsigned char *)data;
     const unsigned char *src = (const unsigned char *)data + TIDESDB_ENC_IV_LEN;
@@ -5186,6 +5260,7 @@ static std::string tidesdb_decrypt_row(const char *data, size_t len, uint key_id
 
     int rc = encryption_crypt(src, slen, (unsigned char *)&out[0], &dlen, key, klen, iv,
                               TIDESDB_ENC_IV_LEN, ENCRYPTION_FLAG_DECRYPT, key_id, key_version);
+    tdb_secure_zero(key, sizeof(key));
     if (rc != 0)
     {
         sql_print_error("[TIDESDB] encryption_crypt(decrypt) failed rc=%d", rc);
@@ -7301,7 +7376,7 @@ int ha_tidesdb::delete_all_rows(void)
     /* We drop and recreate the main data CF (O(1)) */
     {
         std::string cf_name = share->cf_name;
-        int rc = tidesdb_drop_column_family(tdb_global, cf_name.c_str());
+        int rc = tidesdb_drop_column_family(tdb_get_engine(), cf_name.c_str());
         if (rc != TDB_SUCCESS && rc != TDB_ERR_NOT_FOUND)
         {
             sql_print_error("[TIDESDB] truncate: failed to drop CF '%s' (err=%d)", cf_name.c_str(),
@@ -7309,7 +7384,7 @@ int ha_tidesdb::delete_all_rows(void)
             DBUG_RETURN(tdb_rc_to_ha(rc, "truncate drop_cf"));
         }
 
-        rc = tidesdb_create_column_family(tdb_global, cf_name.c_str(), &cfg);
+        rc = tidesdb_create_column_family(tdb_get_engine(), cf_name.c_str(), &cfg);
         if (rc != TDB_SUCCESS)
         {
             sql_print_error("[TIDESDB] truncate: failed to recreate CF '%s' (err=%d)",
@@ -7317,7 +7392,7 @@ int ha_tidesdb::delete_all_rows(void)
             DBUG_RETURN(tdb_rc_to_ha(rc, "truncate create_cf"));
         }
 
-        share->cf = tidesdb_get_column_family(tdb_global, cf_name.c_str());
+        share->cf = tidesdb_get_column_family(tdb_get_engine(), cf_name.c_str());
         if (!share->cf)
         {
             sql_print_error("[TIDESDB] truncate: CF '%s' not found after recreate",
@@ -7332,7 +7407,7 @@ int ha_tidesdb::delete_all_rows(void)
         if (!share->idx_cfs[i]) continue;
 
         const std::string &idx_name = share->idx_cf_names[i];
-        tidesdb_drop_column_family(tdb_global, idx_name.c_str());
+        tidesdb_drop_column_family(tdb_get_engine(), idx_name.c_str());
 
         tidesdb_column_family_config_t idx_cfg = cfg;
         if (i < table->s->keys && TDB_INDEX_OPTIONS(&table->key_info[i]))
@@ -7341,7 +7416,7 @@ int ha_tidesdb::delete_all_rows(void)
             idx_cfg.use_btree = iopts->use_btree ? 1 : 0;
         }
 
-        int rc = tidesdb_create_column_family(tdb_global, idx_name.c_str(), &idx_cfg);
+        int rc = tidesdb_create_column_family(tdb_get_engine(), idx_name.c_str(), &idx_cfg);
         if (rc != TDB_SUCCESS)
         {
             sql_print_warning("[TIDESDB] truncate: failed to recreate idx CF '%s' (err=%d)",
@@ -7350,7 +7425,7 @@ int ha_tidesdb::delete_all_rows(void)
             continue;
         }
 
-        share->idx_cfs[i] = tidesdb_get_column_family(tdb_global, idx_name.c_str());
+        share->idx_cfs[i] = tidesdb_get_column_family(tdb_get_engine(), idx_name.c_str());
     }
 
     share->next_row_id.store(HIDDEN_PK_FIRST_ROW_ID, std::memory_order_relaxed);
@@ -7404,7 +7479,7 @@ int ha_tidesdb::maybe_bulk_commit(tidesdb_trx_t *trx)
         tidesdb_txn_free(trx->txn);
         trx->txn = NULL;
         int rc =
-            tidesdb_txn_begin_with_isolation(tdb_global, TDB_ISOLATION_READ_COMMITTED, &trx->txn);
+            tidesdb_txn_begin_with_isolation(tdb_get_engine(), TDB_ISOLATION_READ_COMMITTED, &trx->txn);
         if (rc != TDB_SUCCESS) return tdb_rc_to_ha(rc, "bulk_commit txn_begin");
     }
 
@@ -9252,13 +9327,13 @@ bool ha_tidesdb::prepare_inplace_alter_table(
             std::string idx_cf = base_cf + CF_INDEX_INFIX + new_key->name;
 
             /* We drop stale CF if it exists from a previous failed ALTER */
-            tidesdb_drop_column_family(tdb_global, idx_cf.c_str());
+            tidesdb_drop_column_family(tdb_get_engine(), idx_cf.c_str());
 
             tidesdb_column_family_config_t idx_cfg = cfg;
             ha_index_option_struct *iopts = TDB_INDEX_OPTIONS(new_key);
             if (iopts) idx_cfg.use_btree = iopts->use_btree ? 1 : 0;
 
-            int rc = tidesdb_create_column_family(tdb_global, idx_cf.c_str(), &idx_cfg);
+            int rc = tidesdb_create_column_family(tdb_get_engine(), idx_cf.c_str(), &idx_cfg);
             if (rc != TDB_SUCCESS)
             {
                 sql_print_error("[TIDESDB] inplace ADD INDEX: failed to create CF '%s' (err=%d)",
@@ -9267,7 +9342,7 @@ bool ha_tidesdb::prepare_inplace_alter_table(
                 DBUG_RETURN(true);
             }
 
-            tidesdb_column_family_t *icf = tidesdb_get_column_family(tdb_global, idx_cf.c_str());
+            tidesdb_column_family_t *icf = tidesdb_get_column_family(tdb_get_engine(), idx_cf.c_str());
             if (!icf)
             {
                 sql_print_error("[TIDESDB] inplace ADD INDEX: CF '%s' not found after create",
@@ -9331,7 +9406,7 @@ bool ha_tidesdb::inplace_alter_table(
        each key in the read-set, causing unbounded memory growth.  Index
        builds are DDL and never need OCC conflict detection. */
     tidesdb_txn_t *txn = NULL;
-    int rc = tidesdb_txn_begin_with_isolation(tdb_global, TDB_ISOLATION_READ_COMMITTED, &txn);
+    int rc = tidesdb_txn_begin_with_isolation(tdb_get_engine(), TDB_ISOLATION_READ_COMMITTED, &txn);
     if (rc != TDB_SUCCESS || !txn)
     {
         sql_print_error("[TIDESDB] inplace ADD INDEX: txn_begin failed (err=%d)", rc);
@@ -9527,7 +9602,7 @@ bool ha_tidesdb::inplace_alter_table(
                     rrc);
                 tidesdb_txn_free(txn);
                 txn = NULL;
-                rc = tidesdb_txn_begin_with_isolation(tdb_global, TDB_ISOLATION_READ_COMMITTED,
+                rc = tidesdb_txn_begin_with_isolation(tdb_get_engine(), TDB_ISOLATION_READ_COMMITTED,
                                                       &txn);
                 if (rc != TDB_SUCCESS || !txn)
                 {
@@ -9616,14 +9691,14 @@ bool ha_tidesdb::commit_inplace_alter_table(
     {
         /* Rollback, we drop any CFs we created for new indexes */
         for (const auto &cf_name : ctx->add_cf_names)
-            tidesdb_drop_column_family(tdb_global, cf_name.c_str());
+            tidesdb_drop_column_family(tdb_get_engine(), cf_name.c_str());
         DBUG_RETURN(false);
     }
 
     /* Commit, we drop CFs for removed indexes */
     for (const auto &cf_name : ctx->drop_cf_names)
     {
-        int rc = tidesdb_drop_column_family(tdb_global, cf_name.c_str());
+        int rc = tidesdb_drop_column_family(tdb_get_engine(), cf_name.c_str());
         if (rc != TDB_SUCCESS && rc != TDB_ERR_NOT_FOUND)
             sql_print_warning("[TIDESDB] commit ALTER: failed to drop CF '%s' (err=%d)",
                               cf_name.c_str(), rc);
@@ -9646,7 +9721,7 @@ bool ha_tidesdb::commit_inplace_alter_table(
         }
         std::string idx_name;
         tidesdb_column_family_t *icf = resolve_idx_cf(
-            tdb_global, share->cf_name, altered_table->key_info[i].name, idx_name);
+            tdb_get_engine(), share->cf_name, altered_table->key_info[i].name, idx_name);
         share->idx_cfs.push_back(icf);
         share->idx_cf_names.push_back(idx_name);
     }
@@ -9775,9 +9850,9 @@ int ha_tidesdb::rename_table(const char *from, const char *to, const dd::Table *
 
     /* If the destination CF already exists (stale from a previous ALTER),
        drop it first so the rename can proceed. */
-    tidesdb_drop_column_family(tdb_global, new_cf.c_str());
+    tidesdb_drop_column_family(tdb_get_engine(), new_cf.c_str());
 
-    int rc = tidesdb_rename_column_family(tdb_global, old_cf.c_str(), new_cf.c_str());
+    int rc = tidesdb_rename_column_family(tdb_get_engine(), old_cf.c_str(), new_cf.c_str());
     if (rc != TDB_SUCCESS && rc != TDB_ERR_NOT_FOUND)
     {
         sql_print_error("[TIDESDB] Failed to rename CF '%s' -> '%s' (err=%d)", old_cf.c_str(),
@@ -9790,7 +9865,7 @@ int ha_tidesdb::rename_table(const char *from, const char *to, const dd::Table *
         std::string prefix = old_cf + CF_INDEX_INFIX;
         char **names = NULL;
         int count = 0;
-        if (tidesdb_list_column_families(tdb_global, &names, &count) == TDB_SUCCESS && names)
+        if (tidesdb_list_column_families(tdb_get_engine(), &names, &count) == TDB_SUCCESS && names)
         {
             for (int i = 0; i < count; i++)
             {
@@ -9802,8 +9877,8 @@ int ha_tidesdb::rename_table(const char *from, const char *to, const dd::Table *
                     std::string suffix = cf_str.substr(prefix.size());
                     std::string new_idx = new_cf + CF_INDEX_INFIX + suffix;
 
-                    tidesdb_drop_column_family(tdb_global, new_idx.c_str());
-                    rc = tidesdb_rename_column_family(tdb_global, cf_str.c_str(), new_idx.c_str());
+                    tidesdb_drop_column_family(tdb_get_engine(), new_idx.c_str());
+                    rc = tidesdb_rename_column_family(tdb_get_engine(), cf_str.c_str(), new_idx.c_str());
                     if (rc != TDB_SUCCESS && rc != TDB_ERR_NOT_FOUND)
                         sql_print_error("[TIDESDB] Failed to rename idx CF '%s' -> '%s' (err=%d)",
                                         cf_str.c_str(), new_idx.c_str(), rc);
@@ -9852,7 +9927,7 @@ static void force_remove_cf_dir(const std::string &cf_name)
 */
 static int tidesdb_drop_table_impl(const char *path)
 {
-    if (!tdb_global) return 0;
+    if (!tdb_get_engine()) return 0;
 
     std::string cf_name = ha_tidesdb::path_to_cf_name(path);
 
@@ -9863,7 +9938,7 @@ static int tidesdb_drop_table_impl(const char *path)
         std::string prefix = cf_name + CF_INDEX_INFIX;
         char **names = NULL;
         int count = 0;
-        if (tidesdb_list_column_families(tdb_global, &names, &count) == TDB_SUCCESS && names)
+        if (tidesdb_list_column_families(tdb_get_engine(), &names, &count) == TDB_SUCCESS && names)
         {
             for (int i = 0; i < count; i++)
             {
@@ -9876,7 +9951,7 @@ static int tidesdb_drop_table_impl(const char *path)
         }
     }
 
-    int rc = tidesdb_drop_column_family(tdb_global, cf_name.c_str());
+    int rc = tidesdb_drop_column_family(tdb_get_engine(), cf_name.c_str());
     if (rc != TDB_SUCCESS && rc != TDB_ERR_NOT_FOUND)
     {
         sql_print_error("[TIDESDB] Failed to drop CF '%s' (err=%d)", cf_name.c_str(), rc);
@@ -9884,7 +9959,7 @@ static int tidesdb_drop_table_impl(const char *path)
     }
 
     for (const auto &idx_name : idx_cf_names)
-        tidesdb_drop_column_family(tdb_global, idx_name.c_str());
+        tidesdb_drop_column_family(tdb_get_engine(), idx_name.c_str());
 
     /* We force-remove CF directories from disk in case the
        library's internal remove_directory() failed silently.  Without
@@ -9940,7 +10015,7 @@ static std::string tidesdb_path_to_db_name(const char *path)
 */
 static void tidesdb_hton_drop_database(handlerton *, char *path)
 {
-    if (!tdb_global || !path) return;
+    if (!tdb_get_engine() || !path) return;
 
     std::string db = tidesdb_path_to_db_name(path);
     if (db.empty()) return;
@@ -9951,7 +10026,7 @@ static void tidesdb_hton_drop_database(handlerton *, char *path)
     {
         char **names = NULL;
         int count = 0;
-        if (tidesdb_list_column_families(tdb_global, &names, &count) == TDB_SUCCESS && names)
+        if (tidesdb_list_column_families(tdb_get_engine(), &names, &count) == TDB_SUCCESS && names)
         {
             for (int i = 0; i < count; i++)
             {
@@ -9966,7 +10041,7 @@ static void tidesdb_hton_drop_database(handlerton *, char *path)
 
     for (const auto &cf_name : to_drop)
     {
-        int rc = tidesdb_drop_column_family(tdb_global, cf_name.c_str());
+        int rc = tidesdb_drop_column_family(tdb_get_engine(), cf_name.c_str());
         if (rc != TDB_SUCCESS && rc != TDB_ERR_NOT_FOUND)
             sql_print_warning("[TIDESDB] drop_database: failed to drop CF '%s' (err=%d)",
                               cf_name.c_str(), rc);
@@ -10055,15 +10130,15 @@ static SHOW_VAR tidesdb_status_variables[] = {
    Called from tidesdb_show_status (SHOW ENGINE STATUS) and periodically. */
 static void tidesdb_refresh_status_vars()
 {
-    if (!tdb_global) return;
+    if (!tdb_get_engine()) return;
 
     tidesdb_db_stats_t db_st;
     memset(&db_st, 0, sizeof(db_st));
-    tidesdb_get_db_stats(tdb_global, &db_st);
+    tidesdb_get_db_stats(tdb_get_engine(), &db_st);
 
     tidesdb_cache_stats_t cache_st;
     memset(&cache_st, 0, sizeof(cache_st));
-    tidesdb_get_cache_stats(tdb_global, &cache_st);
+    tidesdb_get_cache_stats(tdb_get_engine(), &cache_st);
 
     srv_stat_column_families = db_st.num_column_families;
     srv_stat_global_seq = (long long)db_st.global_seq;
@@ -10093,7 +10168,7 @@ static void tidesdb_refresh_status_vars()
        path. */
     char **cf_names = NULL;
     int cf_count = 0;
-    if (tidesdb_list_column_families(tdb_global, &cf_names, &cf_count) == TDB_SUCCESS && cf_names)
+    if (tidesdb_list_column_families(tdb_get_engine(), &cf_names, &cf_count) == TDB_SUCCESS && cf_names)
     {
         uint64_t total_tomb = 0, total_keys = 0;
         double max_density = 0.0;
@@ -10101,7 +10176,7 @@ static void tidesdb_refresh_status_vars()
         for (int i = 0; i < cf_count; i++)
         {
             if (!cf_names[i]) continue;
-            tidesdb_column_family_t *cf = tidesdb_get_column_family(tdb_global, cf_names[i]);
+            tidesdb_column_family_t *cf = tidesdb_get_column_family(tdb_get_engine(), cf_names[i]);
             if (!cf) continue;
             tidesdb_stats_t *st = NULL;
             if (tidesdb_get_stats(cf, &st) == TDB_SUCCESS && st)
