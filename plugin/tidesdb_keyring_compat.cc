@@ -35,6 +35,8 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <sys/mman.h>  /* mlock, madvise -- L-5 master-key hardening */
+#include <unistd.h>    /* sysconf, _SC_PAGESIZE */
 
 #include "tidesdb_compat.h"
 
@@ -56,6 +58,39 @@ std::mutex g_master_key_mu;
 unsigned char g_master_key[TIDESDB_MASTER_KEY_LEN] = {0};
 std::atomic<bool> g_master_key_loaded{false};
 std::atomic<uint64_t> g_master_key_gen{0};
+
+/* L-5: lock the page containing g_master_key into RAM and tell the
+   kernel to exclude it from core dumps. Prevents the key from showing
+   up in swap (mlock) and from being captured in /proc/<pid>/core
+   files or by external coredump tools (MADV_DONTDUMP). Run once on
+   first successful load -- subsequent loads target the same page.
+
+   Best-effort: a failure here doesn't abort encryption (any sysadmin
+   running mysqld in a container with RLIMIT_MEMLOCK = 0 would never
+   start otherwise). The log line surfaces the situation so operators
+   know the hardening didn't apply. */
+void tidesdb_master_key_pin_page() {
+    long pagesize = ::sysconf(_SC_PAGESIZE);
+    if (pagesize <= 0) return;
+    void *page_start = reinterpret_cast<void *>(
+        reinterpret_cast<uintptr_t>(g_master_key) & ~(uintptr_t)(pagesize - 1));
+    /* The key may span two pages if it straddles a boundary -- 32 bytes
+       fits in any page so the second page only matters if alignment is
+       unlucky. mlock-ing exactly two pages covers it cheaply. */
+    if (::mlock(page_start, (size_t)pagesize * 2) != 0) {
+        sql_print_warning("[TIDESDB] master key: mlock failed (errno=%d); "
+                          "key may be paged to swap. Raise RLIMIT_MEMLOCK "
+                          "or ignore this if the host has swap disabled.",
+                          errno);
+    }
+#ifdef MADV_DONTDUMP
+    if (::madvise(page_start, (size_t)pagesize * 2, MADV_DONTDUMP) != 0) {
+        sql_print_warning("[TIDESDB] master key: madvise(MADV_DONTDUMP) failed "
+                          "(errno=%d); key may appear in core dumps.",
+                          errno);
+    }
+#endif
+}
 
 }  /* unnamed namespace */
 
@@ -90,6 +125,9 @@ bool tidesdb_master_key_load_from_file(const char *path) {
         g_master_key_gen.fetch_add(1, std::memory_order_acq_rel);
     }
     memset(buf, 0, sizeof(buf));
+    /* L-5: pin the master-key page so it can't get paged out or appear
+       in a core dump. Idempotent (same page each load). */
+    tidesdb_master_key_pin_page();
     sql_print_information("[TIDESDB] master key loaded from '%s' (%u bytes)",
                           path, TIDESDB_MASTER_KEY_LEN);
     return false;
@@ -161,9 +199,18 @@ unsigned int encryption_encrypted_length(unsigned int src_len,
 int encryption_crypt(const unsigned char *src, unsigned int src_len,
                      unsigned char *dst, unsigned int *dst_len,
                      const unsigned char *key, unsigned int key_len,
-                     const unsigned char *iv, unsigned int /*iv_len*/,
+                     const unsigned char *iv, unsigned int iv_len,
                      int flags, unsigned int /*key_id*/,
                      unsigned int /*key_version*/) {
+    /* L-2: my_aes_encrypt / my_aes_decrypt hard-code a 16-byte IV for
+       CBC mode. The iv_len argument used to be silently discarded;
+       any caller passing a non-16-byte IV would have its tail treated
+       as padding garbage. Assert + reject so future refactors that
+       want to thread iv_len through must change my_aes too. */
+    static_assert(TIDESDB_AES_BLOCK_LEN == 16,
+                  "AES CBC IV is always 16 bytes; update if BLOCK_LEN changes");
+    if (iv_len != TIDESDB_AES_BLOCK_LEN) return -1;
+
     if (!g_master_key_loaded.load(std::memory_order_acquire)) return -1;
     if (key_len != TIDESDB_MASTER_KEY_LEN) return -1;
 

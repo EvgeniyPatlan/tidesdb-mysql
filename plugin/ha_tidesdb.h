@@ -675,8 +675,14 @@ class ha_tidesdb : public handler
        cached-THDVAR refresh. */
     ulonglong cached_compact_after_range_delete_min_rows_;
     ha_rows bulk_delete_rows_;
-    std::string bulk_delete_min_pk_;
-    std::string bulk_delete_max_pk_;
+    /* L-6: fixed buffers + length instead of std::string. Bulk DELETE
+       used to construct a fresh std::string per row to compare against
+       the running min/max; switching to memcmp on fixed buffers cuts
+       the per-row allocation count to zero in this path. */
+    uchar bulk_delete_min_pk_[DATA_KEY_BUF_LEN];
+    uchar bulk_delete_max_pk_[DATA_KEY_BUF_LEN];
+    uint bulk_delete_min_pk_len_ = 0;
+    uint bulk_delete_max_pk_len_ = 0;
 
     /* Multi-Range Read state.  We accept MRR when every range the optimizer
        hands us is UNIQUE_RANGE|EQ_RANGE (i.e. the WHERE col IN (...) case on

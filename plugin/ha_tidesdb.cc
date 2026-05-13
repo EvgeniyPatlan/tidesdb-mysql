@@ -1197,11 +1197,22 @@ static void fts_tokenize(const char *text, size_t text_len, CHARSET_INFO *cs,
 }
 
 /* Extract and tokenize the document from all FULLTEXT key_part fields.
-   Returns the token list and word count. */
+   Returns the token list and word count.
+
+   L-8: `doc` is held via a thread_local pointer so the heap buffer is
+   reused across rows in DML paths (write_row / update_row / delete_row
+   call this function per row). Clear-without-shrink preserves capacity
+   between calls. See write_row's M-5 comment for why we go via a
+   pointer rather than `static thread_local std::string` directly
+   (static-TLS budget for dlopen'd plugins). */
 static void fts_extract_and_tokenize(TABLE *table, const KEY *key_info, const uchar *record,
                                      CHARSET_INFO *cs, std::vector<fts_token_t> &out_tokens)
 {
-    std::string doc;
+    static thread_local std::string *doc_buf = nullptr;
+    if (!doc_buf) doc_buf = new std::string();
+    std::string &doc = *doc_buf;
+    doc.clear();
+
     my_ptrdiff_t ptrdiff = (my_ptrdiff_t)(record - table->record[0]);
 
     for (uint p = 0; p < key_info->user_defined_key_parts; p++)
@@ -4228,8 +4239,20 @@ static int tidesdb_init_func(void *p)
             DBUG_RETURN(1);
         }
 
+        /* L-4: log only redacted identifiers, not full endpoint/bucket
+           names. Error logs commonly forward to centralized aggregators
+           (CloudWatch / ELK / SIEM); leaking the bucket name alongside
+           an access key (readable through any privileged process or any
+           stack trace pre-fix) significantly lowers the bar for a
+           targeted S3 attack. Operators who need the full values can
+           read them from my.cnf where they were configured. */
+        auto redact = [](const char *s) -> const char * {
+            if (!s || !s[0]) return "(unset)";
+            return "***";
+        };
         sql_print_information("[TIDESDB] S3 connector created (endpoint=%s, bucket=%s, ssl=%s)",
-                              srv_s3_endpoint, srv_s3_bucket, srv_s3_use_ssl ? "yes" : "no");
+                              redact(srv_s3_endpoint), redact(srv_s3_bucket),
+                              srv_s3_use_ssl ? "yes" : "no");
 #else
         sql_print_error(
             "[TIDESDB] S3 backend requested but TidesDB was not built with "
@@ -5513,6 +5536,22 @@ static bool tidesdb_encrypt_row_into(const std::string &plain, uint key_id, uint
         return false;
     }
 
+    /* L-3: guard the size_t -> unsigned int narrowing.
+       encryption_encrypted_length computes ((src_len / 16) + 1) * 16
+       which overflows unsigned int when src_len >= 0xFFFFFFF0; the
+       resulting buffer would be far too small and the AES write would
+       overrun. Real rows can't get this large under TidesDB's block
+       size limits, but the check belongs here at the boundary. */
+    constexpr size_t TIDESDB_ENCRYPT_MAX_PLAIN = 0xEFFFFFFFu;
+    if (plain.size() > TIDESDB_ENCRYPT_MAX_PLAIN)
+    {
+        tdb_secure_zero(key, sizeof(key));
+        sql_print_error("[TIDESDB] plaintext too large for encryption (%zu bytes); "
+                        "refusing to encrypt",
+                        plain.size());
+        out.clear();
+        return false;
+    }
     unsigned int slen = (unsigned int)plain.size();
     unsigned int enc_len = encryption_encrypted_length(slen, key_id, key_version);
     out.resize(TIDESDB_ENC_IV_LEN + enc_len);
@@ -7195,9 +7234,37 @@ int ha_tidesdb::update_row(const uchar *old_data, uchar *new_data)
        row is already locked. */
 
     /* new_pk uses its own stack buffer so it survives the current_pk_buf_
-       manipulations in the secondary index loop (avoids overlapping memcpy UB) */
+       manipulations in the secondary index loop (avoids overlapping memcpy UB)
+
+       L-7: skip make_comparable_key when the UPDATE doesn't touch any
+       PK column. The common UPDATE shape is `SET non_pk_col = x WHERE pk = y`
+       -- write_set has only the non-PK columns. Rebuilding the PK from
+       new_data was wasted work in that case; reuse old_pk. */
     uchar new_pk[MAX_KEY_LENGTH];
-    uint new_pk_len = pk_from_record(new_data, new_pk);
+    uint new_pk_len;
+    bool any_pk_col_in_write_set = false;
+    if (share->has_user_pk)
+    {
+        KEY *pk_key = &table->key_info[share->pk_index];
+        for (uint p = 0; p < pk_key->user_defined_key_parts; p++)
+        {
+            Field *f = pk_key->key_part[p].field;
+            if (bitmap_is_set(table->write_set, f->field_index()))
+            {
+                any_pk_col_in_write_set = true;
+                break;
+            }
+        }
+    }
+    if (any_pk_col_in_write_set)
+    {
+        new_pk_len = pk_from_record(new_data, new_pk);
+    }
+    else
+    {
+        memcpy(new_pk, old_pk, old_pk_len);
+        new_pk_len = old_pk_len;
+    }
 
     const std::string &new_row = serialize_row(new_data);
     if (share->encrypted && new_row.empty())
@@ -7581,19 +7648,37 @@ int ha_tidesdb::delete_row(const uchar *buf)
     /* Track the touched data-key range when the auto-compact session var
        is on and we are inside a multi-row DELETE.  We compare the full
        data keys (KEY_NS_DATA + comparable_pk) so the recorded bounds can
-       be passed to tidesdb_compact_range without further conversion. */
-    if (in_bulk_delete_ && cached_compact_after_range_delete_min_rows_ > 0)
+       be passed to tidesdb_compact_range without further conversion.
+
+       L-6: fixed-buffer min/max tracking. dk_len is bounded by
+       DATA_KEY_BUF_LEN (data key namespace + comparable PK), so the
+       fixed buffer covers any legal key. memcmp is zero-alloc. */
+    if (in_bulk_delete_ && cached_compact_after_range_delete_min_rows_ > 0 &&
+        dk_len <= DATA_KEY_BUF_LEN)
     {
-        const std::string this_key((const char *)dk, dk_len);
         if (bulk_delete_rows_ == 0)
         {
-            bulk_delete_min_pk_ = this_key;
-            bulk_delete_max_pk_ = this_key;
+            memcpy(bulk_delete_min_pk_, dk, dk_len);
+            memcpy(bulk_delete_max_pk_, dk, dk_len);
+            bulk_delete_min_pk_len_ = dk_len;
+            bulk_delete_max_pk_len_ = dk_len;
         }
         else
         {
-            if (this_key < bulk_delete_min_pk_) bulk_delete_min_pk_ = this_key;
-            if (this_key > bulk_delete_max_pk_) bulk_delete_max_pk_ = this_key;
+            int cmin = memcmp(dk, bulk_delete_min_pk_,
+                              std::min<uint>(dk_len, bulk_delete_min_pk_len_));
+            if (cmin < 0 || (cmin == 0 && dk_len < bulk_delete_min_pk_len_))
+            {
+                memcpy(bulk_delete_min_pk_, dk, dk_len);
+                bulk_delete_min_pk_len_ = dk_len;
+            }
+            int cmax = memcmp(dk, bulk_delete_max_pk_,
+                              std::min<uint>(dk_len, bulk_delete_max_pk_len_));
+            if (cmax > 0 || (cmax == 0 && dk_len > bulk_delete_max_pk_len_))
+            {
+                memcpy(bulk_delete_max_pk_, dk, dk_len);
+                bulk_delete_max_pk_len_ = dk_len;
+            }
         }
         bulk_delete_rows_++;
     }
@@ -7949,8 +8034,10 @@ bool ha_tidesdb::start_bulk_delete()
     in_bulk_delete_ = true;
     bulk_insert_ops_ = 0;
     bulk_delete_rows_ = 0;
-    bulk_delete_min_pk_.clear();
-    bulk_delete_max_pk_.clear();
+    /* L-6: length=0 indicates "no rows seen yet"; buffer content
+       doesn't need clearing since we never read past _len_. */
+    bulk_delete_min_pk_len_ = 0;
+    bulk_delete_max_pk_len_ = 0;
     return 0;
 }
 
@@ -7966,11 +8053,11 @@ int ha_tidesdb::end_bulk_delete()
        on those CFs. */
     if (cached_compact_after_range_delete_min_rows_ > 0 &&
         bulk_delete_rows_ >= cached_compact_after_range_delete_min_rows_ && share && share->cf &&
-        !bulk_delete_min_pk_.empty() && !bulk_delete_max_pk_.empty())
+        bulk_delete_min_pk_len_ > 0 && bulk_delete_max_pk_len_ > 0)
     {
         int crc = tidesdb_compact_range(
-            share->cf, (const uint8_t *)bulk_delete_min_pk_.data(), bulk_delete_min_pk_.size(),
-            (const uint8_t *)bulk_delete_max_pk_.data(), bulk_delete_max_pk_.size());
+            share->cf, bulk_delete_min_pk_, bulk_delete_min_pk_len_,
+            bulk_delete_max_pk_, bulk_delete_max_pk_len_);
         if (crc != TDB_SUCCESS)
         {
             sql_print_information(
@@ -7980,8 +8067,8 @@ int ha_tidesdb::end_bulk_delete()
     }
 
     bulk_delete_rows_ = 0;
-    bulk_delete_min_pk_.clear();
-    bulk_delete_max_pk_.clear();
+    bulk_delete_min_pk_len_ = 0;
+    bulk_delete_max_pk_len_ = 0;
     return 0;
 }
 

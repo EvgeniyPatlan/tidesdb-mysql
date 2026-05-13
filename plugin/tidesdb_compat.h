@@ -212,16 +212,15 @@ enum thd_kill_levels {
  * evaluation is now inline in ha_tidesdb::icp_check_secondary in
  * ha_tidesdb.cc (kill check + compare_key_icp + pushed_idx_cond->val_bool). */
 
-/* MariaDB exposes LOCK_global_system_variables; MySQL doesn't expose it as
- * a global symbol but engines can use mysql_mutex_t. Provide an inline
- * mysql_mutex_t (C++17 inline variable for single-instance) so TideSQL's
- * { mysql_mutex_lock(&LOCK_global_system_variables); ... } sites compile.
- * Initialized lazily on first use; never destroyed (deliberate — short-lived
- * server lifecycle). Currently unused in the MySQL port: all global sysvar
- * reads happen under MySQL's own LOCK_global_system_variables before the
- * engine ever runs. Kept for compilation of any future ported call sites. */
-#include "mysql/psi/mysql_mutex.h"
-inline mysql_mutex_t LOCK_global_system_variables{};
+/* (deleted) The old inline mysql_mutex_t LOCK_global_system_variables{}
+ * lived here -- zero-initialized in the header so any TideSQL-era call
+ * site lock(&LOCK_global_system_variables) would compile. The
+ * zero-initialization of a pthread_mutex_t is implementation-defined
+ * (works on Linux/glibc, undefined behaviour on macOS/BSD), and the
+ * shim was already documented as "currently unused in the MySQL port".
+ * Removed entirely so any future need for the symbol fails at link
+ * time with a clear "undefined reference" rather than silently using
+ * an uninitialized mutex. */
 
 /* MariaDB-only utilities. Stub each to compile-only behavior. */
 #ifndef mysql_file_stat
@@ -286,6 +285,7 @@ inline int my_random_bytes(unsigned char *buf, int n) {
 #endif
 
 #ifndef microsecond_interval_timer
+#include <ctime>  /* clock_gettime, CLOCK_MONOTONIC, timespec */
 inline unsigned long long microsecond_interval_timer() {
     timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<unsigned long long>(ts.tv_sec) * 1000000ULL
