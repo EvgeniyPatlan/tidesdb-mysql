@@ -41,6 +41,8 @@ extern "C"
 #include <unordered_set>
 #include <vector>
 
+#include <climits>     /* PATH_MAX for HF-3 realpath buffer */
+#include <cstdlib>     /* realpath() for HF-3 confinement check */
 #include "sql/auth/auth_acls.h"      /* SELECT_ACL for M-12 privilege check */
 #include "sql/auth/sql_security_ctx.h" /* Security_context::check_access */
 #include "sql/item.h"  /* Item::val_bool() for ICP evaluation */
@@ -106,24 +108,22 @@ static char last_conflict_info[LAST_CONFLICT_INFO_LEN] = "";
 static mysql_rwlock_t g_trx_lifecycle_lock;
 static PSI_rwlock_key g_trx_lifecycle_lock_key;
 
-/* Mutex serializing FTS doc/word-counter read-modify-write sequences.
+/* HF-2 fix (follow-up review): the former process-global
+ * g_fts_meta_mutex has moved into TidesDB_share::fts_meta_mutex
+ * (see ha_tidesdb.h). Each table now has its own mutex; two unrelated
+ * tables no longer contend on a single process-wide lock when both
+ * have FTS indexes. Lost-update protection still applies (the meta
+ * key is per-CF / per-share, so per-share granularity is sufficient).
  *
- * fts_update_meta does a load -> mutate -> put on a single counter key
- * inside the caller's transaction. Two concurrent writers each read the
- * same pre-update value, each increment, both commit -- one increment
- * is lost. BM25 ranking depends on these counters, so the loss is
- * silent-but-progressive degradation of search relevance.
- *
- * This mutex serializes the RMW pair. Under SNAPSHOT or stronger
- * isolation, TidesDB's commit-time conflict detection also catches
- * concurrent writes to the same key, so the mutex narrows the race
- * window enough that the second writer either sees the first writer's
- * value (correct) or detects the conflict and retries (also correct).
- * Under READ_COMMITTED the mutex still serializes the read+put pair
- * but cannot make the load see a not-yet-committed write; documenting
- * residual race -- moving accounting to in-memory deltas flushed at
- * commit is the proper structural fix and tracked separately. */
-static mysql_mutex_t g_fts_meta_mutex;
+ * Original race documentation, preserved for context: fts_update_meta
+ * does a load -> mutate -> put on a single counter key inside the
+ * caller's transaction. Two concurrent writers each read the same
+ * pre-update value, each increment, both commit -- one increment
+ * is lost. Per-share mutex serializes the RMW. Under SNAPSHOT or
+ * stronger isolation, TidesDB's commit-time conflict detection also
+ * catches the case; under READ_COMMITTED the mutex still serializes
+ * the read+put pair but cannot make the load see a not-yet-committed
+ * write (residual race documented as future structural work). */
 
 /*
   Map TidesDB library error codes to MySQL handler error codes.
@@ -745,11 +745,13 @@ static int fts_load_meta(tidesdb_txn_t *txn, tidesdb_column_family_t *data_cf, u
 }
 
 /* Update FTS metadata counters atomically within the current transaction.
-   See g_fts_meta_mutex comment for the lost-update race this serializes. */
-static int fts_update_meta(tidesdb_txn_t *txn, tidesdb_column_family_t *data_cf, uint keynr,
+   Per-share mutex serializes the load-modify-put. See the per-share
+   fts_meta_mutex comment in TidesDB_share. */
+static int fts_update_meta(TidesDB_share *share, tidesdb_txn_t *txn,
+                           tidesdb_column_family_t *data_cf, uint keynr,
                            int64_t delta_docs, int64_t delta_words)
 {
-    mysql_mutex_lock(&g_fts_meta_mutex);
+    mysql_mutex_lock(&share->fts_meta_mutex);
 
     int64_t total_docs = 0, total_words = 0;
     fts_load_meta(txn, data_cf, keynr, &total_docs, &total_words);
@@ -770,7 +772,7 @@ static int fts_update_meta(tidesdb_txn_t *txn, tidesdb_column_family_t *data_cf,
     int rc = tidesdb_txn_put(txn, data_cf, mk, FTS_META_KEY_LEN, mv, FTS_META_VALUE_LEN,
                              TIDESDB_TTL_NONE);
 
-    mysql_mutex_unlock(&g_fts_meta_mutex);
+    mysql_mutex_unlock(&share->fts_meta_mutex);
     return rc;
 }
 
@@ -909,22 +911,35 @@ static bool tdb_load_stopwords_from_table_spec_into(const char *table_spec,
        db-level check is a sound coarse approximation (if the user is
        trusted with SELECT on the entire database, they can read this
        table anyway). */
+    /* HF-1 fix (follow-up review): fail-closed on missing THD or
+       security context. The previous form
+         if (cur_thd && cur_thd->security_context()) { check; }
+       fell THROUGH to opening the CF when either was null -- a NULL
+       current_thd (system thread / plugin init / bootstrap) bypassed
+       the privilege gate entirely. The sysvar callback today always
+       runs with a user THD, but any future internal caller without one
+       would have silently inherited root-level CF access. */
     THD *cur_thd = current_thd;
-    if (cur_thd && cur_thd->security_context())
+    if (!cur_thd || !cur_thd->security_context())
     {
-        Security_context *sctx = cur_thd->security_context();
-        /* check_access returns true when the privilege IS granted.
-           We deny when it returns false. */
-        if (!sctx->check_access(SELECT_ACL, db_name, false))
-        {
-            sql_print_warning(
-                "[TIDESDB] Stop word table load denied: user '%s'@'%s' lacks "
-                "SELECT on database '%s'. Refusing to load stop words from '%s'.",
-                sctx->priv_user().str ? sctx->priv_user().str : "?",
-                sctx->priv_host().str ? sctx->priv_host().str : "?",
-                db_name.c_str(), table_spec);
-            return false;
-        }
+        sql_print_warning(
+            "[TIDESDB] Stop word table load denied: no user security "
+            "context (table_spec='%s')",
+            table_spec);
+        return false;
+    }
+    Security_context *sctx = cur_thd->security_context();
+    /* check_access returns true when the privilege IS granted.
+       We deny when it returns false. */
+    if (!sctx->check_access(SELECT_ACL, db_name, false))
+    {
+        sql_print_warning(
+            "[TIDESDB] Stop word table load denied: user '%s'@'%s' lacks "
+            "SELECT on database '%s'. Refusing to load stop words from '%s'.",
+            sctx->priv_user().str ? sctx->priv_user().str : "?",
+            sctx->priv_host().str ? sctx->priv_host().str : "?",
+            db_name.c_str(), table_spec);
+        return false;
     }
 
     /* We look for a TidesDB CF matching the table path convention */
@@ -2324,16 +2339,32 @@ static char *srv_backup_dir = NULL;
       to copy the input into save via thd->strmake; we must do that here
       since we're overriding the default check.
 */
+/* HF-3 fix (follow-up review): operator-configured allowed-root sysvar
+   for backup / checkpoint destinations. NULL (default) preserves the
+   prior lexical-only behavior (any absolute non-`..` path accepted).
+   When set, both backup_dir and checkpoint_dir destinations must
+   canonicalize (via realpath) to a path under the canonicalized
+   allowed-root -- which defeats the symlink-redirect attack class
+   (SYSTEM_VARIABLES_ADMIN holder plants a symlink and aims it at
+   /etc/cron.d). Operators who want strict confinement set this. */
+static char *srv_backup_allowed_root = NULL;
+static MYSQL_SYSVAR_STR(backup_allowed_root, srv_backup_allowed_root,
+                        PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                        "If set, restrict tidesdb_backup_dir and "
+                        "tidesdb_checkpoint_dir to paths whose realpath() "
+                        "is under this directory. Must itself be an absolute "
+                        "path. Default NULL = no restriction beyond the "
+                        "lexical no-'..' check.",
+                        NULL, NULL, NULL);
+
 /* Lexical safety check for backup / checkpoint destination paths.
    Rejects any path that is not absolute, or that contains a `..`
    component. This prevents the trivial path-traversal escape (a DBA
    with SYSTEM_VARIABLES_ADMIN setting `tidesdb_backup_dir = '../../etc'`
    to copy data files outside the intended location).
 
-   This is lexical only -- a sufficiently privileged operator can still
-   choose any absolute path the `mysql` OS user can write. True
-   confinement requires an operator-configured allowed-root sysvar
-   (future work). Symlink-following escapes are out of scope here. */
+   For symlink-redirect attacks, callers should additionally call
+   tdb_path_is_under_allowed_root() AFTER this check passes. */
 static bool tdb_path_is_safe(const char *path)
 {
     if (!path || path[0] != '/') return false; /* absolute only */
@@ -2345,6 +2376,58 @@ static bool tdb_path_is_safe(const char *path)
         if (prev_is_boundary && next_is_boundary) return false;
         p += 2;
     }
+    return true;
+}
+
+/* HF-3 confinement check. Returns true if `path` is allowed -- either
+   because no allowed-root is configured (NULL), or because realpath(path)
+   resolves under realpath(allowed_root). realpath() follows symlinks,
+   so this catches a symlinked component that aims outside the root.
+
+   We resolve the destination's PARENT directory rather than the
+   destination itself because the backup directory is expected NOT to
+   exist yet (tidesdb_backup creates it). realpath on a non-existent
+   path fails; resolving the parent and appending the basename is the
+   defensible approximation. */
+static bool tdb_path_is_under_allowed_root(const char *path)
+{
+    if (!srv_backup_allowed_root || !srv_backup_allowed_root[0])
+        return true; /* operator did not enable confinement */
+
+    /* Canonicalize the allowed root. If it doesn't exist, refuse to
+       proceed -- a misconfigured policy should fail closed. */
+    char root_real[PATH_MAX];
+    if (!::realpath(srv_backup_allowed_root, root_real))
+    {
+        sql_print_warning("[TIDESDB] tidesdb_backup_allowed_root='%s' "
+                          "does not resolve (errno=%d); rejecting all "
+                          "backup/checkpoint destinations until fixed",
+                          srv_backup_allowed_root, errno);
+        return false;
+    }
+
+    /* Resolve the destination's parent directory; the destination
+       itself does not yet exist for a fresh backup. */
+    std::string dest(path);
+    size_t slash = dest.find_last_of('/');
+    std::string parent = (slash == std::string::npos || slash == 0)
+                             ? std::string("/")
+                             : dest.substr(0, slash);
+    char parent_real[PATH_MAX];
+    if (!::realpath(parent.c_str(), parent_real))
+    {
+        sql_print_warning("[TIDESDB] backup/checkpoint destination parent "
+                          "'%s' does not resolve (errno=%d); rejecting",
+                          parent.c_str(), errno);
+        return false;
+    }
+
+    /* Prefix check: parent_real must start with root_real, AND the
+       character following the prefix must be '/' or end-of-string (so
+       /allowed_root_evil doesn't sneak past a /allowed_root match). */
+    size_t rlen = strlen(root_real);
+    if (strncmp(parent_real, root_real, rlen) != 0) return false;
+    if (parent_real[rlen] != '\0' && parent_real[rlen] != '/') return false;
     return true;
 }
 
@@ -2368,6 +2451,27 @@ static int tidesdb_backup_dir_check(THD *thd, SYS_VAR *, void *save,
                         "[TIDESDB] Backup path must be absolute and free of "
                         "'..' components: '%s' rejected",
                         MYF(0), new_dir);
+        return 1;
+    }
+
+    /* HF-3: defense against symlink-redirect when an operator has
+       configured tidesdb_backup_allowed_root. */
+    if (!tdb_path_is_under_allowed_root(new_dir))
+    {
+        my_printf_error(ER_UNKNOWN_ERROR,
+                        "[TIDESDB] Backup path '%s' is not under "
+                        "tidesdb_backup_allowed_root",
+                        MYF(0), new_dir);
+        return 1;
+    }
+
+    /* HF-4: tidesdb_backup() is uncancellable from MySQL's side -- there
+       is no thd_killed poll inside the library. If the user's query has
+       already been killed by the time this callback runs, refuse early
+       rather than start a potentially-long operation we can't abort. */
+    if (thd_killed(thd))
+    {
+        my_error(ER_QUERY_INTERRUPTED, MYF(0));
         return 1;
     }
 
@@ -2436,7 +2540,12 @@ static void tidesdb_backup_dir_update(THD *, SYS_VAR *, void *var_ptr, const voi
 
 static MYSQL_SYSVAR_STR(backup_dir, srv_backup_dir, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
                         "Set to a directory path to trigger an online TidesDB backup. "
-                        "The directory must not exist or be empty. "
+                        "The directory must not exist or be empty. The path must be "
+                        "absolute and contain no '..' components. If tidesdb_backup_allowed_root "
+                        "is set, the path must additionally resolve under that root. "
+                        "WARNING: the backup operation is synchronous and currently NOT "
+                        "interruptible by KILL QUERY -- on a slow backend (NFS, full disk) "
+                        "the connection may block for an extended period. "
                         "Example: SET GLOBAL tidesdb_backup_dir = '/path/to/backup'",
                         tidesdb_backup_dir_check, tidesdb_backup_dir_update, NULL);
 
@@ -2446,7 +2555,7 @@ static char *srv_checkpoint_dir = NULL;
 
 /* See tidesdb_backup_dir_check for the rationale on doing the work in
    check rather than update. */
-static int tidesdb_checkpoint_dir_check(THD *, SYS_VAR *, void *save,
+static int tidesdb_checkpoint_dir_check(THD *thd, SYS_VAR *, void *save,
                                         struct st_mysql_value *value)
 {
     char buf[1024];
@@ -2465,6 +2574,24 @@ static int tidesdb_checkpoint_dir_check(THD *, SYS_VAR *, void *save,
                         "[TIDESDB] Checkpoint path must be absolute and free of "
                         "'..' components: '%s' rejected",
                         MYF(0), new_dir);
+        return 1;
+    }
+
+    /* HF-3: enforce allowed-root if operator has configured one. */
+    if (!tdb_path_is_under_allowed_root(new_dir))
+    {
+        my_printf_error(ER_UNKNOWN_ERROR,
+                        "[TIDESDB] Checkpoint path '%s' is not under "
+                        "tidesdb_backup_allowed_root",
+                        MYF(0), new_dir);
+        return 1;
+    }
+
+    /* HF-4: refuse early if THD already killed; tidesdb_checkpoint is
+       uncancellable from our side. */
+    if (thd && thd_killed(thd))
+    {
+        my_error(ER_QUERY_INTERRUPTED, MYF(0));
         return 1;
     }
 
@@ -2488,7 +2615,8 @@ static int tidesdb_checkpoint_dir_check(THD *, SYS_VAR *, void *save,
         return 1;
     }
 
-    THD *thd = current_thd;
+    /* `thd` is the callback parameter (no longer ignored after HF-4
+       added the killed-pre-check); use it directly. */
     *static_cast<const char **>(save) =
         thd ? thd->strmake(ckpt_path.c_str(), ckpt_path.size()) : NULL;
     return 0;
@@ -2503,7 +2631,9 @@ static MYSQL_SYSVAR_STR(checkpoint_dir, srv_checkpoint_dir,
                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
                         "Set to a directory path to trigger a TidesDB checkpoint "
                         "(hard-link snapshot, near-instant). "
-                        "The directory must not exist or be empty. "
+                        "The directory must not exist or be empty. The path must be "
+                        "absolute and contain no '..' components. If tidesdb_backup_allowed_root "
+                        "is set, the path must additionally resolve under that root. "
                         "Example: SET GLOBAL tidesdb_checkpoint_dir = '/path/to/checkpoint'",
                         tidesdb_checkpoint_dir_check, tidesdb_checkpoint_dir_update, NULL);
 
@@ -2516,6 +2646,7 @@ static SYS_VAR *tidesdb_system_variables[] = {
     MYSQL_SYSVAR(max_memory_usage),
     MYSQL_SYSVAR(backup_dir),
     MYSQL_SYSVAR(checkpoint_dir),
+    MYSQL_SYSVAR(backup_allowed_root),
     MYSQL_SYSVAR(print_all_conflicts),
     MYSQL_SYSVAR(pessimistic_locking),
     MYSQL_SYSVAR(fts_min_word_len),
@@ -3043,12 +3174,16 @@ TidesDB_share::TidesDB_share()
     memset(idx_is_fts, 0, sizeof(idx_is_fts));
     memset(idx_is_spatial, 0, sizeof(idx_is_spatial));
     for (uint i = 0; i < MAX_KEY; i++) cached_rec_per_key[i].store(0, std::memory_order_relaxed);
+    /* HF-2 fix: per-share FTS-meta serialization mutex. Replaces a
+       former process-global g_fts_meta_mutex. */
+    mysql_mutex_init(0, &fts_meta_mutex, MY_MUTEX_INIT_FAST);
 }
 
 TidesDB_share::~TidesDB_share()
 {
     delete cached_opts;
     cached_opts = nullptr;
+    mysql_mutex_destroy(&fts_meta_mutex);
 }
 
 /* ******************** Per-connection transaction helpers ******************** */
@@ -4161,9 +4296,9 @@ static int tidesdb_init_func(void *p)
        for the UAF it protects against). */
     mysql_rwlock_init(g_trx_lifecycle_lock_key, &g_trx_lifecycle_lock);
 
-    /* Initialize FTS-meta serialization mutex (see g_fts_meta_mutex
-       comment for the lost-update race). */
-    mysql_mutex_init(0, &g_fts_meta_mutex, MY_MUTEX_INIT_FAST);
+    /* HF-2: FTS-meta serialization mutex is now per-share, initialized
+       in TidesDB_share's constructor. The former process-global init
+       has been removed; nothing to do here. */
 
     /* Initialize FTS stop word set with defaults */
     mysql_rwlock_init(tdb_stopword_lock_key, &tdb_stopword_lock);
@@ -4406,12 +4541,27 @@ static void tidesdb_hton_kill_query(handlerton *, THD *thd, enum thd_kill_levels
     tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, tidesdb_hton);
     if (!trx) return;
 
-    tdb_row_lock_t *wait = trx->waiting_on.load(std::memory_order_acquire);
-    if (!wait) return;
+    /* CF-1 fix: this callback runs on the thread executing KILL QUERY,
+       not the victim's thread. The victim's tidesdb_close_connection
+       may be freeing `trx` concurrently. We MUST hold the
+       g_trx_lifecycle_lock read-lock for any dereference of `trx`,
+       matching the discipline applied to tdb_lock_would_deadlock. The
+       original H-3 rollout missed this site -- it's the same UAF class
+       the rwlock was introduced to close. */
+    mysql_rwlock_rdlock(&g_trx_lifecycle_lock);
 
-    /* We broadcast under the owning partition's mutex so the wake-up is
-       serialized against the holder's release path.  Partition index is
-       cached on the lock entry so we don't have to recompute the hash. */
+    tdb_row_lock_t *wait = trx->waiting_on.load(std::memory_order_acquire);
+    if (!wait)
+    {
+        mysql_rwlock_unlock(&g_trx_lifecycle_lock);
+        return;
+    }
+
+    /* Lock entries themselves are never freed (H-3 invariant), so
+       `wait` is safe to deref without the rwlock -- but `trx` IS, so
+       we hold the rwlock until we're done with `trx`. We broadcast
+       under the owning partition's mutex so the wake-up is serialized
+       against the holder's release path. */
     if (lock_partitions && wait->partition < ROW_LOCK_PARTITIONS)
     {
         tdb_lock_partition_t *part = &lock_partitions[wait->partition];
@@ -4419,6 +4569,8 @@ static void tidesdb_hton_kill_query(handlerton *, THD *thd, enum thd_kill_levels
         mysql_cond_broadcast(&wait->cond);
         mysql_mutex_unlock(&part->mutex);
     }
+
+    mysql_rwlock_unlock(&g_trx_lifecycle_lock);
 }
 
 static int tidesdb_deinit_func(void *p)
@@ -4436,7 +4588,7 @@ static int tidesdb_deinit_func(void *p)
     }
 
     mysql_mutex_destroy(&last_conflict_mutex);
-    mysql_mutex_destroy(&g_fts_meta_mutex);
+    /* HF-2: per-share FTS-meta mutexes destroyed in TidesDB_share dtor. */
     mysql_rwlock_destroy(&g_trx_lifecycle_lock);
     mysql_rwlock_destroy(&tdb_stopword_lock);
     mysql_rwlock_destroy(&tdb_blend_lock);
@@ -6279,7 +6431,7 @@ int ha_tidesdb::write_row(uchar *buf)
                 }
                 else
                 {
-                    fts_update_meta(txn, share->cf, i, FTS_DOC_DELTA_ADD,
+                    fts_update_meta(share, txn, share->cf, i, FTS_DOC_DELTA_ADD,
                                     (int64_t)word_count);
                 }
             }
@@ -7466,7 +7618,7 @@ int ha_tidesdb::update_row(const uchar *old_data, uchar *new_data)
                    new_wc - old_wc; only write the meta row when it actually
                    moved to avoid a pointless read-modify-write. */
                 int64_t wc_delta = (int64_t)new_wc - (int64_t)old_wc;
-                if (wc_delta != 0) fts_update_meta(txn, share->cf, i, 0, wc_delta);
+                if (wc_delta != 0) fts_update_meta(share, txn, share->cf, i, 0, wc_delta);
             }
             else if (share->idx_is_spatial[i])
             {
@@ -7734,7 +7886,7 @@ int ha_tidesdb::delete_row(const uchar *buf)
                     tidesdb_txn_delete_cf(txn, share->idx_cfs[i], fk, fk_len, true);
                 }
 
-                fts_update_meta(txn, share->cf, i, FTS_DOC_DELTA_DEL, -(int64_t)word_count);
+                fts_update_meta(share, txn, share->cf, i, FTS_DOC_DELTA_DEL, -(int64_t)word_count);
             }
             else if (share->idx_is_spatial[i])
             {
@@ -7984,7 +8136,7 @@ int ha_tidesdb::end_bulk_insert()
             if (fts_meta_doc_delta_[i] == 0 && fts_meta_word_delta_[i] == 0)
                 continue;
             if (!share->idx_is_fts[i]) continue;
-            fts_update_meta(stmt_txn, share->cf, i,
+            fts_update_meta(share, stmt_txn, share->cf, i,
                             fts_meta_doc_delta_[i],
                             fts_meta_word_delta_[i]);
             fts_meta_doc_delta_[i] = 0;

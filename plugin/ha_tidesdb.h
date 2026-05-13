@@ -428,6 +428,14 @@ class TidesDB_share : public Handler_share
        nested scan the old code did on every covered read. */
     std::vector<std::vector<bool>> idx_cover;
 
+    /* HF-2 fix (follow-up review): per-share mutex serializing FTS
+       doc/word-counter RMW for this table. Replaces an earlier global
+       g_fts_meta_mutex that caused unrelated tables' FTS writes to
+       contend on a single process-wide lock. Lost-update protection
+       only requires per-CF (== per-share) granularity since the meta
+       key is per-CF. Initialized in the ctor; destroyed in the dtor. */
+    mysql_mutex_t fts_meta_mutex;
+
     TidesDB_share();
     ~TidesDB_share();
 };
