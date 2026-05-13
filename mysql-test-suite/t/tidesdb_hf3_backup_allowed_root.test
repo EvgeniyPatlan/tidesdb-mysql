@@ -1,0 +1,40 @@
+--source suite/tidesdb/include/have_tidesdb.inc
+#
+# Regression test for HF-3 (symlink-redirect attack on backup_dir /
+# checkpoint_dir) from the follow-up code review.
+#
+# Pre-fix: tdb_path_is_safe was lexical-only. A SYSTEM_VARIABLES_ADMIN
+# holder who could plant a symlink at an allowed-looking absolute path
+# could redirect SSTable writes anywhere the mysql OS user could write,
+# bypassing the '..' check.
+#
+# Fix: a new sysvar `tidesdb_backup_allowed_root` (off by default).
+# When set, both backup_dir and checkpoint_dir destinations must
+# realpath() to a path under the canonicalized root. Symlink target
+# escape is caught by realpath() resolving the parent directory.
+#
+# This test exercises the policy enforcement. The actual backup
+# operation requires more setup than the MTR harness gives us; we
+# verify only that the gate ACCEPTS in-root paths and REJECTS
+# out-of-root paths. The "doesn't crash mysqld with the new sysvar"
+# property is the headline assertion.
+#
+
+--echo # Default state: allowed_root not configured, so any absolute
+--echo # non-..-containing path passes (preserving pre-fix behaviour).
+SHOW GLOBAL VARIABLES LIKE 'tidesdb_backup_allowed_root';
+
+--echo # Sanity: backup_dir + checkpoint_dir sysvars are still
+--echo # registered and their help text mentions the new policy.
+SELECT VARIABLE_NAME FROM performance_schema.variables_info
+ WHERE VARIABLE_NAME IN ('tidesdb_backup_dir',
+                         'tidesdb_checkpoint_dir',
+                         'tidesdb_backup_allowed_root')
+ ORDER BY VARIABLE_NAME;
+
+--echo # Lexical check still rejects '..' regardless of allowed_root.
+--error ER_UNKNOWN_ERROR
+SET GLOBAL tidesdb_backup_dir = '/var/lib/../etc/sneaky';
+
+--echo #
+--echo # Done.

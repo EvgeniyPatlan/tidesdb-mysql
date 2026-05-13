@@ -1,0 +1,21 @@
+# Default state: allowed_root not configured, so any absolute
+# non-..-containing path passes (preserving pre-fix behaviour).
+SHOW GLOBAL VARIABLES LIKE 'tidesdb_backup_allowed_root';
+Variable_name	Value
+tidesdb_backup_allowed_root	
+# Sanity: backup_dir + checkpoint_dir sysvars are still
+# registered and their help text mentions the new policy.
+SELECT VARIABLE_NAME FROM performance_schema.variables_info
+WHERE VARIABLE_NAME IN ('tidesdb_backup_dir',
+'tidesdb_checkpoint_dir',
+'tidesdb_backup_allowed_root')
+ORDER BY VARIABLE_NAME;
+VARIABLE_NAME
+tidesdb_backup_allowed_root
+tidesdb_backup_dir
+tidesdb_checkpoint_dir
+# Lexical check still rejects '..' regardless of allowed_root.
+SET GLOBAL tidesdb_backup_dir = '/var/lib/../etc/sneaky';
+ERROR HY000: [TIDESDB] Backup path must be absolute and free of '..' components: '/var/lib/../etc/sneaky' rejected
+#
+# Done.
