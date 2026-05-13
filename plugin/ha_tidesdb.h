@@ -39,6 +39,10 @@ extern "C"
 #include <tidesdb/db.h>
 }
 
+/* Forward declaration for TidesDB_share::cached_opts. Full definition
+   lives in ha_tidesdb.cc near the JSON parser that fills it. */
+struct ha_table_option_struct;
+
 /* Key namespace prefixes (first byte of every TidesDB key) */
 static constexpr uint8_t KEY_NS_META = 0x00;
 static constexpr uint8_t KEY_NS_DATA = 0x01;
@@ -398,6 +402,20 @@ class TidesDB_share : public Handler_share
        0 = not yet computed, use heuristic; >0 = sampled value. */
     std::atomic<ulong> cached_rec_per_key[MAX_KEY];
 
+    /* Cached parsed ENGINE_ATTRIBUTE table options (M-1 + M-13 fix).
+       Populated once at open() time; the rapidjson Parse and the 25+
+       THDVAR reads in tidesdb_seed_opts_from_session run exactly once
+       per share instead of per-call (open() alone makes 5+ calls). The
+       cache also gives every handler a stable pointer that does not
+       alias across nested calls (M-1: previously a single thread_local
+       struct was overwritten on every call).
+
+       Held by raw pointer rather than by value because ha_table_option_struct
+       is defined in ha_tidesdb.cc only; the share header is included by
+       other plugin TUs. Allocated and freed by the share destructor. */
+    ha_table_option_struct *cached_opts{nullptr};
+    bool cached_opts_valid{false};
+
     /* Secondary index CFs (one per secondary key) */
     std::vector<tidesdb_column_family_t *> idx_cfs;
     std::vector<std::string> idx_cf_names;
@@ -551,6 +569,16 @@ class ha_tidesdb : public handler
        across calls (tidesdb_encrypt_row used to replace row_buf_). */
     std::string enc_buf_;
 
+    /* Scratch buffer for key_copy_to_comparable.
+       Previously key_restore wrote into table->record[1] as an intermediate
+       step before reading field-by-field via make_comparable_key. record[1]
+       is shared with the rest of the engine and the SQL layer (UPDATE uses
+       it for the old row); writing into it on every seek polluted cache
+       lines that were also being read by the surrounding row machinery.
+       Using a dedicated per-handler buffer of size table->s->reclength
+       (allocated at open() time) keeps the scratch in its own cache line. */
+    std::vector<uchar> key_unpack_scratch_;
+
     /* Per-statement cached encryption key version -- avoids calling
        encryption_key_get_latest_version() on every single row write. */
     uint cached_enc_key_ver_;
@@ -628,6 +656,15 @@ class ha_tidesdb : public handler
     bool in_bulk_update_;
     bool in_bulk_delete_;
     ha_rows bulk_insert_ops_; /* ops buffered since last mid-txn commit */
+
+    /* M-4: per-FTS-key counter deltas accumulated during bulk insert
+       and flushed once at end_bulk_insert. Previously fts_update_meta
+       (LSM read + write of the doc/word counters) fired on every single
+       row, turning bulk INSERT into a doubled LSM read amplification
+       on the meta CF. Buffering shifts those reads to a single per-key
+       call at the end of the bulk operation. Cleared in start_bulk_insert. */
+    int64_t fts_meta_doc_delta_[MAX_KEY] = {};
+    int64_t fts_meta_word_delta_[MAX_KEY] = {};
 
     /* Auto-compact-after-range-delete tracking.  When the session var
        tidesdb_compact_after_range_delete_min_rows is non-zero, delete_row

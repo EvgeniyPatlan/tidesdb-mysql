@@ -262,16 +262,25 @@ inline int my_rmtree(const char *path, int /*flags*/) {
 #ifndef my_random_bytes
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/random.h>  /* getrandom(2), Linux >= 3.17, glibc >= 2.25 */
+/* Fill `buf` with `n` cryptographically-strong random bytes.
+ * Used to generate the IV for each encrypted row write -- one call per
+ * write_row/update_row on an encrypted table. The old implementation
+ * open()/read()/close()'d /dev/urandom every call (3 syscalls per row);
+ * getrandom(2) is a single syscall and drops the fd table footprint
+ * entirely. Returns 0 on success, 1 on failure (matches the original
+ * contract; callers check for non-zero). */
 inline int my_random_bytes(unsigned char *buf, int n) {
-    int fd = ::open("/dev/urandom", O_RDONLY);
-    if (fd < 0) return 1;
     int got = 0;
     while (got < n) {
-        int r = ::read(fd, buf + got, n - got);
-        if (r <= 0) { ::close(fd); return 1; }
-        got += r;
+        ssize_t r = ::getrandom(buf + got, (size_t)(n - got), 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return 1;
+        }
+        if (r == 0) return 1; /* shouldn't happen with blocking getrandom */
+        got += (int)r;
     }
-    ::close(fd);
     return 0;
 }
 #endif

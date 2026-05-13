@@ -41,6 +41,8 @@ extern "C"
 #include <unordered_set>
 #include <vector>
 
+#include "sql/auth/auth_acls.h"      /* SELECT_ACL for M-12 privilege check */
+#include "sql/auth/sql_security_ctx.h" /* Security_context::check_access */
 #include "sql/item.h"  /* Item::val_bool() for ICP evaluation */
 #include "sql/key.h"
 #include "sql/sql_class.h"
@@ -849,11 +851,20 @@ static std::unordered_set<std::string> tdb_stopwords;
 static mysql_rwlock_t tdb_stopword_lock;
 static PSI_rwlock_key tdb_stopword_lock_key;
 
-/* Load stop words from the default list */
+/* Load stop words from the default list into `out` (no lock taken;
+   caller manages serialization). */
+static void tdb_load_default_stopwords_into(std::unordered_set<std::string> &out)
+{
+    out.clear();
+    for (const char **w = tdb_default_stopwords; *w; w++) out.insert(*w);
+}
+
+/* Backward-compatible wrapper for the init path: populates the global
+   tdb_stopwords directly (init runs single-threaded before the rwlock
+   is even initialized). */
 static void tdb_load_default_stopwords()
 {
-    tdb_stopwords.clear();
-    for (const char **w = tdb_default_stopwords; *w; w++) tdb_stopwords.insert(*w);
+    tdb_load_default_stopwords_into(tdb_stopwords);
 }
 
 /* Check if a lowercased token is a stop word.
@@ -864,13 +875,16 @@ static inline bool tdb_is_stopword_locked(const std::string &word)
     return tdb_stopwords.count(word) > 0;
 }
 
-/* Load stop words from a user table specified as "db_name/table_name".
-   Must be called with tdb_stopword_lock held for writing.
-   Uses TidesDB's own CF to read the table if it's a TidesDB table,
-   or falls back to an empty set with a warning for other engines.
-   For simplicity, the table must store one word per row in a column named 'value'
-   and be accessible as a TidesDB CF named "db_name__table_name". */
-static bool tdb_load_stopwords_from_table_spec(const char *table_spec)
+/* Load stop words from a user table specified as "db_name/table_name"
+   into `out`. The CF scan can take arbitrarily long; callers should
+   build a local set with this function WITHOUT holding the stopword
+   write-lock, then swap the populated set into tdb_stopwords under
+   the lock at the end. Used by tdb_ft_stopword_table_update; previously
+   this function wrote to tdb_stopwords directly while the caller held
+   the write-lock across the entire scan, blocking concurrent FTS
+   readers (M-11 in the code review). */
+static bool tdb_load_stopwords_from_table_spec_into(const char *table_spec,
+                                                   std::unordered_set<std::string> &out)
 {
     if (!table_spec || !table_spec[0]) return false;
 
@@ -884,6 +898,34 @@ static bool tdb_load_stopwords_from_table_spec(const char *table_spec)
 
     std::string db_name(table_spec, slash - table_spec);
     std::string tbl_name(slash + 1);
+
+    /* M-12 privilege check: SET GLOBAL tidesdb_ft_stopword_table requires
+       only SYSTEM_VARIABLES_ADMIN, but the value-loading path reads every
+       row of the named table -- without a privilege check that bypasses
+       MySQL's standard table-level grants. We require at least SELECT on
+       the target database. Database-level instead of table-level because
+       constructing a Table_ref to call check_grant/check_table_access
+       from a plugin context requires significant scaffolding; the
+       db-level check is a sound coarse approximation (if the user is
+       trusted with SELECT on the entire database, they can read this
+       table anyway). */
+    THD *cur_thd = current_thd;
+    if (cur_thd && cur_thd->security_context())
+    {
+        Security_context *sctx = cur_thd->security_context();
+        /* check_access returns true when the privilege IS granted.
+           We deny when it returns false. */
+        if (!sctx->check_access(SELECT_ACL, db_name, false))
+        {
+            sql_print_warning(
+                "[TIDESDB] Stop word table load denied: user '%s'@'%s' lacks "
+                "SELECT on database '%s'. Refusing to load stop words from '%s'.",
+                sctx->priv_user().str ? sctx->priv_user().str : "?",
+                sctx->priv_host().str ? sctx->priv_host().str : "?",
+                db_name.c_str(), table_spec);
+            return false;
+        }
+    }
 
     /* We look for a TidesDB CF matching the table path convention */
     std::string cf_name = db_name + "/" + tbl_name;
@@ -917,7 +959,7 @@ static bool tdb_load_stopwords_from_table_spec(const char *table_spec)
     }
 
     tidesdb_iter_seek_to_first(iter);
-    tdb_stopwords.clear();
+    out.clear();
 
     while (tidesdb_iter_valid(iter))
     {
@@ -955,7 +997,7 @@ static bool tdb_load_stopwords_from_table_spec(const char *table_spec)
                 {
                     std::string word((const char *)(data + FIELD_VARCHAR_LEN_PREFIX), str_len);
                     std::transform(word.begin(), word.end(), word.begin(), ::tolower);
-                    tdb_stopwords.insert(std::move(word));
+                    out.insert(std::move(word));
                 }
             }
         }
@@ -965,37 +1007,53 @@ static bool tdb_load_stopwords_from_table_spec(const char *table_spec)
     tidesdb_iter_free(iter);
     tidesdb_txn_free(txn);
 
-    sql_print_information("[TIDESDB] Loaded %zu stop words from table '%s'", tdb_stopwords.size(),
+    sql_print_information("[TIDESDB] Loaded %zu stop words from table '%s'", out.size(),
                           table_spec);
     return true;
 }
 
-/* Sysvar update callback for tidesdb_ft_stopword_table */
+/* Sysvar update callback for tidesdb_ft_stopword_table.
+   Builds the new stopword set OUTSIDE the rwlock (the table scan can
+   be long), then swaps it in under a brief write-lock. Previously the
+   write-lock was held across the entire scan, blocking concurrent FTS
+   tokenization on any indexed table for the duration. */
 static void tdb_ft_stopword_table_update(MYSQL_THD thd, SYS_VAR *var, void *var_ptr,
                                          const void *save)
 {
     const char *new_val = *static_cast<const char *const *>(save);
-    mysql_rwlock_wrlock(&tdb_stopword_lock);
+
+    std::unordered_set<std::string> new_set;
+    bool ok;
 
     if (!new_val || !new_val[0])
     {
-        /* NULL or empty string -- we reset to defaults */
-        tdb_load_default_stopwords();
-        sql_print_information("[TIDESDB] Stop words reset to defaults (%zu words)",
-                              tdb_stopwords.size());
+        /* NULL or empty string -- reset to defaults. */
+        tdb_load_default_stopwords_into(new_set);
+        ok = true;
     }
     else
     {
-        /* We try to load from user table */
-        if (!tdb_load_stopwords_from_table_spec(new_val))
+        ok = tdb_load_stopwords_from_table_spec_into(new_val, new_set);
+        if (!ok)
         {
             sql_print_warning("[TIDESDB] Failed to load stop words from '%s', keeping current set",
                               new_val);
         }
     }
 
+    /* Hold the write-lock only for the swap + sysvar pointer publish.
+       Concurrent FTS readers (held in read-lock) drain quickly even
+       under heavy tokenization load. */
+    mysql_rwlock_wrlock(&tdb_stopword_lock);
+    if (ok) tdb_stopwords = std::move(new_set);
     *static_cast<const char **>(var_ptr) = new_val;
     mysql_rwlock_unlock(&tdb_stopword_lock);
+
+    if (ok && (!new_val || !new_val[0]))
+    {
+        sql_print_information("[TIDESDB] Stop words reset to defaults (%zu words)",
+                              tdb_stopwords.size());
+    }
 }
 
 /* BM25 tuning parameters.  k1 controls term-frequency saturation
@@ -2689,18 +2747,44 @@ static void tidesdb_seed_opts_from_session(THD *thd, ha_table_option_struct *opt
  * use site consumes the pointer immediately.
  *
  * Returns NULL only when called with a NULL table or one without a share. */
-static ha_table_option_struct *tidesdb_opts_for_table(const TABLE *table) {
-    if (!table || !table->s) return nullptr;
-    static thread_local ha_table_option_struct tls;
-    tidesdb_seed_opts_from_session(current_thd, &tls);
+/* Populate `out` by seeding from session and overlaying JSON from
+   table->s->engine_attribute. Helper extracted so both the share-cache
+   warm-up path (called once at open()) and the no-share fallback path
+   (e.g. inplace_alter against an altered_table without a TidesDB share)
+   can share the same logic. */
+static void tidesdb_compute_opts_for_table(const TABLE *table, ha_table_option_struct *out) {
+    tidesdb_seed_opts_from_session(current_thd, out);
+    if (!table || !table->s) return;
     LEX_CSTRING attr = table->s->engine_attribute;
     if (attr.str && attr.length) {
-        if (!tidesdb_engine_attribute_to_options(attr, &tls)) {
+        if (!tidesdb_engine_attribute_to_options(attr, out)) {
             sql_print_warning("[TIDESDB] ENGINE_ATTRIBUTE on table '%s' is "
                               "malformed JSON; falling back to session defaults",
                               table->s->table_name.str ? table->s->table_name.str : "?");
         }
     }
+}
+
+static ha_table_option_struct *tidesdb_opts_for_table(const TABLE *table) {
+    if (!table || !table->s) return nullptr;
+
+    /* M-1 + M-13: if the table has a TidesDB_share with a populated
+       cache, return its stable pointer. No JSON re-parse, no THDVAR
+       loops, no aliased thread-local storage. The share's cached_opts
+       is filled exactly once during open() before any TDB_TABLE_OPTIONS
+       call sites run; see ha_tidesdb::open. */
+    if (table->s->ha_share) {
+        TidesDB_share *sh = static_cast<TidesDB_share *>(table->s->ha_share);
+        if (sh->cached_opts_valid && sh->cached_opts) return sh->cached_opts;
+    }
+
+    /* Fallback for paths where the share is not yet populated (CREATE
+       TABLE pre-open, inplace_alter against altered_table). One TLS
+       struct refreshed per call -- nested calls on the same thread
+       overwrite it, which is fine here because every fallback caller
+       is a single TDB_TABLE_OPTIONS() consume-immediately site. */
+    static thread_local ha_table_option_struct tls;
+    tidesdb_compute_opts_for_table(table, &tls);
     return &tls;
 }
 
@@ -2952,6 +3036,8 @@ TidesDB_share::TidesDB_share()
 
 TidesDB_share::~TidesDB_share()
 {
+    delete cached_opts;
+    cached_opts = nullptr;
 }
 
 /* ******************** Per-connection transaction helpers ******************** */
@@ -3742,12 +3828,16 @@ static void schema_cf_rename(const char *from, const char *to)
         /* We delete old key */
         tidesdb_txn_delete(txn, schema_cf, (const uint8_t *)old_key.data(), old_key.size());
         tidesdb_txn_commit(txn);
-        free(val);
+        /* Must be tidesdb_free, not libc free -- val was allocated by
+           TidesDB's internal allocator, which may be mimalloc / jemalloc
+           / tcmalloc depending on build flags. Calling libc free on
+           those is heap corruption. */
+        tidesdb_free(val);
     }
     else
     {
         tidesdb_txn_rollback(txn);
-        if (val) free(val);
+        if (val) tidesdb_free(val);
 
         /* We fallback, old key missing? we read .frm from disk at new path */
         schema_cf_store_frm(to);
@@ -4586,7 +4676,15 @@ uint ha_tidesdb::make_comparable_key(KEY *key_info, const uchar *record, uint nu
 uint ha_tidesdb::key_copy_to_comparable(KEY *key_info, const uchar *key_buf, uint key_len,
                                         uchar *out)
 {
-    key_restore(table->record[1], key_buf, key_info, key_len);
+    /* Use per-handler scratch buffer rather than table->record[1] so we
+       don't pollute the row buffer the SQL layer is sharing. Lazy-size
+       on first use (open() can't always size it -- altered tables may
+       have a different reclength). */
+    if (key_unpack_scratch_.size() < table->s->reclength)
+        key_unpack_scratch_.resize(table->s->reclength);
+    uchar *scratch = key_unpack_scratch_.data();
+
+    key_restore(scratch, key_buf, key_info, key_len);
 
     /* We count how many key parts are covered by key_len */
     uint parts = 0;
@@ -4599,7 +4697,7 @@ uint ha_tidesdb::key_copy_to_comparable(KEY *key_info, const uchar *key_buf, uin
     }
     if (parts == 0) parts = 1;
 
-    return make_comparable_key(key_info, table->record[1], parts, out);
+    return make_comparable_key(key_info, scratch, parts, out);
 }
 
 /*
@@ -5091,6 +5189,18 @@ int ha_tidesdb::open(const char *name, int mode, uint test_if_locked, const dd::
       racing on the shared vectors.
     */
     lock_shared_ha_data();
+
+    /* M-1 + M-13: populate the share's ENGINE_ATTRIBUTE option cache
+       once per share. Subsequent TDB_TABLE_OPTIONS(table) calls (5+
+       just in this open() body) read directly from share->cached_opts
+       instead of seeding session vars + re-parsing JSON each time. */
+    if (!share->cached_opts_valid)
+    {
+        share->cached_opts = new ha_table_option_struct();
+        tidesdb_compute_opts_for_table(table, share->cached_opts);
+        share->cached_opts_valid = true;
+    }
+
     if (!share->cf)
     {
         share->cf_name = path_to_cf_name(name);
@@ -6079,12 +6189,31 @@ int ha_tidesdb::write_row(uchar *buf)
 
             if (ki->algorithm == HA_KEY_ALG_FULLTEXT)
             {
-                /* FTS index maintenance */
+                /* FTS index maintenance.
+                   Per-row tokenization reuses thread-local scratch buffers
+                   so steady-state INSERT on FTS-indexed tables fires zero
+                   allocator activity in this path beyond what the
+                   tokenizer itself does. The scratch is held via a
+                   thread_local POINTER (lazy-allocated on first use)
+                   rather than `static thread_local std::vector ...` --
+                   dlopen'd plugins have a static-TLS budget too small
+                   for std::vector / std::unordered_map's storage and
+                   the load fails with "cannot allocate memory in static
+                   TLS block". The pointer fits in 8 bytes of TLS; the
+                   heap object lives for the thread's lifetime. */
                 CHARSET_INFO *fts_cs = ki->key_part[0].field->charset();
-                std::vector<fts_token_t> fts_tokens;
+                struct WriteRowFtsScratch {
+                    std::vector<fts_token_t> tokens;
+                    std::unordered_map<std::string, uint16> tf_map;
+                };
+                static thread_local WriteRowFtsScratch *fts_scratch = nullptr;
+                if (!fts_scratch) fts_scratch = new WriteRowFtsScratch();
+                auto &fts_tokens = fts_scratch->tokens;
+                auto &tf_map = fts_scratch->tf_map;
+                fts_tokens.clear();
+                tf_map.clear();
                 fts_extract_and_tokenize(table, ki, buf, fts_cs, fts_tokens);
 
-                std::unordered_map<std::string, uint16> tf_map;
                 for (auto &tok : fts_tokens) tf_map[tok.word]++;
                 uint32 word_count = (uint32)fts_tokens.size();
 
@@ -6099,7 +6228,21 @@ int ha_tidesdb::write_row(uchar *buf)
                     if (rc != TDB_SUCCESS) goto err;
                 }
 
-                fts_update_meta(txn, share->cf, i, FTS_DOC_DELTA_ADD, (int64_t)word_count);
+                /* M-4: in bulk INSERT, accumulate the delta and flush at
+                   end_bulk_insert as a single RMW per key. Outside bulk
+                   mode (single-row INSERT in autocommit), the per-row
+                   RMW is unavoidable without changing transaction
+                   semantics, so we leave that path inline. */
+                if (in_bulk_insert_ && i < MAX_KEY)
+                {
+                    fts_meta_doc_delta_[i] += FTS_DOC_DELTA_ADD;
+                    fts_meta_word_delta_[i] += (int64_t)word_count;
+                }
+                else
+                {
+                    fts_update_meta(txn, share->cf, i, FTS_DOC_DELTA_ADD,
+                                    (int64_t)word_count);
+                }
             }
             else if (ki->algorithm == HA_KEY_ALG_RTREE)
             {
@@ -7159,12 +7302,29 @@ int ha_tidesdb::update_row(const uchar *old_data, uchar *new_data)
                 /* Tokenize both old and new docs, build term-frequency maps,
                    then emit only the minimum set of deletes/puts needed.
                    For a small edit to a large document this avoids rewriting
-                   every term entry. */
-                std::vector<fts_token_t> old_tokens, new_tokens;
+                   every term entry.
+
+                   See write_row's FTS comment for why this is a
+                   thread_local POINTER, not a thread_local object. */
+                struct UpdateRowFtsScratch {
+                    std::vector<fts_token_t> old_tokens;
+                    std::vector<fts_token_t> new_tokens;
+                    std::unordered_map<std::string, uint16> old_tf;
+                    std::unordered_map<std::string, uint16> new_tf;
+                };
+                static thread_local UpdateRowFtsScratch *upd_fts_scratch = nullptr;
+                if (!upd_fts_scratch) upd_fts_scratch = new UpdateRowFtsScratch();
+                auto &old_tokens = upd_fts_scratch->old_tokens;
+                auto &new_tokens = upd_fts_scratch->new_tokens;
+                auto &old_tf = upd_fts_scratch->old_tf;
+                auto &new_tf = upd_fts_scratch->new_tf;
+                old_tokens.clear();
+                new_tokens.clear();
+                old_tf.clear();
+                new_tf.clear();
                 fts_extract_and_tokenize(table, ki, old_data, fts_cs, old_tokens);
                 fts_extract_and_tokenize(table, ki, new_data, fts_cs, new_tokens);
 
-                std::unordered_map<std::string, uint16> old_tf, new_tf;
                 for (auto &tok : old_tokens) old_tf[tok.word]++;
                 for (auto &tok : new_tokens) new_tf[tok.word]++;
                 uint32 old_wc = (uint32)old_tokens.size();
@@ -7463,11 +7623,21 @@ int ha_tidesdb::delete_row(const uchar *buf)
 
             if (share->idx_is_fts[i])
             {
+                /* See write_row's FTS comment for why this is a
+                   thread_local POINTER, not a thread_local object. */
                 CHARSET_INFO *fts_cs = ki->key_part[0].field->charset();
-                std::vector<fts_token_t> fts_tokens;
+                struct DeleteRowFtsScratch {
+                    std::vector<fts_token_t> tokens;
+                    std::unordered_map<std::string, uint16> tf_map;
+                };
+                static thread_local DeleteRowFtsScratch *del_fts_scratch = nullptr;
+                if (!del_fts_scratch) del_fts_scratch = new DeleteRowFtsScratch();
+                auto &fts_tokens = del_fts_scratch->tokens;
+                auto &tf_map = del_fts_scratch->tf_map;
+                fts_tokens.clear();
+                tf_map.clear();
                 fts_extract_and_tokenize(table, ki, buf, fts_cs, fts_tokens);
 
-                std::unordered_map<std::string, uint16> tf_map;
                 for (auto &tok : fts_tokens) tf_map[tok.word]++;
                 uint32 word_count = (uint32)fts_tokens.size();
 
@@ -7702,11 +7872,40 @@ void ha_tidesdb::start_bulk_insert(ha_rows rows)
 {
     in_bulk_insert_ = true;
     bulk_insert_ops_ = 0;
+    /* M-4: reset per-key FTS meta deltas; we'll accumulate while
+       in_bulk_insert_ is true and flush in end_bulk_insert. */
+    if (table && table->s)
+    {
+        uint nkeys = table->s->keys;
+        for (uint i = 0; i < nkeys && i < MAX_KEY; i++)
+        {
+            fts_meta_doc_delta_[i] = 0;
+            fts_meta_word_delta_[i] = 0;
+        }
+    }
 }
 
 int ha_tidesdb::end_bulk_insert()
 {
     in_bulk_insert_ = false;
+
+    /* M-4: flush buffered FTS meta deltas. One RMW per FTS key with
+       non-zero delta (vs one RMW per row pre-fix). */
+    if (table && table->s && share && stmt_txn)
+    {
+        uint nkeys = table->s->keys;
+        for (uint i = 0; i < nkeys && i < MAX_KEY; i++)
+        {
+            if (fts_meta_doc_delta_[i] == 0 && fts_meta_word_delta_[i] == 0)
+                continue;
+            if (!share->idx_is_fts[i]) continue;
+            fts_update_meta(stmt_txn, share->cf, i,
+                            fts_meta_doc_delta_[i],
+                            fts_meta_word_delta_[i]);
+            fts_meta_doc_delta_[i] = 0;
+            fts_meta_word_delta_[i] = 0;
+        }
+    }
     return 0;
 }
 

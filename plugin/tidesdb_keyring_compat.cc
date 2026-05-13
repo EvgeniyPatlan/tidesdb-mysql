@@ -45,10 +45,17 @@ constexpr unsigned int TIDESDB_AES_BLOCK_LEN  = 16;
 
 /* Master key state. Set once at plugin init from a file the DBA points to;
    read concurrently by encrypt/decrypt paths. We use std::atomic<bool> for
-   the loaded flag so the read path doesn't take a mutex on every row. */
+   the loaded flag so the read path doesn't take a mutex on every row.
+
+   `g_master_key_gen` is bumped on every load / clear; encryption_key_get
+   compares it against a thread_local snapshot to know whether its
+   TLS-cached copy of the key is still valid. This lets the steady-state
+   read path (the by-far-common case: key loaded once at startup, then
+   used by row encrypt/decrypt forever) skip the mutex entirely. */
 std::mutex g_master_key_mu;
 unsigned char g_master_key[TIDESDB_MASTER_KEY_LEN] = {0};
 std::atomic<bool> g_master_key_loaded{false};
+std::atomic<uint64_t> g_master_key_gen{0};
 
 }  /* unnamed namespace */
 
@@ -78,6 +85,9 @@ bool tidesdb_master_key_load_from_file(const char *path) {
         std::lock_guard<std::mutex> lock(g_master_key_mu);
         memcpy(g_master_key, buf, TIDESDB_MASTER_KEY_LEN);
         g_master_key_loaded.store(true, std::memory_order_release);
+        /* Bump generation so any thread's TLS-cached copy is invalidated
+           on next encryption_key_get. */
+        g_master_key_gen.fetch_add(1, std::memory_order_acq_rel);
     }
     memset(buf, 0, sizeof(buf));
     sql_print_information("[TIDESDB] master key loaded from '%s' (%u bytes)",
@@ -89,6 +99,11 @@ void tidesdb_master_key_clear() {
     std::lock_guard<std::mutex> lock(g_master_key_mu);
     memset(g_master_key, 0, sizeof(g_master_key));
     g_master_key_loaded.store(false, std::memory_order_release);
+    /* Bump generation so TLS caches invalidate. Threads that already
+       had the old key cached and call encryption_key_get again will
+       see the generation mismatch, take the mutex, re-check loaded
+       (now false), and return -1. */
+    g_master_key_gen.fetch_add(1, std::memory_order_acq_rel);
 }
 
 unsigned int encryption_key_get_latest_version(unsigned int /*key_id*/) {
@@ -100,12 +115,36 @@ unsigned int encryption_key_get_latest_version(unsigned int /*key_id*/) {
 
 int encryption_key_get(unsigned int /*key_id*/, unsigned int /*key_version*/,
                        unsigned char *key, unsigned int *key_len) {
+    /* TLS-cached copy of the master key, valid as long as tls_gen matches
+       the global g_master_key_gen. Once the key is loaded (and not
+       cleared), the global gen stops changing, so this fast path skips
+       the mutex on every subsequent call. Without this cache, every
+       encrypted-row read or write serialized through g_master_key_mu --
+       which blocks concurrent decrypts from different connections. */
+    thread_local unsigned char tls_master_key[TIDESDB_MASTER_KEY_LEN];
+    thread_local uint64_t tls_gen = 0;
+
+    uint64_t cur_gen = g_master_key_gen.load(std::memory_order_acquire);
+    if (cur_gen != 0 && tls_gen == cur_gen) {
+        /* Fast path: TLS cache valid. No mutex. */
+        memcpy(key, tls_master_key, TIDESDB_MASTER_KEY_LEN);
+        *key_len = TIDESDB_MASTER_KEY_LEN;
+        return 0;
+    }
+
+    /* Slow path: cold TLS, or generation changed (load/clear happened). */
+    std::lock_guard<std::mutex> lock(g_master_key_mu);
+    /* Re-check under the lock; another thread may have cleared. */
     if (!g_master_key_loaded.load(std::memory_order_acquire)) {
         if (key_len) *key_len = 0;
+        /* Wipe the now-stale TLS copy so it can't be reused after clear. */
+        memset(tls_master_key, 0, sizeof(tls_master_key));
+        tls_gen = 0;
         return -1;
     }
-    std::lock_guard<std::mutex> lock(g_master_key_mu);
-    memcpy(key, g_master_key, TIDESDB_MASTER_KEY_LEN);
+    memcpy(tls_master_key, g_master_key, TIDESDB_MASTER_KEY_LEN);
+    tls_gen = g_master_key_gen.load(std::memory_order_acquire);
+    memcpy(key, tls_master_key, TIDESDB_MASTER_KEY_LEN);
     *key_len = TIDESDB_MASTER_KEY_LEN;
     return 0;
 }
