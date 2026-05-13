@@ -1,3 +1,4 @@
+# Origin: H-9
 --source suite/tidesdb/include/have_tidesdb.inc
 #
 # Regression test for H-9 (ENGINE_ATTRIBUTE JSON parser unbounded depth).

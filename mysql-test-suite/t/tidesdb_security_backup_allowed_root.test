@@ -1,3 +1,4 @@
+# Origin: HF-3
 --source suite/tidesdb/include/have_tidesdb.inc
 #
 # Regression test for HF-3 (symlink-redirect attack on backup_dir /

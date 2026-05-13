@@ -1,3 +1,4 @@
+# Origin: M-12
 --source suite/tidesdb/include/have_tidesdb.inc
 #
 # Regression test for M-12 (stopword-table-load bypasses table-level grants).

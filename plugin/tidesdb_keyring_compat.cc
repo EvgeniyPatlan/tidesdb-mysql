@@ -69,25 +69,59 @@ std::atomic<uint64_t> g_master_key_gen{0};
    running mysqld in a container with RLIMIT_MEMLOCK = 0 would never
    start otherwise). The log line surfaces the situation so operators
    know the hardening didn't apply. */
+/* LF-2: translate common mlock/madvise errnos into operator-actionable
+   hints rather than raw numeric codes. Numeric errno fingerprints the
+   environment in logs; named hints describe what to fix. */
+static const char *tdb_mlock_errno_hint(int e) {
+    switch (e) {
+        case ENOMEM:
+            return "RLIMIT_MEMLOCK limit reached -- raise the limit "
+                   "(ulimit -l) or run without memlock";
+        case EPERM:
+            return "permission denied (CAP_IPC_LOCK / RLIMIT_MEMLOCK) -- "
+                   "grant the capability or relax the limit";
+        case EAGAIN:
+            return "transient memory pressure (EAGAIN); retry later";
+        case EINVAL:
+            return "invalid arguments to mlock -- likely a code bug";
+        default:
+            return "see mlock(2) for the failure mode";
+    }
+}
+
 void tidesdb_master_key_pin_page() {
     long pagesize = ::sysconf(_SC_PAGESIZE);
     if (pagesize <= 0) return;
-    void *page_start = reinterpret_cast<void *>(
-        reinterpret_cast<uintptr_t>(g_master_key) & ~(uintptr_t)(pagesize - 1));
-    /* The key may span two pages if it straddles a boundary -- 32 bytes
-       fits in any page so the second page only matters if alignment is
-       unlucky. mlock-ing exactly two pages covers it cheaply. */
-    if (::mlock(page_start, (size_t)pagesize * 2) != 0) {
-        sql_print_warning("[TIDESDB] master key: mlock failed (errno=%d); "
+
+    uintptr_t key_addr = reinterpret_cast<uintptr_t>(g_master_key);
+    uintptr_t page_mask = ~(uintptr_t)(pagesize - 1);
+    void *page_start = reinterpret_cast<void *>(key_addr & page_mask);
+
+    /* LF-4: lock exactly the page(s) the key occupies -- the previous
+       always-2-pages approach failed with ENOMEM under tight
+       RLIMIT_MEMLOCK (containers with the limit set to one page).
+       Compute straddle and lock 1 or 2 pages accordingly. The key
+       struct is 32 bytes; with any plausible page size (4K+) we
+       straddle only if the start address is in the last 32 bytes of
+       a page. */
+    bool straddles =
+        ((key_addr + TIDESDB_MASTER_KEY_LEN - 1) & page_mask) !=
+        (key_addr & page_mask);
+    size_t pin_bytes = straddles ? (size_t)pagesize * 2 : (size_t)pagesize;
+
+    if (::mlock(page_start, pin_bytes) != 0) {
+        int e = errno;
+        sql_print_warning("[TIDESDB] master key: mlock failed (%s); "
                           "key may be paged to swap. Raise RLIMIT_MEMLOCK "
                           "or ignore this if the host has swap disabled.",
-                          errno);
+                          tdb_mlock_errno_hint(e));
     }
 #ifdef MADV_DONTDUMP
-    if (::madvise(page_start, (size_t)pagesize * 2, MADV_DONTDUMP) != 0) {
-        sql_print_warning("[TIDESDB] master key: madvise(MADV_DONTDUMP) failed "
-                          "(errno=%d); key may appear in core dumps.",
-                          errno);
+    if (::madvise(page_start, pin_bytes, MADV_DONTDUMP) != 0) {
+        int e = errno;
+        sql_print_warning("[TIDESDB] master key: madvise(MADV_DONTDUMP) "
+                          "failed (%s); key may appear in core dumps.",
+                          tdb_mlock_errno_hint(e));
     }
 #endif
 }

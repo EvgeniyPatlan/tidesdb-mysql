@@ -1,3 +1,4 @@
+# Origin: H-4
 --source suite/tidesdb/include/have_tidesdb.inc
 #
 # Regression test for H-4 (Hilbert encoder overflow corrupts spatial keys).

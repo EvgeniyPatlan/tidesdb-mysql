@@ -1,3 +1,4 @@
+# Origin: H-10
 --source suite/tidesdb/include/have_tidesdb.inc
 #
 # Regression test for H-10 (ICP advertised but check stub returned 0).

@@ -4974,7 +4974,11 @@ uint ha_tidesdb::key_copy_to_comparable(KEY *key_info, const uchar *key_buf, uin
        don't pollute the row buffer the SQL layer is sharing. Lazy-size
        on first use (open() can't always size it -- altered tables may
        have a different reclength). */
-    if (key_unpack_scratch_.size() < table->s->reclength)
+    /* LF-1: scratch is sized once in open() and grown defensively here
+       only if the table_share's reclength has somehow expanded since
+       open (e.g. mid-statement ALTER -- shouldn't happen but cheap to
+       check). Steady-state hot path takes the resize branch never. */
+    if (unlikely(key_unpack_scratch_.size() < table->s->reclength))
         key_unpack_scratch_.resize(table->s->reclength);
     uchar *scratch = key_unpack_scratch_.data();
 
@@ -5676,6 +5680,12 @@ int ha_tidesdb::open(const char *name, int mode, uint test_if_locked, const dd::
         record1_hi_ = NULL;
     }
 
+    /* LF-1: size key_unpack_scratch_ once now that table is available.
+       Subsequent key_copy_to_comparable calls see the buffer already
+       sized and skip the resize branch on the hot path. */
+    if (table && table->s && key_unpack_scratch_.size() < table->s->reclength)
+        key_unpack_scratch_.resize(table->s->reclength);
+
     DBUG_RETURN(0);
 }
 
@@ -5774,15 +5784,25 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
 
 /* ******************** Data-at-rest encryption helpers ******************** */
 
-/* Compiler-optimization-resistant memory wipe for key material. A plain
-   memset on a stack local that's about to go out of scope is legitimately
-   removable by the optimizer; iterating through a volatile pointer is not.
-   Equivalent in intent to OpenSSL's OPENSSL_cleanse / glibc's explicit_bzero. */
+/* Compiler-optimization-resistant memory wipe for key material.
+   LF-3: prefer glibc's explicit_bzero(3) when available -- it includes
+   a compiler barrier in addition to being un-optimizable-away, and is
+   the canonical idiom that future readers expect. Fall back to a
+   volatile-pointer loop where unavailable. Ubuntu 24.04 has
+   glibc 2.38; explicit_bzero has been there since 2.25.
+
+   Cf. OpenSSL's OPENSSL_cleanse and C11's memset_s. */
+#if defined(__GLIBC__) && \
+    (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 25))
+#include <string.h>
+static inline void tdb_secure_zero(void *p, size_t n) { explicit_bzero(p, n); }
+#else
 static inline void tdb_secure_zero(void *p, size_t n)
 {
     volatile unsigned char *vp = (volatile unsigned char *)p;
     while (n--) *vp++ = 0;
 }
+#endif
 
 /*
   Encrypt plaintext into enc_buf_.  Format is [IV (16 bytes)] [ciphertext].
