@@ -10565,10 +10565,26 @@ bool ha_tidesdb::commit_inplace_alter_table(
 
     /* If table options changed (SYNC_MODE, COMPRESSION, BLOOM_FPR, etc.),
        we apply them to the live CF(s) so they take effect immediately instead
-       of only being persisted in the .frm. */
+       of only being persisted in the .frm.
+
+       ENGINE_ATTRIBUTE-freeze fix: compute the new options FRESH from
+       altered_table's engine_attribute, bypassing the share's cached
+       opts pointer entirely (the cache currently holds the OLD parse).
+       Using a local struct lets us:
+         (1) feed accurate values into build_cf_config and the share
+             field updates below, and
+         (2) atomic-swap into share->cached_opts at the end so that
+             future TDB_TABLE_OPTIONS(table) calls -- after this alter
+             returns -- see the new values rather than the pre-alter
+             cache.
+       Without this, ALTER TABLE ... ENGINE_ATTRIBUTE='{...}' appeared
+       to succeed (DD updated, SHOW CREATE TABLE returns the new value)
+       but the engine kept using the old values for the share's life. */
     if (ha_alter_info->handler_flags & ALTER_CHANGE_CREATE_OPTION)
     {
-        tidesdb_column_family_config_t cfg = build_cf_config(TDB_TABLE_OPTIONS(altered_table));
+        ha_table_option_struct fresh_opts{};
+        tidesdb_compute_opts_for_table(altered_table, &fresh_opts);
+        tidesdb_column_family_config_t cfg = build_cf_config(&fresh_opts);
 
         /* Main data CF */
         if (share->cf)
@@ -10602,19 +10618,39 @@ bool ha_tidesdb::commit_inplace_alter_table(
             }
         }
 
-        /* We update share-level cached options that are read from table options */
-        if (TDB_TABLE_OPTIONS(altered_table))
+        /* We update share-level cached options that are read from table
+           options. Source: the freshly-computed `fresh_opts` (above)
+           rather than TDB_TABLE_OPTIONS(altered_table) -- the latter
+           might still hit the share's old cached pointer depending on
+           whether altered_table->s->ha_share is set. */
         {
-            uint iso_idx = TDB_TABLE_OPTIONS(altered_table)->isolation_level;
+            uint iso_idx = fresh_opts.isolation_level;
             if (iso_idx < array_elements(tdb_isolation_map))
                 share->isolation_level = (tidesdb_isolation_level_t)tdb_isolation_map[iso_idx];
-            share->default_ttl = TDB_TABLE_OPTIONS(altered_table)->ttl;
+            share->default_ttl = fresh_opts.ttl;
             share->has_ttl = (share->default_ttl > 0 || share->ttl_field_idx >= 0);
-            share->encrypted = TDB_TABLE_OPTIONS(altered_table)->encrypted;
+            /* Encryption changes mid-table aren't safe to flip via inplace
+               alter -- existing rows are already encrypted (or not) with
+               the previous setting. We update the share for new-row
+               behavior consistency with the persisted DD, but the on-disk
+               state may now mix old and new rows. Document; a stricter
+               implementation would force COPY for encrypted-flag changes. */
+            share->encrypted = fresh_opts.encrypted;
             if (share->encrypted)
-                share->encryption_key_id =
-                    (uint)TDB_TABLE_OPTIONS(altered_table)->encryption_key_id;
+                share->encryption_key_id = (uint)fresh_opts.encryption_key_id;
         }
+
+        /* ENGINE_ATTRIBUTE-freeze fix: atomically replace share->cached_opts
+           with the freshly-computed values so subsequent TDB_TABLE_OPTIONS
+           readers (any connection that still holds this share open) see
+           the post-alter view rather than the pre-alter cache. We hold
+           lock_shared_ha_data, so no concurrent reader can be racing
+           against the swap -- but using exchange() preserves the
+           memory-ordering contract for the lock-free fast path. */
+        ha_table_option_struct *new_cached = new ha_table_option_struct(fresh_opts);
+        ha_table_option_struct *old_cached =
+            share->cached_opts.exchange(new_cached, std::memory_order_acq_rel);
+        delete old_cached;
     }
 
     /* We force a stats refresh on next info() call */

@@ -1,0 +1,54 @@
+# ============================================
+# CREATE without TTL, then ALTER to add TTL,
+# then INSERT and verify the new TTL applied.
+# ============================================
+CREATE TABLE t_alt_attr (
+id INT PRIMARY KEY,
+val VARCHAR(50)
+) ENGINE=TidesDB;
+INSERT INTO t_alt_attr VALUES (1, 'pre_alter_no_ttl');
+# Sanity: row visible.
+SELECT id, val FROM t_alt_attr ORDER BY id;
+id	val
+1	pre_alter_no_ttl
+# Add TTL=1 via inplace ALTER. SHOW CREATE TABLE should
+# reflect the new attribute.
+ALTER TABLE t_alt_attr ENGINE_ATTRIBUTE='{"ttl":1}';
+SHOW CREATE TABLE t_alt_attr;
+Table	Create Table
+t_alt_attr	CREATE TABLE `t_alt_attr` (
+  `id` int NOT NULL,
+  `val` varchar(50) DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci /*!80021 ENGINE_ATTRIBUTE='{"ttl": 1}' */
+# Insert a row that should pick up the new TTL.
+INSERT INTO t_alt_attr VALUES (2, 'post_alter_ttl_1');
+# Immediately visible.
+SELECT id, val FROM t_alt_attr ORDER BY id;
+id	val
+1	pre_alter_no_ttl
+2	post_alter_ttl_1
+# Wait 3s -- TTL=1 means row 2 should expire. Row 1 was
+# inserted before the ALTER and has no TTL (the engine's
+# TTL is applied at INSERT time from the then-current
+# share->default_ttl, so row 1 stays).
+SELECT id, val FROM t_alt_attr ORDER BY id;
+id	val
+1	pre_alter_no_ttl
+# ============================================
+# ALTER back to no TTL, verify subsequent INSERT
+# is NOT subject to TTL.
+# ============================================
+ALTER TABLE t_alt_attr ENGINE_ATTRIBUTE='{"ttl":0}';
+INSERT INTO t_alt_attr VALUES (3, 'post_alter_no_ttl');
+SELECT id, val FROM t_alt_attr ORDER BY id;
+id	val
+1	pre_alter_no_ttl
+3	post_alter_no_ttl
+SELECT id, val FROM t_alt_attr ORDER BY id;
+id	val
+1	pre_alter_no_ttl
+3	post_alter_no_ttl
+DROP TABLE t_alt_attr;
+#
+# Done.

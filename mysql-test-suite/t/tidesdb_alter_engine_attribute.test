@@ -1,0 +1,69 @@
+# Origin: architect's ENGINE_ATTRIBUTE-freeze constraint
+--source suite/tidesdb/include/have_tidesdb.inc
+#
+# Regression test: ALTER TABLE ... ENGINE_ATTRIBUTE='{...}' actually
+# takes effect at the engine level, not just at the data-dictionary
+# level. Pre-fix, the share's cached_opts pointer was populated at
+# first open() and never invalidated -- the new attribute persisted in
+# the DD (SHOW CREATE TABLE returned it) but the engine kept using the
+# old values for the share's lifetime.
+#
+# Fix (commit_inplace_alter_table CHANGE_CREATE_OPTION block):
+#   - compute fresh opts directly from altered_table's engine_attribute
+#     (bypassing TDB_TABLE_OPTIONS's share-cache fast path),
+#   - update share->default_ttl / isolation_level / encrypted from those
+#     fresh values, AND
+#   - atomic-swap share->cached_opts so any subsequent
+#     TDB_TABLE_OPTIONS(table) reader sees the post-alter view.
+#
+# We use TTL behavior as the observable signal because it's directly
+# exercised on each INSERT via compute_row_ttl(share->default_ttl).
+
+--echo # ============================================
+--echo # CREATE without TTL, then ALTER to add TTL,
+--echo # then INSERT and verify the new TTL applied.
+--echo # ============================================
+
+CREATE TABLE t_alt_attr (
+  id INT PRIMARY KEY,
+  val VARCHAR(50)
+) ENGINE=TidesDB;
+
+INSERT INTO t_alt_attr VALUES (1, 'pre_alter_no_ttl');
+
+--echo # Sanity: row visible.
+SELECT id, val FROM t_alt_attr ORDER BY id;
+
+--echo # Add TTL=1 via inplace ALTER. SHOW CREATE TABLE should
+--echo # reflect the new attribute.
+ALTER TABLE t_alt_attr ENGINE_ATTRIBUTE='{"ttl":1}';
+SHOW CREATE TABLE t_alt_attr;
+
+--echo # Insert a row that should pick up the new TTL.
+INSERT INTO t_alt_attr VALUES (2, 'post_alter_ttl_1');
+
+--echo # Immediately visible.
+SELECT id, val FROM t_alt_attr ORDER BY id;
+
+--echo # Wait 3s -- TTL=1 means row 2 should expire. Row 1 was
+--echo # inserted before the ALTER and has no TTL (the engine's
+--echo # TTL is applied at INSERT time from the then-current
+--echo # share->default_ttl, so row 1 stays).
+--sleep 3
+SELECT id, val FROM t_alt_attr ORDER BY id;
+
+--echo # ============================================
+--echo # ALTER back to no TTL, verify subsequent INSERT
+--echo # is NOT subject to TTL.
+--echo # ============================================
+
+ALTER TABLE t_alt_attr ENGINE_ATTRIBUTE='{"ttl":0}';
+INSERT INTO t_alt_attr VALUES (3, 'post_alter_no_ttl');
+SELECT id, val FROM t_alt_attr ORDER BY id;
+--sleep 3
+SELECT id, val FROM t_alt_attr ORDER BY id;
+
+DROP TABLE t_alt_attr;
+
+--echo #
+--echo # Done.
