@@ -41,6 +41,7 @@ extern "C"
 #include <unordered_set>
 #include <vector>
 
+#include "sql/item.h"  /* Item::val_bool() for ICP evaluation */
 #include "sql/key.h"
 #include "sql/sql_class.h"
 
@@ -85,6 +86,42 @@ static mysql_mutex_t last_conflict_mutex;
    sizeof() so the constant only appears here. */
 static constexpr size_t LAST_CONFLICT_INFO_LEN = 1024;
 static char last_conflict_info[LAST_CONFLICT_INFO_LEN] = "";
+
+/* Reader-writer lock protecting tidesdb_trx_t lifetime against the
+   deadlock-graph walker.
+ *
+ * The deadlock walker (tdb_lock_would_deadlock) traverses pointers to
+ * tidesdb_trx_t structs loaded atomically from lock entries. Each such
+ * pointer points to a connection's trx struct, which tidesdb_close_connection
+ * my_free()s when the connection closes -- without any prior synchronization
+ * with the walker. A walker that loaded the pointer just before the free
+ * would then dereference a freed struct (UAF).
+ *
+ * Resolution: walker takes the read lock for the duration of the walk;
+ * close_connection takes the write lock around my_free. Walks are fast and
+ * read locks compose freely; close_connection is rare. PSI key registered
+ * for performance schema visibility. */
+static mysql_rwlock_t g_trx_lifecycle_lock;
+static PSI_rwlock_key g_trx_lifecycle_lock_key;
+
+/* Mutex serializing FTS doc/word-counter read-modify-write sequences.
+ *
+ * fts_update_meta does a load -> mutate -> put on a single counter key
+ * inside the caller's transaction. Two concurrent writers each read the
+ * same pre-update value, each increment, both commit -- one increment
+ * is lost. BM25 ranking depends on these counters, so the loss is
+ * silent-but-progressive degradation of search relevance.
+ *
+ * This mutex serializes the RMW pair. Under SNAPSHOT or stronger
+ * isolation, TidesDB's commit-time conflict detection also catches
+ * concurrent writes to the same key, so the mutex narrows the race
+ * window enough that the second writer either sees the first writer's
+ * value (correct) or detects the conflict and retries (also correct).
+ * Under READ_COMMITTED the mutex still serializes the read+put pair
+ * but cannot make the load see a not-yet-committed write; documenting
+ * residual race -- moving accounting to in-memory deltas flushed at
+ * commit is the proper structural fix and tracked separately. */
+static mysql_mutex_t g_fts_meta_mutex;
 
 /*
   Map TidesDB library error codes to MySQL handler error codes.
@@ -323,16 +360,29 @@ static bool tdb_lock_would_deadlock(tidesdb_trx_t *requestor, tdb_row_lock_t *ta
 {
     /* Chain is requestor -> target_lock -> target_lock.owner_trx ->
        owner.waiting_on -> ... -- if we reach the requestor there's a cycle.
-       Depth capped at DEADLOCK_MAX_DEPTH to avoid pathological runs. */
+       Depth capped at DEADLOCK_MAX_DEPTH to avoid pathological runs.
+
+       Read-locking g_trx_lifecycle_lock prevents the trx structs we deref
+       (`cur->waiting_on`) from being my_free()d by a concurrent
+       tidesdb_close_connection between our atomic load of the pointer
+       and the subsequent dereference. Lock entries themselves are never
+       freed by design, so target_lock + cur_waiting are safe. */
+    mysql_rwlock_rdlock(&g_trx_lifecycle_lock);
     tidesdb_trx_t *cur = target_lock->owner_trx.load(std::memory_order_acquire);
+    bool found_cycle = false;
     for (int depth = 0; depth < DEADLOCK_MAX_DEPTH && cur; depth++)
     {
-        if (cur == requestor) return true; /* cycle */
+        if (cur == requestor)
+        {
+            found_cycle = true;
+            break;
+        }
         tdb_row_lock_t *cur_waiting = cur->waiting_on.load(std::memory_order_acquire);
         if (!cur_waiting) break; /* not currently waiting */
         cur = cur_waiting->owner_trx.load(std::memory_order_acquire);
     }
-    return false;
+    mysql_rwlock_unlock(&g_trx_lifecycle_lock);
+    return found_cycle;
 }
 
 /*
@@ -415,15 +465,32 @@ static int row_lock_acquire(tidesdb_trx_t *trx, const uchar *key, uint len, THD 
     /* Still owned -- wait for release.  kill_query wakes us by broadcasting
        on lock->cond; we re-check thd_killed() on every wake-up and bail
        with HA_ERR_LOCK_WAIT_TIMEOUT so the client sees a proper error
-       instead of hanging until the holder eventually commits. */
+       instead of hanging until the holder eventually commits.
+
+       We also re-run the deadlock detector on each wake-up: a new
+       wait-for cycle can form AFTER the initial pre-wait check (the
+       lock holder waited on something we now own, for example). Without
+       a re-check, that deadlock turns into a hang until lock_wait_timeout
+       rather than the proper ER_LOCK_DEADLOCK. */
     lock->waiters++;
     bool killed = false;
+    bool deadlock_in_wait = false;
     while (lock->owner_txn_id.load(std::memory_order_relaxed) != 0 &&
            lock->owner_trx.load(std::memory_order_relaxed) != trx)
     {
         if (thd && thd_killed(thd))
         {
             killed = true;
+            break;
+        }
+        /* Deadlock walker uses atomic loads only -- safe to call with
+           part->mutex held. We MUST re-publish waiting_on first so the
+           walker (running on another thread) sees the same wait
+           intention it saw before we entered cond_wait; the publish
+           happened on entry to row_lock_acquire and is still valid. */
+        if (tdb_lock_would_deadlock(trx, lock))
+        {
+            deadlock_in_wait = true;
             break;
         }
         mysql_cond_wait(&lock->cond, &part->mutex);
@@ -435,6 +502,11 @@ static int row_lock_acquire(tidesdb_trx_t *trx, const uchar *key, uint len, THD 
     {
         mysql_mutex_unlock(&part->mutex);
         return HA_ERR_LOCK_WAIT_TIMEOUT;
+    }
+    if (deadlock_in_wait)
+    {
+        mysql_mutex_unlock(&part->mutex);
+        return HA_ERR_LOCK_DEADLOCK;
     }
 
     /* We claim the lock */
@@ -670,10 +742,13 @@ static int fts_load_meta(tidesdb_txn_t *txn, tidesdb_column_family_t *data_cf, u
     return 0;
 }
 
-/* Update FTS metadata counters atomically within the current transaction. */
+/* Update FTS metadata counters atomically within the current transaction.
+   See g_fts_meta_mutex comment for the lost-update race this serializes. */
 static int fts_update_meta(tidesdb_txn_t *txn, tidesdb_column_family_t *data_cf, uint keynr,
                            int64_t delta_docs, int64_t delta_words)
 {
+    mysql_mutex_lock(&g_fts_meta_mutex);
+
     int64_t total_docs = 0, total_words = 0;
     fts_load_meta(txn, data_cf, keynr, &total_docs, &total_words);
 
@@ -690,8 +765,11 @@ static int fts_update_meta(tidesdb_txn_t *txn, tidesdb_column_family_t *data_cf,
     uchar mv[FTS_META_VALUE_LEN];
     int8store(mv, total_docs);
     int8store(mv + FTS_META_VALUE_WORDS_OFFSET, total_words);
-    return tidesdb_txn_put(txn, data_cf, mk, FTS_META_KEY_LEN, mv, FTS_META_VALUE_LEN,
-                           TIDESDB_TTL_NONE);
+    int rc = tidesdb_txn_put(txn, data_cf, mk, FTS_META_KEY_LEN, mv, FTS_META_VALUE_LEN,
+                             TIDESDB_TTL_NONE);
+
+    mysql_mutex_unlock(&g_fts_meta_mutex);
+    return rc;
 }
 
 /* Tokenize a text string using MariaDB's default FT parser.
@@ -1277,15 +1355,21 @@ static inline uint32_t double_to_lex_uint32(double val)
    Wikipedia pseudocode at https://en.wikipedia.org/wiki/Hilbert_curve.
    The literal (n - 1) is the standard reflection around the centre
    of an n-cell axis; rx and ry carry the binary quadrant flags from
-   the caller. */
-static inline void hilbert_rot(uint32_t n, uint32_t *x, uint32_t *y, uint32_t rx, uint32_t ry)
+   the caller.
+
+   `n` is uint64_t because the caller (hilbert_xy2d_64) needs to pass
+   2^32 on the first iteration of a 32-bit-per-axis curve, which doesn't
+   fit in uint32_t. The previous signature truncated 2^32 to 0 on the
+   first call, then computed `n - 1 = UINT32_MAX` causing every
+   high-bit input pair to encode wrong. */
+static inline void hilbert_rot(uint64_t n, uint32_t *x, uint32_t *y, uint32_t rx, uint32_t ry)
 {
     if (ry == 0)
     {
         if (rx == 1)
         {
-            *x = n - 1 - *x;
-            *y = n - 1 - *y;
+            *x = (uint32_t)(n - 1) - *x;
+            *y = (uint32_t)(n - 1) - *y;
         }
         uint32_t t = *x;
         *x = *y;
@@ -1308,7 +1392,10 @@ static uint64_t hilbert_xy2d_64(uint32_t x, uint32_t y)
         uint32_t rx = (x & s) > 0 ? 1 : 0;
         uint32_t ry = (y & s) > 0 ? 1 : 0;
         d += s * s * (uint64_t)((3 * rx) ^ ry);
-        hilbert_rot((uint32_t)s << 1, &x, &y, rx, ry);
+        /* s << 1 stays 64-bit; previous (uint32_t)s << 1 truncated the
+           top bit on the first iteration (s = 2^31 -> 0x80000000, shifted
+           left in uint32_t becomes 0). hilbert_rot now takes uint64_t n. */
+        hilbert_rot(s << 1, &x, &y, rx, ry);
     }
     return d;
 }
@@ -2016,7 +2103,15 @@ static MYSQL_SYSVAR_STR(data_home_dir, srv_data_home_dir, PLUGIN_VAR_RQCMDARG | 
    master key used by every encrypted CREATE TABLE. Read once at plugin
    init; if absent, missing, or wrong size, encryption stays unavailable
    and any CREATE TABLE ... ENGINE_ATTRIBUTE='{"encrypted":true}' fails
-   with a clear error. */
+   with a clear error.
+
+   Note on H-5 (review finding): we leave master_key_file visible in
+   SHOW VARIABLES because (a) operators legitimately need to verify
+   their encryption config, (b) MTR tests and tooling query it, and
+   (c) the path itself does not grant access -- file-system permissions
+   on the key file are the actual control. The S3 access/secret keys
+   are different: they are real credentials in plaintext, so they get
+   PLUGIN_VAR_NOSYSVAR (see below). */
 static char *srv_master_key_file = NULL;
 static MYSQL_SYSVAR_STR(master_key_file, srv_master_key_file,
                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
@@ -2049,12 +2144,19 @@ static char *srv_s3_prefix = NULL;
 static MYSQL_SYSVAR_STR(s3_prefix, srv_s3_prefix, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
                         "S3 key prefix (e.g. production/db1/)", NULL, NULL, NULL);
 
+/* S3 access + secret keys: NOSYSVAR so SHOW VARIABLES / SHOW GLOBAL
+   VARIABLES cannot disclose them to users with SYSTEM_VARIABLES_ADMIN.
+   Settable at startup (my.cnf / cmdline) only. */
 static char *srv_s3_access_key = NULL;
-static MYSQL_SYSVAR_STR(s3_access_key, srv_s3_access_key, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+static MYSQL_SYSVAR_STR(s3_access_key, srv_s3_access_key,
+                        PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY |
+                            PLUGIN_VAR_NOSYSVAR,
                         "S3 access key ID", NULL, NULL, NULL);
 
 static char *srv_s3_secret_key = NULL;
-static MYSQL_SYSVAR_STR(s3_secret_key, srv_s3_secret_key, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+static MYSQL_SYSVAR_STR(s3_secret_key, srv_s3_secret_key,
+                        PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY |
+                            PLUGIN_VAR_NOSYSVAR,
                         "S3 secret access key", NULL, NULL, NULL);
 
 static char *srv_s3_region = NULL;
@@ -2153,6 +2255,30 @@ static char *srv_backup_dir = NULL;
       to copy the input into save via thd->strmake; we must do that here
       since we're overriding the default check.
 */
+/* Lexical safety check for backup / checkpoint destination paths.
+   Rejects any path that is not absolute, or that contains a `..`
+   component. This prevents the trivial path-traversal escape (a DBA
+   with SYSTEM_VARIABLES_ADMIN setting `tidesdb_backup_dir = '../../etc'`
+   to copy data files outside the intended location).
+
+   This is lexical only -- a sufficiently privileged operator can still
+   choose any absolute path the `mysql` OS user can write. True
+   confinement requires an operator-configured allowed-root sysvar
+   (future work). Symlink-following escapes are out of scope here. */
+static bool tdb_path_is_safe(const char *path)
+{
+    if (!path || path[0] != '/') return false; /* absolute only */
+    const char *p = path;
+    while ((p = strstr(p, "..")) != nullptr)
+    {
+        bool prev_is_boundary = (p == path || p[-1] == '/');
+        bool next_is_boundary = (p[2] == '\0' || p[2] == '/');
+        if (prev_is_boundary && next_is_boundary) return false;
+        p += 2;
+    }
+    return true;
+}
+
 static int tidesdb_backup_dir_check(THD *thd, SYS_VAR *, void *save,
                                     struct st_mysql_value *value)
 {
@@ -2167,6 +2293,15 @@ static int tidesdb_backup_dir_check(THD *thd, SYS_VAR *, void *save,
         return 0;
     }
 
+    if (!tdb_path_is_safe(new_dir))
+    {
+        my_printf_error(ER_UNKNOWN_ERROR,
+                        "[TIDESDB] Backup path must be absolute and free of "
+                        "'..' components: '%s' rejected",
+                        MYF(0), new_dir);
+        return 1;
+    }
+
     if (!tdb_get_engine())
     {
         my_error(ER_UNKNOWN_ERROR, MYF(0), "TidesDB is not open");
@@ -2174,7 +2309,16 @@ static int tidesdb_backup_dir_check(THD *thd, SYS_VAR *, void *save,
     }
 
     /* Free the calling connection's TidesDB transaction before backup.
-       tidesdb_backup() waits for all open transactions to drain. */
+       tidesdb_backup() waits for all open transactions to drain.
+
+       Thread-safety note (responding to a flagged review concern):
+       `thd` here is the *issuing* THD -- the same thread that ran
+       SET GLOBAL tidesdb_backup_dir=... and is now executing this
+       check callback synchronously. MySQL's sysvar machinery does not
+       hop threads, so reading and mutating `trx->txn` is purely
+       thread-local; there is no concurrent reader/writer on the same
+       trx. Any other connection's DML touches its own thd_get_ha_data
+       slot, not this one. */
     {
         tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, tidesdb_hton);
         if (trx && trx->txn)
@@ -2244,6 +2388,15 @@ static int tidesdb_checkpoint_dir_check(THD *, SYS_VAR *, void *save,
     {
         *static_cast<const char **>(save) = NULL;
         return 0;
+    }
+
+    if (!tdb_path_is_safe(new_dir))
+    {
+        my_printf_error(ER_UNKNOWN_ERROR,
+                        "[TIDESDB] Checkpoint path must be absolute and free of "
+                        "'..' components: '%s' rejected",
+                        MYF(0), new_dir);
+        return 1;
     }
 
     if (!tdb_get_engine())
@@ -2437,7 +2590,16 @@ static bool tidesdb_engine_attribute_to_options(LEX_CSTRING attr,
     if (!attr.str || attr.length == 0) return true;  /* nothing supplied */
 
     rapidjson::Document doc;
-    doc.Parse(attr.str, attr.length);
+    /* Iterative parser: rapidjson's default recursive-descent parses up
+       to 500 nesting levels deep, which on a debug-build mysqld is enough
+       to overflow the stack from a single deeply-nested
+       ENGINE_ATTRIBUTE='{"a":{"a":{...}}}' table option. The
+       kParseIterativeFlag uses an internal stack on the heap with no
+       depth limit risk, only memory cost. ENGINE_ATTRIBUTE is persisted
+       in the MySQL data dictionary and reloaded on every OPEN TABLE,
+       so a single CREATE TABLE with a malicious attribute would crash
+       mysqld on every subsequent connection until the table is dropped. */
+    doc.Parse<rapidjson::kParseIterativeFlag>(attr.str, attr.length);
     if (doc.HasParseError() || !doc.IsObject()) return false;
 
     auto get_uint = [&](const char *k, ulonglong &dst) {
@@ -3189,7 +3351,16 @@ static int tidesdb_close_connection(handlerton *, THD *thd)
             tidesdb_txn_rollback(trx->txn);
             tidesdb_txn_free(trx->txn);
         }
+        /* Take the trx-lifecycle write-lock around my_free so any
+           in-flight deadlock walker (which holds the read-lock for the
+           duration of its walk) cannot dereference this struct after
+           it's freed. row_locks_release_all already cleared the lock
+           table's owner_trx pointers atomically, so no new walker can
+           reach `trx` after we get the write-lock; the write-lock
+           guarantees no existing walker is still mid-deref. */
+        mysql_rwlock_wrlock(&g_trx_lifecycle_lock);
         my_free(trx);
+        mysql_rwlock_unlock(&g_trx_lifecycle_lock);
         thd_set_ha_data(thd, tidesdb_hton, NULL);
     }
     return 0;
@@ -3885,6 +4056,14 @@ static int tidesdb_init_func(void *p)
         }
     }
 
+    /* Initialize trx-lifecycle rwlock (see g_trx_lifecycle_lock comment
+       for the UAF it protects against). */
+    mysql_rwlock_init(g_trx_lifecycle_lock_key, &g_trx_lifecycle_lock);
+
+    /* Initialize FTS-meta serialization mutex (see g_fts_meta_mutex
+       comment for the lost-update race). */
+    mysql_mutex_init(0, &g_fts_meta_mutex, MY_MUTEX_INIT_FAST);
+
     /* Initialize FTS stop word set with defaults */
     mysql_rwlock_init(tdb_stopword_lock_key, &tdb_stopword_lock);
     tdb_load_default_stopwords();
@@ -4144,6 +4323,8 @@ static int tidesdb_deinit_func(void *p)
     }
 
     mysql_mutex_destroy(&last_conflict_mutex);
+    mysql_mutex_destroy(&g_fts_meta_mutex);
+    mysql_rwlock_destroy(&g_trx_lifecycle_lock);
     mysql_rwlock_destroy(&tdb_stopword_lock);
     mysql_rwlock_destroy(&tdb_blend_lock);
     tdb_stopwords.clear();
@@ -4687,9 +4868,10 @@ bool ha_tidesdb::decode_sort_key_part(const uint8_t *src, uint sort_len, Field *
   the expensive PK point-lookup (InnoDB pattern).
 
   Decodes the index key column values and PK column values from the
-  comparable-format index key into the record buffer, then calls
-  handler_index_cond_check() which evaluates the pushed condition,
-  checks end_range, and handles THD kill signals.
+  comparable-format index key into the record buffer, then evaluates
+  the pushed condition (pushed_idx_cond->val_bool), end_range, and
+  THD kill state inline -- replacing an old MariaDB-port stub that
+  did none of these checks.
 
   Supports integer types, DATE, DATETIME, TIMESTAMP, YEAR, and
   fixed-length CHAR/BINARY (binary/latin1 charset) via
@@ -4794,9 +4976,27 @@ check_result_t ha_tidesdb::icp_check_secondary(const uint8_t *ik, size_t iks, ui
         }
     }
 
-    /* Delegate to MariaDB's ICP evaluator which checks kill state,
-       end_range, and pushed_idx_cond->val_bool(). */
-    return handler_index_cond_check(this);
+    /* Evaluate the pushed condition.  Previously this delegated to a
+       MariaDB-only stub (handler_index_cond_check in tidesdb_compat.h)
+       that always returned 0, which the caller fell through as "accept"
+       -- meaning ICP was advertised via HA_DO_INDEX_COND_PUSHDOWN but
+       did no filtering and did no end_range checking. With
+       in_range_check_pushed_down=true (set in idx_cond_push), MySQL
+       trusts the engine to honor both -- so the old behavior could
+       return rows past the upper bound on secondary-index range scans.
+       Now: real evaluation.
+
+       Order matches MySQL's handler_index_cond_check_icp() in
+       sql/handler.cc:7929 (8.0+) -- kill check first, then end_range,
+       then the pushed condition. */
+    THD *thd_local = ha_thd();
+    if (thd_local && thd_killed(thd_local)) return CHECK_NEG;
+
+    if (end_range && compare_key_icp(end_range) > 0) return CHECK_OUT_OF_RANGE;
+
+    if (!pushed_idx_cond->val_bool()) return CHECK_NEG;
+
+    return CHECK_POS;
 }
 
 /* ******************** Counter recovery ******************** */

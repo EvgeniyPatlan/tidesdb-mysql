@@ -709,11 +709,12 @@ class ha_tidesdb : public handler
 
     /* Evaluate pushed index condition on a secondary-index entry before
        the expensive PK point-lookup.  Decodes the index key columns into
-       buf and calls handler_index_cond_check().
-       Returns CHECK_POS                -- condition satisfied, proceed with PK lookup
-               CHECK_NEG                -- condition not satisfied, skip this entry
-               CHECK_OUT_OF_RANGE       -- past end of scan range
-               CHECK_ABORTED_BY_USER    -- query killed */
+       buf and evaluates pushed_idx_cond->val_bool() inline (replacing the
+       old MariaDB-port handler_index_cond_check() stub which did no
+       filtering and no end_range check).
+       Returns CHECK_POS          -- condition satisfied, proceed with PK lookup
+               CHECK_NEG          -- condition not satisfied, skip this entry
+               CHECK_OUT_OF_RANGE -- past end of scan range */
     check_result_t icp_check_secondary(const uint8_t *ik, size_t iks, uint idx, uchar *buf);
 
     /* Reverse a single integer sort-key part back to native little-endian

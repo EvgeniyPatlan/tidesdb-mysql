@@ -203,8 +203,14 @@ enum thd_kill_levels {
 };
 #endif
 
-/* MariaDB-only handler_index_cond_check pushdown helper. Stub. */
-inline int handler_index_cond_check(void * /*opaque*/) { return 0; }
+/* (deleted) The old MariaDB-port stub `handler_index_cond_check(void *)`
+ * lived here returning a constant 0. With HA_DO_INDEX_COND_PUSHDOWN
+ * advertised in index_flags and in_range_check_pushed_down=true in
+ * idx_cond_push(), MySQL trusts the engine to filter AND honor
+ * end_range; the stub did neither, so secondary-index range scans
+ * could leak rows past end_range and through pushed conditions. ICP
+ * evaluation is now inline in ha_tidesdb::icp_check_secondary in
+ * ha_tidesdb.cc (kill check + compare_key_icp + pushed_idx_cond->val_bool). */
 
 /* MariaDB exposes LOCK_global_system_variables; MySQL doesn't expose it as
  * a global symbol but engines can use mysql_mutex_t. Provide an inline
