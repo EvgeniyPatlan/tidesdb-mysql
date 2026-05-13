@@ -133,14 +133,32 @@ bool tidesdb_master_key_load_from_file(const char *path) {
     return false;
 }
 
+/* tidesdb_master_key_clear -- TEST-ONLY.
+ *
+ * MF-5 contract documentation: this function is NOT a runtime key
+ * revocation primitive. After this returns, the global g_master_key
+ * buffer is zeroed and g_master_key_loaded is false, but per-thread
+ * TLS copies in encryption_key_get (the M-8 cache) are NOT
+ * synchronously cleared -- they're invalidated lazily, on each
+ * thread's next encryption_key_get call. A worker thread that holds
+ * a TLS copy and goes idle (never calls again) retains the plaintext
+ * 32-byte key in its TLS region indefinitely.
+ *
+ * For production key rotation we would need either:
+ *   (a) Broadcast a flush signal that every worker checks between
+ *       row operations and explicit-bzero its TLS copy, or
+ *   (b) Eliminate the TLS cache entirely and take the mutex on every
+ *       call (regresses M-8's per-row mutex elimination).
+ *
+ * Neither is implemented today. This function exists for the
+ * tidesdb_encryption MTR test's setup/teardown. Use of this function
+ * from any non-test path is a bug. */
 void tidesdb_master_key_clear() {
     std::lock_guard<std::mutex> lock(g_master_key_mu);
     memset(g_master_key, 0, sizeof(g_master_key));
     g_master_key_loaded.store(false, std::memory_order_release);
-    /* Bump generation so TLS caches invalidate. Threads that already
-       had the old key cached and call encryption_key_get again will
-       see the generation mismatch, take the mutex, re-check loaded
-       (now false), and return -1. */
+    /* Bump generation so TLS caches invalidate on next access. See
+       the contract block above for the residual exposure window. */
     g_master_key_gen.fetch_add(1, std::memory_order_acq_rel);
 }
 

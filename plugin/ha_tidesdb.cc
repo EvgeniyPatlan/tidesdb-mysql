@@ -78,6 +78,10 @@ struct ha_field_option_struct;
 static ha_table_option_struct *tidesdb_opts_for_table(const TABLE *table);
 #define TDB_TABLE_OPTIONS(tbl)    tidesdb_opts_for_table(tbl)
 #define TDB_INDEX_OPTIONS(keyref) (static_cast<ha_index_option_struct *>(nullptr))
+
+/* Forward declaration for MF-6 log sanitizer; defined alongside the
+   path validation helpers later in the file. */
+static void tdb_sanitize_for_log(const char *in, char *out, size_t out_size);
 #define TDB_FIELD_OPTIONS(fldref) (static_cast<ha_field_option_struct *>(nullptr))
 
 /* Forward-declared for tdb_rc_to_ha(); defined with sysvars below */
@@ -104,7 +108,25 @@ static char last_conflict_info[LAST_CONFLICT_INFO_LEN] = "";
  * Resolution: walker takes the read lock for the duration of the walk;
  * close_connection takes the write lock around my_free. Walks are fast and
  * read locks compose freely; close_connection is rare. PSI key registered
- * for performance schema visibility. */
+ * for performance schema visibility.
+ *
+ * MF-4 lock-order invariant (DO NOT VIOLATE):
+ *
+ *   acquisition order:  partition->mutex  ->  g_trx_lifecycle_lock
+ *
+ * The H-1 deadlock re-check inside row_lock_acquire's cond_wait loop
+ * calls tdb_lock_would_deadlock while holding part->mutex. The walker
+ * then takes g_trx_lifecycle_lock as a read-lock. tidesdb_close_connection
+ * takes the write-lock around my_free WITHOUT holding any partition
+ * mutex (row_locks_release_all has already run and released them).
+ * As long as no code path acquires part->mutex while holding the
+ * write-side of g_trx_lifecycle_lock, there is no cycle.
+ *
+ * Future maintainers: if you add a partition-mutex acquisition inside
+ * tidesdb_close_connection, OR add code that runs under the write-side
+ * of this rwlock and touches partition mutexes, you have created a
+ * deadlock. Move row_locks_release_all earlier, or restructure to
+ * release the rwlock before touching partitions. */
 static mysql_rwlock_t g_trx_lifecycle_lock;
 static PSI_rwlock_key g_trx_lifecycle_lock_key;
 
@@ -890,11 +912,18 @@ static bool tdb_load_stopwords_from_table_spec_into(const char *table_spec,
 {
     if (!table_spec || !table_spec[0]) return false;
 
+    /* MF-6: sanitize the user-supplied spec for every log line below.
+       SET GLOBAL tidesdb_ft_stopword_table=... accepts arbitrary
+       strings; an attacker with SYSTEM_VARIABLES_ADMIN could embed
+       newlines / escape sequences and fool the error log parser. */
+    char sanitized_spec[256];
+    tdb_sanitize_for_log(table_spec, sanitized_spec, sizeof(sanitized_spec));
+
     const char *slash = strchr(table_spec, '/');
     if (!slash)
     {
         sql_print_error("[TIDESDB] ft_stopword_table format must be 'db_name/table_name', got '%s'",
-                        table_spec);
+                        sanitized_spec);
         return false;
     }
 
@@ -925,7 +954,7 @@ static bool tdb_load_stopwords_from_table_spec_into(const char *table_spec,
         sql_print_warning(
             "[TIDESDB] Stop word table load denied: no user security "
             "context (table_spec='%s')",
-            table_spec);
+            sanitized_spec);
         return false;
     }
     Security_context *sctx = cur_thd->security_context();
@@ -933,12 +962,17 @@ static bool tdb_load_stopwords_from_table_spec_into(const char *table_spec,
        We deny when it returns false. */
     if (!sctx->check_access(SELECT_ACL, db_name, false))
     {
+        /* db_name is derived from table_spec; sanitize it for the log
+           the same way (the db_name string is small enough we use a
+           local buffer). */
+        char sanitized_db[256];
+        tdb_sanitize_for_log(db_name.c_str(), sanitized_db, sizeof(sanitized_db));
         sql_print_warning(
             "[TIDESDB] Stop word table load denied: user '%s'@'%s' lacks "
             "SELECT on database '%s'. Refusing to load stop words from '%s'.",
             sctx->priv_user().str ? sctx->priv_user().str : "?",
             sctx->priv_host().str ? sctx->priv_host().str : "?",
-            db_name.c_str(), table_spec);
+            sanitized_db, sanitized_spec);
         return false;
     }
 
@@ -954,10 +988,12 @@ static bool tdb_load_stopwords_from_table_spec_into(const char *table_spec,
 
     if (!sw_cf)
     {
+        char sanitized_cf[256];
+        tdb_sanitize_for_log(cf_name.c_str(), sanitized_cf, sizeof(sanitized_cf));
         sql_print_warning(
             "[TIDESDB] Stop word table '%s' not found as TidesDB CF '%s'. "
             "The table must be a TidesDB ENGINE table. Keeping current stop words.",
-            table_spec, cf_name.c_str());
+            sanitized_spec, sanitized_cf);
         return false;
     }
 
@@ -1023,7 +1059,7 @@ static bool tdb_load_stopwords_from_table_spec_into(const char *table_spec,
     tidesdb_txn_free(txn);
 
     sql_print_information("[TIDESDB] Loaded %zu stop words from table '%s'", out.size(),
-                          table_spec);
+                          sanitized_spec);
     return true;
 }
 
@@ -1223,8 +1259,13 @@ static void fts_tokenize(const char *text, size_t text_len, CHARSET_INFO *cs,
 static void fts_extract_and_tokenize(TABLE *table, const KEY *key_info, const uchar *record,
                                      CHARSET_INFO *cs, std::vector<fts_token_t> &out_tokens)
 {
-    static thread_local std::string *doc_buf = nullptr;
-    if (!doc_buf) doc_buf = new std::string();
+    /* MF-8: std::unique_ptr in thread_local storage. unique_ptr's
+       size is one pointer (fits the dlopen'd static-TLS budget that
+       broke the original `static thread_local std::string` attempt),
+       and its destructor runs at thread exit via __cxa_thread_atexit,
+       freeing the heap object. No more per-pooled-thread leak. */
+    static thread_local std::unique_ptr<std::string> doc_buf;
+    if (!doc_buf) doc_buf = std::make_unique<std::string>();
     std::string &doc = *doc_buf;
     doc.clear();
 
@@ -2357,6 +2398,33 @@ static MYSQL_SYSVAR_STR(backup_allowed_root, srv_backup_allowed_root,
                         "lexical no-'..' check.",
                         NULL, NULL, NULL);
 
+/* MF-6: sanitize untrusted strings before they reach the error log.
+   sql_print_* writes to stderr via vfprintf; embedded newlines or
+   ANSI escape sequences fool downstream log parsers / SIEM tools
+   into thinking the attacker's content is its own log line. Replace
+   any byte < 0x20 (control chars including newline / CR / NUL / ESC)
+   with '?'. Output is written to `out` (caller-provided fixed buffer)
+   and NUL-terminated; truncation is silent and accepted.
+
+   Used wherever a SYSTEM_VARIABLES_ADMIN-controlled value (path,
+   table_spec) is logged via %s. */
+static void tdb_sanitize_for_log(const char *in, char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return;
+    if (!in)
+    {
+        out[0] = '\0';
+        return;
+    }
+    size_t o = 0;
+    for (size_t i = 0; in[i] != '\0' && o + 1 < out_size; i++)
+    {
+        unsigned char c = (unsigned char)in[i];
+        out[o++] = (c < 0x20 || c == 0x7f) ? '?' : (char)c;
+    }
+    out[o] = '\0';
+}
+
 /* Lexical safety check for backup / checkpoint destination paths.
    Rejects any path that is not absolute, or that contains a `..`
    component. This prevents the trivial path-traversal escape (a DBA
@@ -2364,10 +2432,24 @@ static MYSQL_SYSVAR_STR(backup_allowed_root, srv_backup_allowed_root,
    to copy data files outside the intended location).
 
    For symlink-redirect attacks, callers should additionally call
-   tdb_path_is_under_allowed_root() AFTER this check passes. */
-static bool tdb_path_is_safe(const char *path)
+   tdb_path_is_under_allowed_root() AFTER this check passes.
+
+   MF-7: explicit null-byte rejection. strlen() already stops at the
+   first '\0' so an attacker-supplied path with a payload after a null
+   is already truncated, but we reject defensively in case a future
+   length-aware consumer is added. */
+static bool tdb_path_is_safe(const char *path, size_t len)
 {
     if (!path || path[0] != '/') return false; /* absolute only */
+    /* If the SQL layer surfaced a length, reject any embedded null
+       within it. When len == 0 we fall back to strlen() semantics. */
+    if (len > 0)
+    {
+        for (size_t i = 0; i < len; i++)
+        {
+            if (path[i] == '\0') return false;
+        }
+    }
     const char *p = path;
     while ((p = strstr(p, "..")) != nullptr)
     {
@@ -2445,12 +2527,18 @@ static int tidesdb_backup_dir_check(THD *thd, SYS_VAR *, void *save,
         return 0;
     }
 
-    if (!tdb_path_is_safe(new_dir))
+    /* MF-6: pre-sanitize the path for any log/error message we emit
+       below. Attacker-controlled strings via SET GLOBAL must not be
+       able to inject log lines via embedded newlines / escape codes. */
+    char sanitized_path[1024];
+    tdb_sanitize_for_log(new_dir, sanitized_path, sizeof(sanitized_path));
+
+    if (!tdb_path_is_safe(new_dir, (size_t)len))
     {
         my_printf_error(ER_UNKNOWN_ERROR,
                         "[TIDESDB] Backup path must be absolute and free of "
-                        "'..' components: '%s' rejected",
-                        MYF(0), new_dir);
+                        "'..' / NUL components: '%s' rejected",
+                        MYF(0), sanitized_path);
         return 1;
     }
 
@@ -2461,7 +2549,7 @@ static int tidesdb_backup_dir_check(THD *thd, SYS_VAR *, void *save,
         my_printf_error(ER_UNKNOWN_ERROR,
                         "[TIDESDB] Backup path '%s' is not under "
                         "tidesdb_backup_allowed_root",
-                        MYF(0), new_dir);
+                        MYF(0), sanitized_path);
         return 1;
     }
 
@@ -2514,9 +2602,9 @@ static int tidesdb_backup_dir_check(THD *thd, SYS_VAR *, void *save,
 
     if (rc != TDB_SUCCESS)
     {
-        sql_print_error("[TIDESDB] Backup to '%s' failed (err=%d)", backup_path.c_str(), rc);
+        sql_print_error("[TIDESDB] Backup to '%s' failed (err=%d)", sanitized_path, rc);
         my_printf_error(ER_UNKNOWN_ERROR, "[TIDESDB] Backup to '%s' failed (err=%d)",
-                        MYF(0), backup_path.c_str(), rc);
+                        MYF(0), sanitized_path, rc);
         return 1;  /* reject the SET; var keeps old value */
     }
 
@@ -2568,12 +2656,16 @@ static int tidesdb_checkpoint_dir_check(THD *thd, SYS_VAR *, void *save,
         return 0;
     }
 
-    if (!tdb_path_is_safe(new_dir))
+    /* MF-6: sanitize before logging. */
+    char sanitized_path[1024];
+    tdb_sanitize_for_log(new_dir, sanitized_path, sizeof(sanitized_path));
+
+    if (!tdb_path_is_safe(new_dir, (size_t)len))
     {
         my_printf_error(ER_UNKNOWN_ERROR,
                         "[TIDESDB] Checkpoint path must be absolute and free of "
-                        "'..' components: '%s' rejected",
-                        MYF(0), new_dir);
+                        "'..' / NUL components: '%s' rejected",
+                        MYF(0), sanitized_path);
         return 1;
     }
 
@@ -2583,7 +2675,7 @@ static int tidesdb_checkpoint_dir_check(THD *thd, SYS_VAR *, void *save,
         my_printf_error(ER_UNKNOWN_ERROR,
                         "[TIDESDB] Checkpoint path '%s' is not under "
                         "tidesdb_backup_allowed_root",
-                        MYF(0), new_dir);
+                        MYF(0), sanitized_path);
         return 1;
     }
 
@@ -2609,9 +2701,9 @@ static int tidesdb_checkpoint_dir_check(THD *thd, SYS_VAR *, void *save,
 
     if (rc != TDB_SUCCESS)
     {
-        sql_print_error("[TIDESDB] Checkpoint to '%s' failed (err=%d)", ckpt_path.c_str(), rc);
+        sql_print_error("[TIDESDB] Checkpoint to '%s' failed (err=%d)", sanitized_path, rc);
         my_printf_error(ER_UNKNOWN_ERROR, "[TIDESDB] Checkpoint to '%s' failed (err=%d)",
-                        MYF(0), ckpt_path.c_str(), rc);
+                        MYF(0), sanitized_path, rc);
         return 1;
     }
 
@@ -2785,9 +2877,25 @@ struct ha_table_option_struct
  *
  * Returns true on parse success (empty / NULL attr is also success — no
  * overrides). False on malformed JSON; *opts is left as the caller seeded. */
+/* MF-3: hard cap on ENGINE_ATTRIBUTE length. The H-9 fix removed the
+   recursion depth crash but the iterative parser still allocates
+   O(depth) heap on the persisted attribute, reloaded on every
+   OPEN TABLE. Cap at 64KB -- legitimate options are under 1KB; this
+   is generous defense against a CREATE TABLE storing a malicious
+   attribute that exhausts memory on every open. */
+static constexpr size_t TIDESDB_ENGINE_ATTRIBUTE_MAX_LEN = 65536;
+
 static bool tidesdb_engine_attribute_to_options(LEX_CSTRING attr,
                                                 ha_table_option_struct *opts) {
     if (!attr.str || attr.length == 0) return true;  /* nothing supplied */
+
+    if (attr.length > TIDESDB_ENGINE_ATTRIBUTE_MAX_LEN) {
+        sql_print_warning("[TIDESDB] ENGINE_ATTRIBUTE too large (%zu bytes, "
+                          "max %zu); using session defaults",
+                          (size_t)attr.length,
+                          TIDESDB_ENGINE_ATTRIBUTE_MAX_LEN);
+        return false;
+    }
 
     rapidjson::Document doc;
     /* Iterative parser: rapidjson's default recursive-descent parses up
@@ -2798,7 +2906,8 @@ static bool tidesdb_engine_attribute_to_options(LEX_CSTRING attr,
        depth limit risk, only memory cost. ENGINE_ATTRIBUTE is persisted
        in the MySQL data dictionary and reloaded on every OPEN TABLE,
        so a single CREATE TABLE with a malicious attribute would crash
-       mysqld on every subsequent connection until the table is dropped. */
+       mysqld on every subsequent connection until the table is dropped.
+       Combined with the length cap above, the worst case is bounded. */
     doc.Parse<rapidjson::kParseIterativeFlag>(attr.str, attr.length);
     if (doc.HasParseError() || !doc.IsObject()) return false;
 
@@ -2914,10 +3023,16 @@ static ha_table_option_struct *tidesdb_opts_for_table(const TABLE *table) {
        cache, return its stable pointer. No JSON re-parse, no THDVAR
        loops, no aliased thread-local storage. The share's cached_opts
        is filled exactly once during open() before any TDB_TABLE_OPTIONS
-       call sites run; see ha_tidesdb::open. */
+       call sites run; see ha_tidesdb::open.
+
+       MF-1: atomic acquire-load. Non-null implies the pointee is fully
+       initialized -- the writer in open() constructs and computes the
+       struct contents BEFORE the atomic release-store. */
     if (table->s->ha_share) {
         TidesDB_share *sh = static_cast<TidesDB_share *>(table->s->ha_share);
-        if (sh->cached_opts_valid && sh->cached_opts) return sh->cached_opts;
+        ha_table_option_struct *cached =
+            sh->cached_opts.load(std::memory_order_acquire);
+        if (cached) return cached;
     }
 
     /* Fallback for paths where the share is not yet populated (CREATE
@@ -3181,8 +3296,13 @@ TidesDB_share::TidesDB_share()
 
 TidesDB_share::~TidesDB_share()
 {
-    delete cached_opts;
-    cached_opts = nullptr;
+    /* No concurrent readers possible by share-destruction time: MySQL
+       guarantees no handler holds the share when the share is freed.
+       Plain load is fine here. */
+    ha_table_option_struct *opts =
+        cached_opts.load(std::memory_order_relaxed);
+    delete opts;
+    cached_opts.store(nullptr, std::memory_order_relaxed);
     mysql_mutex_destroy(&fts_meta_mutex);
 }
 
@@ -4363,28 +4483,27 @@ static int tidesdb_init_func(void *p)
             DBUG_RETURN(1);
         }
 
+        /* L-4 + MF-2: redact endpoint/bucket in BOTH success and
+           failure logs. The original L-4 fix only covered the success
+           log; the follow-up review flagged that the failure path at
+           the error site below still leaked the raw values. Hoist the
+           redactor here so both sites use it. */
+        auto redact = [](const char *s) -> const char * {
+            if (!s || !s[0]) return "(unset)";
+            return "***";
+        };
+
         objstore_connector = tidesdb_objstore_s3_create(
             srv_s3_endpoint, srv_s3_bucket, srv_s3_prefix, srv_s3_access_key, srv_s3_secret_key,
             srv_s3_region, srv_s3_use_ssl ? 1 : 0, srv_s3_path_style ? 1 : 0);
 
         if (!objstore_connector)
         {
-            sql_print_error("[TIDESDB] Failed to create S3 connector for %s/%s", srv_s3_endpoint,
-                            srv_s3_bucket);
+            sql_print_error("[TIDESDB] Failed to create S3 connector for %s/%s",
+                            redact(srv_s3_endpoint), redact(srv_s3_bucket));
             DBUG_RETURN(1);
         }
 
-        /* L-4: log only redacted identifiers, not full endpoint/bucket
-           names. Error logs commonly forward to centralized aggregators
-           (CloudWatch / ELK / SIEM); leaking the bucket name alongside
-           an access key (readable through any privileged process or any
-           stack trace pre-fix) significantly lowers the bar for a
-           targeted S3 attack. Operators who need the full values can
-           read them from my.cnf where they were configured. */
-        auto redact = [](const char *s) -> const char * {
-            if (!s || !s[0]) return "(unset)";
-            return "***";
-        };
         sql_print_information("[TIDESDB] S3 connector created (endpoint=%s, bucket=%s, ssl=%s)",
                               redact(srv_s3_endpoint), redact(srv_s3_bucket),
                               srv_s3_use_ssl ? "yes" : "no");
@@ -5357,6 +5476,28 @@ int ha_tidesdb::open(const char *name, int mode, uint test_if_locked, const dd::
 
     if (!(share = get_share())) DBUG_RETURN(1);
 
+    /* MF-1 + MF-9 fix: populate the share's ENGINE_ATTRIBUTE option
+       cache. The expensive compute (25+ THDVAR reads + rapidjson Parse)
+       runs OUTSIDE lock_shared_ha_data() to avoid serializing
+       concurrent first-opens behind one thread doing the JSON parse.
+       Atomic publish via cached_opts.store(release) -- if two threads
+       race, the loser deletes its duplicate. MF-1 atomicity: subsequent
+       TDB_TABLE_OPTIONS readers (no lock) see a fully-initialized
+       pointee on any non-null acquire-load. */
+    if (!share->cached_opts.load(std::memory_order_acquire))
+    {
+        ha_table_option_struct *fresh = new ha_table_option_struct();
+        tidesdb_compute_opts_for_table(table, fresh);
+        ha_table_option_struct *expected = nullptr;
+        if (!share->cached_opts.compare_exchange_strong(
+                expected, fresh, std::memory_order_release,
+                std::memory_order_acquire))
+        {
+            /* Another thread won the race; discard our duplicate. */
+            delete fresh;
+        }
+    }
+
     /*
       We resolve CF pointers only once (first open).  Subsequent opens by
       other connections reuse the already-resolved share.  We hold
@@ -5364,17 +5505,6 @@ int ha_tidesdb::open(const char *name, int mode, uint test_if_locked, const dd::
       racing on the shared vectors.
     */
     lock_shared_ha_data();
-
-    /* M-1 + M-13: populate the share's ENGINE_ATTRIBUTE option cache
-       once per share. Subsequent TDB_TABLE_OPTIONS(table) calls (5+
-       just in this open() body) read directly from share->cached_opts
-       instead of seeding session vars + re-parsing JSON each time. */
-    if (!share->cached_opts_valid)
-    {
-        share->cached_opts = new ha_table_option_struct();
-        tidesdb_compute_opts_for_table(table, share->cached_opts);
-        share->cached_opts_valid = true;
-    }
 
     if (!share->cf)
     {
@@ -6397,8 +6527,10 @@ int ha_tidesdb::write_row(uchar *buf)
                     std::vector<fts_token_t> tokens;
                     std::unordered_map<std::string, uint16> tf_map;
                 };
-                static thread_local WriteRowFtsScratch *fts_scratch = nullptr;
-                if (!fts_scratch) fts_scratch = new WriteRowFtsScratch();
+                /* MF-8: std::unique_ptr -- destructor runs at thread
+                   exit (__cxa_thread_atexit) so no pooled-thread leak. */
+                static thread_local std::unique_ptr<WriteRowFtsScratch> fts_scratch;
+                if (!fts_scratch) fts_scratch = std::make_unique<WriteRowFtsScratch>();
                 auto &fts_tokens = fts_scratch->tokens;
                 auto &tf_map = fts_scratch->tf_map;
                 fts_tokens.clear();
@@ -7531,8 +7663,9 @@ int ha_tidesdb::update_row(const uchar *old_data, uchar *new_data)
                     std::unordered_map<std::string, uint16> old_tf;
                     std::unordered_map<std::string, uint16> new_tf;
                 };
-                static thread_local UpdateRowFtsScratch *upd_fts_scratch = nullptr;
-                if (!upd_fts_scratch) upd_fts_scratch = new UpdateRowFtsScratch();
+                /* MF-8: std::unique_ptr cleans up at thread exit. */
+                static thread_local std::unique_ptr<UpdateRowFtsScratch> upd_fts_scratch;
+                if (!upd_fts_scratch) upd_fts_scratch = std::make_unique<UpdateRowFtsScratch>();
                 auto &old_tokens = upd_fts_scratch->old_tokens;
                 auto &new_tokens = upd_fts_scratch->new_tokens;
                 auto &old_tf = upd_fts_scratch->old_tf;
@@ -7867,8 +8000,9 @@ int ha_tidesdb::delete_row(const uchar *buf)
                     std::vector<fts_token_t> tokens;
                     std::unordered_map<std::string, uint16> tf_map;
                 };
-                static thread_local DeleteRowFtsScratch *del_fts_scratch = nullptr;
-                if (!del_fts_scratch) del_fts_scratch = new DeleteRowFtsScratch();
+                /* MF-8: std::unique_ptr cleans up at thread exit. */
+                static thread_local std::unique_ptr<DeleteRowFtsScratch> del_fts_scratch;
+                if (!del_fts_scratch) del_fts_scratch = std::make_unique<DeleteRowFtsScratch>();
                 auto &fts_tokens = del_fts_scratch->tokens;
                 auto &tf_map = del_fts_scratch->tf_map;
                 fts_tokens.clear();
@@ -8127,7 +8261,14 @@ int ha_tidesdb::end_bulk_insert()
     in_bulk_insert_ = false;
 
     /* M-4: flush buffered FTS meta deltas. One RMW per FTS key with
-       non-zero delta (vs one RMW per row pre-fix). */
+       non-zero delta (vs one RMW per row pre-fix).
+       MF-10: capture and propagate the first non-zero rc. We still
+       try to flush the rest -- a per-key meta failure shouldn't strand
+       a different key's accumulated delta -- but we surface the error
+       so the SQL layer rolls back the bulk insert. Without this, a
+       meta-flush failure was silently swallowed and the statement
+       appeared to succeed. */
+    int sticky_rc = 0;
     if (table && table->s && share && stmt_txn)
     {
         uint nkeys = table->s->keys;
@@ -8136,14 +8277,18 @@ int ha_tidesdb::end_bulk_insert()
             if (fts_meta_doc_delta_[i] == 0 && fts_meta_word_delta_[i] == 0)
                 continue;
             if (!share->idx_is_fts[i]) continue;
-            fts_update_meta(share, stmt_txn, share->cf, i,
-                            fts_meta_doc_delta_[i],
-                            fts_meta_word_delta_[i]);
+            int rc = fts_update_meta(share, stmt_txn, share->cf, i,
+                                     fts_meta_doc_delta_[i],
+                                     fts_meta_word_delta_[i]);
+            if (rc != 0 && sticky_rc == 0)
+            {
+                sticky_rc = tdb_rc_to_ha(rc, "end_bulk_insert FTS meta flush");
+            }
             fts_meta_doc_delta_[i] = 0;
             fts_meta_word_delta_[i] = 0;
         }
     }
-    return 0;
+    return sticky_rc;
 }
 
 /*

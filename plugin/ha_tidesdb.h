@@ -402,19 +402,21 @@ class TidesDB_share : public Handler_share
        0 = not yet computed, use heuristic; >0 = sampled value. */
     std::atomic<ulong> cached_rec_per_key[MAX_KEY];
 
-    /* Cached parsed ENGINE_ATTRIBUTE table options (M-1 + M-13 fix).
-       Populated once at open() time; the rapidjson Parse and the 25+
-       THDVAR reads in tidesdb_seed_opts_from_session run exactly once
-       per share instead of per-call (open() alone makes 5+ calls). The
-       cache also gives every handler a stable pointer that does not
-       alias across nested calls (M-1: previously a single thread_local
-       struct was overwritten on every call).
+    /* Cached parsed ENGINE_ATTRIBUTE table options (M-1 + M-13 fix,
+       MF-1 atomicity fix). Populated once at open() time; the
+       rapidjson Parse and the 25+ THDVAR reads in
+       tidesdb_seed_opts_from_session run exactly once per share
+       instead of per-call (open() alone makes 5+ calls). The cache
+       also gives every handler a stable pointer that does not alias
+       across nested calls.
 
-       Held by raw pointer rather than by value because ha_table_option_struct
-       is defined in ha_tidesdb.cc only; the share header is included by
-       other plugin TUs. Allocated and freed by the share destructor. */
-    ha_table_option_struct *cached_opts{nullptr};
-    bool cached_opts_valid{false};
+       Held by `std::atomic<ha_table_option_struct *>` so the reader
+       at tidesdb_opts_for_table (no lock) and the writer at open()
+       (under lock_shared_ha_data()) are ordered correctly on weakly
+       memory-ordered ISAs (ARM/POWER). Non-null observed via
+       acquire-load means the pointee is fully initialized. The
+       writer publishes with release-store. */
+    std::atomic<ha_table_option_struct *> cached_opts{nullptr};
 
     /* Secondary index CFs (one per secondary key) */
     std::vector<tidesdb_column_family_t *> idx_cfs;

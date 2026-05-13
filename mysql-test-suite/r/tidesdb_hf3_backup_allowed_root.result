@@ -16,6 +16,6 @@ tidesdb_backup_dir
 tidesdb_checkpoint_dir
 # Lexical check still rejects '..' regardless of allowed_root.
 SET GLOBAL tidesdb_backup_dir = '/var/lib/../etc/sneaky';
-ERROR HY000: [TIDESDB] Backup path must be absolute and free of '..' components: '/var/lib/../etc/sneaky' rejected
+ERROR HY000: [TIDESDB] Backup path must be absolute and free of '..' / NUL components: '/var/lib/../etc/sneaky' rejected
 #
 # Done.
