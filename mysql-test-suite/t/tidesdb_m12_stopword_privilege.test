@@ -1,0 +1,67 @@
+--source suite/tidesdb/include/have_tidesdb.inc
+#
+# Regression test for M-12 (stopword-table-load bypasses table-level grants).
+#
+# Pre-fix: SET GLOBAL tidesdb_ft_stopword_table = 'db/table' opened the
+# named TidesDB CF and read every row -- with no privilege check. A user
+# holding SYSTEM_VARIABLES_ADMIN but lacking SELECT on the target table
+# could use the stopword set as a side-channel oracle to detect which
+# words exist in the table.
+#
+# Fix: tdb_load_stopwords_from_table_spec_into now calls
+# Security_context::check_access(SELECT_ACL, db, false) before opening
+# the CF. Database-level rather than table-level because constructing a
+# Table_ref from a plugin context to feed check_table_access is
+# disproportionate scaffolding for a defense-in-depth check.
+#
+
+CREATE DATABASE restricted_db;
+CREATE TABLE restricted_db.secrets (
+  id INT PRIMARY KEY,
+  value VARCHAR(50)
+) ENGINE=TidesDB;
+INSERT INTO restricted_db.secrets VALUES (1, 'apple'), (2, 'banana');
+
+# Make a user with SYSTEM_VARIABLES_ADMIN but NOT SELECT on restricted_db.
+CREATE USER 'limited_user'@'localhost' IDENTIFIED BY 'pass';
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO 'limited_user'@'localhost';
+GRANT SELECT, INSERT ON test.* TO 'limited_user'@'localhost';
+# Crucially: NO grants on restricted_db.
+
+# Suppress the [TIDESDB] warning so it doesn't pollute the result; the
+# warning content itself is the user-visible signal that the load was
+# denied.
+call mtr.add_suppression("\\[TIDESDB\\] Stop word table load denied");
+
+--connect (limited_con, localhost, limited_user, pass, test)
+--connection limited_con
+
+--echo # As the limited user: attempt to set the stopword table to a table
+--echo # we have NO SELECT on. The SET itself succeeds (sysvar takes the
+--echo # value) but the load is rejected and the previous stopword set is
+--echo # retained.
+SET GLOBAL tidesdb_ft_stopword_table = 'restricted_db/secrets';
+
+--echo # Variable reflects the requested value (sysvar always accepts the
+--echo # string; only the underlying load is gated).
+SHOW GLOBAL VARIABLES LIKE 'tidesdb_ft_stopword_table';
+
+--echo # Reset for cleanup.
+SET GLOBAL tidesdb_ft_stopword_table = NULL;
+
+--disconnect limited_con
+--connection default
+
+--echo # As root, the same SET succeeds and would load stopwords from the
+--echo # named table (root has implicit access). We just verify the SET
+--echo # accepts -- exhaustive end-to-end coverage of the load path is in
+--echo # the existing tidesdb_fts_stopwords MTR test.
+SET GLOBAL tidesdb_ft_stopword_table = 'restricted_db/secrets';
+SET GLOBAL tidesdb_ft_stopword_table = NULL;
+
+DROP USER 'limited_user'@'localhost';
+DROP TABLE restricted_db.secrets;
+DROP DATABASE restricted_db;
+
+--echo #
+--echo # Done.

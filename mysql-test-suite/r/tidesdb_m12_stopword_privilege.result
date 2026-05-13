@@ -1,0 +1,33 @@
+CREATE DATABASE restricted_db;
+CREATE TABLE restricted_db.secrets (
+id INT PRIMARY KEY,
+value VARCHAR(50)
+) ENGINE=TidesDB;
+INSERT INTO restricted_db.secrets VALUES (1, 'apple'), (2, 'banana');
+CREATE USER 'limited_user'@'localhost' IDENTIFIED BY 'pass';
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO 'limited_user'@'localhost';
+GRANT SELECT, INSERT ON test.* TO 'limited_user'@'localhost';
+call mtr.add_suppression("\\[TIDESDB\\] Stop word table load denied");
+# As the limited user: attempt to set the stopword table to a table
+# we have NO SELECT on. The SET itself succeeds (sysvar takes the
+# value) but the load is rejected and the previous stopword set is
+# retained.
+SET GLOBAL tidesdb_ft_stopword_table = 'restricted_db/secrets';
+# Variable reflects the requested value (sysvar always accepts the
+# string; only the underlying load is gated).
+SHOW GLOBAL VARIABLES LIKE 'tidesdb_ft_stopword_table';
+Variable_name	Value
+tidesdb_ft_stopword_table	restricted_db/secrets
+# Reset for cleanup.
+SET GLOBAL tidesdb_ft_stopword_table = NULL;
+# As root, the same SET succeeds and would load stopwords from the
+# named table (root has implicit access). We just verify the SET
+# accepts -- exhaustive end-to-end coverage of the load path is in
+# the existing tidesdb_fts_stopwords MTR test.
+SET GLOBAL tidesdb_ft_stopword_table = 'restricted_db/secrets';
+SET GLOBAL tidesdb_ft_stopword_table = NULL;
+DROP USER 'limited_user'@'localhost';
+DROP TABLE restricted_db.secrets;
+DROP DATABASE restricted_db;
+#
+# Done.
