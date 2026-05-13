@@ -340,18 +340,10 @@ SELECT name, 'low' AS tier FROM employees WHERE salary < 70000
 ORDER BY name;
 name	tier
 Alice	high
-Alice	low
-Bob	low
-Carol	low
 Dave	low
 Eve	high
-Eve	low
 Frank	high
-Frank	low
-Grace	low
 Hank	low
-Ivy	low
-Jack	low
 SELECT dept_id FROM employees
 UNION
 SELECT dept_id FROM projects
@@ -522,11 +514,8 @@ dept_id	members
 #
 SELECT name, salary FROM employees WHERE salary BETWEEN 70000 AND 90000 ORDER BY emp_id;
 name	salary
-Alice	95000.00
 Bob	88000.00
 Carol	72000.00
-Eve	105000.00
-Frank	92000.00
 Grace	78000.00
 Ivy	71000.00
 Jack	85000.00
@@ -592,15 +581,9 @@ JOIN employees e2 ON e1.dept_id = e2.dept_id AND e1.emp_id < e2.emp_id
 WHERE e1.dept_id = 1
 ORDER BY e1.emp_id, e2.emp_id;
 employee	colleague
-Alice	Alice
 Alice	Bob
 Alice	Grace
-Bob	Alice
-Bob	Bob
 Bob	Grace
-Grace	Alice
-Grace	Bob
-Grace	Grace
 #
 # ============================================
 # TEST 29: Aggregate with JOIN and GROUP BY

@@ -1,0 +1,45 @@
+CREATE TABLE places (
+id   INT NOT NULL PRIMARY KEY,
+name VARCHAR(100),
+loc  GEOMETRY NOT NULL,
+SPATIAL INDEX (loc)
+) ENGINE=TidesDB;
+INSERT INTO places VALUES (1, 'sw_far',   ST_GeomFromText('POINT(-1000 -1000)'));
+INSERT INTO places VALUES (2, 'sw_near',  ST_GeomFromText('POINT(-1 -1)'));
+INSERT INTO places VALUES (3, 'origin',   ST_GeomFromText('POINT(0 0)'));
+INSERT INTO places VALUES (4, 'ne_near',  ST_GeomFromText('POINT(1 1)'));
+INSERT INTO places VALUES (5, 'ne_far',   ST_GeomFromText('POINT(1000 1000)'));
+# MBRContains-style query covering full set; all 5 rows.
+SELECT name FROM places
+WHERE MBRContains(
+ST_GeomFromText('POLYGON((-2000 -2000, 2000 -2000, 2000 2000, -2000 2000, -2000 -2000))'),
+loc)
+ORDER BY id;
+name
+sw_far
+sw_near
+origin
+ne_near
+ne_far
+# Negative-only window; rows 1, 2.
+SELECT name FROM places
+WHERE MBRContains(
+ST_GeomFromText('POLYGON((-2000 -2000, -0.5 -2000, -0.5 -0.5, -2000 -0.5, -2000 -2000))'),
+loc)
+ORDER BY id;
+name
+sw_far
+sw_near
+# Window straddling zero; rows 2, 3, 4.
+SELECT name FROM places
+WHERE MBRContains(
+ST_GeomFromText('POLYGON((-2 -2, 2 -2, 2 2, -2 2, -2 -2))'),
+loc)
+ORDER BY id;
+name
+sw_near
+origin
+ne_near
+DROP TABLE places;
+#
+# Done.

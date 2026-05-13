@@ -1,0 +1,48 @@
+CREATE TABLE t_icp (
+id INT NOT NULL PRIMARY KEY,
+k  INT NOT NULL,
+v  VARCHAR(20),
+KEY idx_k (k)
+) ENGINE=TidesDB;
+INSERT INTO t_icp VALUES
+(1,  10, 'a'),
+(2,  20, 'b'),
+(3,  30, 'c'),
+(4,  40, 'd'),
+(5,  50, 'e'),
+(6,  60, 'f'),
+(7,  70, 'g'),
+(8,  80, 'h'),
+(9,  90, 'i'),
+(10,100, 'j');
+# Secondary-index range scan. end_range = 50, MUST NOT include rows
+# past it. Pre-fix this could leak rows 6-10 because the stub didn't
+# check end_range when in_range_check_pushed_down=true.
+SELECT id, k FROM t_icp WHERE k BETWEEN 20 AND 50 ORDER BY id;
+id	k
+2	20
+3	30
+4	40
+5	50
+# Range scan combined with a pushed condition that filters most rows.
+# Result must be the intersection: k in [20..80] AND v in ('b','d','f','h').
+SELECT id, k, v FROM t_icp
+WHERE k BETWEEN 20 AND 80
+AND v IN ('b','d','f','h')
+ORDER BY id;
+id	k	v
+2	20	b
+4	40	d
+6	60	f
+8	80	h
+# Open-ended range (k >= 70). end_range here is unbounded so
+# filtering is purely by pushed condition.
+SELECT id, k FROM t_icp WHERE k >= 70 ORDER BY id;
+id	k
+7	70
+8	80
+9	90
+10	100
+DROP TABLE t_icp;
+#
+# Done.

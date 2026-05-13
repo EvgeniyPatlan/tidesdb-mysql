@@ -1,0 +1,22 @@
+# Relative paths must be rejected.
+SET GLOBAL tidesdb_backup_dir = 'relative/path';
+ERROR HY000: [TIDESDB] Backup path must be absolute and free of '..' components: 'relative/path' rejected
+SET GLOBAL tidesdb_checkpoint_dir = 'rel/path';
+ERROR HY000: [TIDESDB] Checkpoint path must be absolute and free of '..' components: 'rel/path' rejected
+# Absolute paths containing '..' must be rejected.
+SET GLOBAL tidesdb_backup_dir = '/var/lib/mysql/../etc/sneaky';
+ERROR HY000: [TIDESDB] Backup path must be absolute and free of '..' components: '/var/lib/mysql/../etc/sneaky' rejected
+SET GLOBAL tidesdb_checkpoint_dir = '/../etc/sneaky';
+ERROR HY000: [TIDESDB] Checkpoint path must be absolute and free of '..' components: '/../etc/sneaky' rejected
+SET GLOBAL tidesdb_backup_dir = '/var/../etc';
+ERROR HY000: [TIDESDB] Backup path must be absolute and free of '..' components: '/var/../etc' rejected
+# Absolute path with a '..' substring inside a legitimate name is fine.
+# (e.g. /var/lib/...backups should not match the '..' boundary rule)
+# Setting to a non-existent absolute path will still fail at the
+# backup step itself with a different error, but tdb_path_is_safe
+# accepts it lexically.
+# Empty / NULL clears the variable.
+SET GLOBAL tidesdb_backup_dir = '';
+SET GLOBAL tidesdb_checkpoint_dir = '';
+#
+# Done.

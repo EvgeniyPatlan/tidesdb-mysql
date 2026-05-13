@@ -1,0 +1,41 @@
+--source suite/tidesdb/include/have_tidesdb.inc
+#
+# Regression test for H-9 (ENGINE_ATTRIBUTE JSON parser unbounded depth).
+#
+# Pre-fix: rapidjson's default recursive-descent parser would overflow
+# the stack on >500 levels of nesting. ENGINE_ATTRIBUTE is reloaded
+# on every OPEN TABLE, so a single malicious CREATE TABLE would crash
+# mysqld on every subsequent connection touching the table.
+#
+# Post-fix: kParseIterativeFlag uses a heap-backed stack with no depth
+# limit. Deeply-nested JSON is parsed without recursion.
+#
+# NB: MySQL pre-validates ENGINE_ATTRIBUTE as JSON before the engine
+# even sees it, so malformed JSON is rejected at the SQL layer with
+# ER_INVALID_JSON_ATTRIBUTE. The engine's parser only sees
+# syntactically-valid JSON; the H-9 risk is structural recursion depth
+# on valid-but-deeply-nested JSON.
+#
+
+--echo # 1. A reasonably nested but schema-non-matching JSON: parses fine
+--echo #    via the iterative path; engine ignores unrecognized keys.
+CREATE TABLE t_h9_a (id INT PRIMARY KEY) ENGINE=TidesDB
+  ENGINE_ATTRIBUTE='{"a":{"b":{"c":{"d":{"e":{"f":{"g":{"h":{"i":{"j":1}}}}}}}}}}';
+DROP TABLE t_h9_a;
+
+--echo # 2. Malformed JSON is rejected by MySQL's own validation
+--echo #    BEFORE reaching the engine -- not specifically the H-9 fix
+--echo #    but confirms the surface around it is safe.
+--error ER_INVALID_JSON_ATTRIBUTE
+CREATE TABLE t_h9_b (id INT PRIMARY KEY) ENGINE=TidesDB
+  ENGINE_ATTRIBUTE='{not valid json';
+
+--echo # 3. A valid recognized key still parses and applies, proving the
+--echo #    iterative parser hasn't broken the happy path.
+CREATE TABLE t_h9_c (id INT PRIMARY KEY) ENGINE=TidesDB
+  ENGINE_ATTRIBUTE='{"compression":"LZ4"}';
+SHOW CREATE TABLE t_h9_c;
+DROP TABLE t_h9_c;
+
+--echo #
+--echo # Done.

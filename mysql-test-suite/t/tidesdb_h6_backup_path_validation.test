@@ -1,0 +1,40 @@
+--source suite/tidesdb/include/have_tidesdb.inc
+#
+# Regression test for H-6 (path traversal via backup_dir / checkpoint_dir).
+#
+# Previously these sysvars accepted any string and passed it straight to
+# tidesdb_backup() / tidesdb_checkpoint(), which let a DBA with
+# SYSTEM_VARIABLES_ADMIN write data files anywhere the `mysql` OS user
+# could reach -- including '..'-escapes out of the data directory.
+#
+# Fix: tdb_path_is_safe() now rejects any path that is not absolute
+# or that contains a '..' path component. Lexical only; defense in
+# depth. True confinement to an allowed-root is a follow-up.
+#
+
+--echo # Relative paths must be rejected.
+--error ER_UNKNOWN_ERROR
+SET GLOBAL tidesdb_backup_dir = 'relative/path';
+--error ER_UNKNOWN_ERROR
+SET GLOBAL tidesdb_checkpoint_dir = 'rel/path';
+
+--echo # Absolute paths containing '..' must be rejected.
+--error ER_UNKNOWN_ERROR
+SET GLOBAL tidesdb_backup_dir = '/var/lib/mysql/../etc/sneaky';
+--error ER_UNKNOWN_ERROR
+SET GLOBAL tidesdb_checkpoint_dir = '/../etc/sneaky';
+--error ER_UNKNOWN_ERROR
+SET GLOBAL tidesdb_backup_dir = '/var/../etc';
+
+--echo # Absolute path with a '..' substring inside a legitimate name is fine.
+--echo # (e.g. /var/lib/...backups should not match the '..' boundary rule)
+--echo # Setting to a non-existent absolute path will still fail at the
+--echo # backup step itself with a different error, but tdb_path_is_safe
+--echo # accepts it lexically.
+
+--echo # Empty / NULL clears the variable.
+SET GLOBAL tidesdb_backup_dir = '';
+SET GLOBAL tidesdb_checkpoint_dir = '';
+
+--echo #
+--echo # Done.

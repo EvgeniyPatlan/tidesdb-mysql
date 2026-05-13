@@ -1,0 +1,64 @@
+--source suite/tidesdb/include/have_tidesdb.inc
+#
+# Regression test for H-4 (Hilbert encoder overflow corrupts spatial keys).
+#
+# Buggy hilbert_rot took uint32_t n; the caller passed `(uint32_t)s << 1`
+# where s=2^31 on the first iteration -- the cast truncated to 0x80000000
+# and the shift overflowed to 0. The first iteration encodes the high bit
+# of each axis, and for negative-double coordinates (whose lex_uint32 has
+# bit 31 = 0) the resulting Hilbert value was wrong, so spatial range
+# scans could miss rows on the negative side.
+#
+# Fix: hilbert_rot now takes uint64_t n; caller shifts in uint64.
+#
+# Modelled on the existing tidesdb_spatial.test pattern (which is known
+# to pass) but with a points set that spans across zero so that some
+# coordinates have lex_uint32 bit 31 = 0 (negative axis values --
+# trigger condition for the original bug).
+#
+
+# Disable the standard "spatial index without SRID will not be used by
+# the optimizer" warning -- the existing tidesdb_spatial.test follows
+# the same no-SRID pattern; the H-4 fix is about Hilbert encoding
+# correctness on INSERT, which happens regardless of whether the
+# optimizer chooses the index for the read.
+--disable_warnings
+CREATE TABLE places (
+  id   INT NOT NULL PRIMARY KEY,
+  name VARCHAR(100),
+  loc  GEOMETRY NOT NULL,
+  SPATIAL INDEX (loc)
+) ENGINE=TidesDB;
+--enable_warnings
+
+INSERT INTO places VALUES (1, 'sw_far',   ST_GeomFromText('POINT(-1000 -1000)'));
+INSERT INTO places VALUES (2, 'sw_near',  ST_GeomFromText('POINT(-1 -1)'));
+INSERT INTO places VALUES (3, 'origin',   ST_GeomFromText('POINT(0 0)'));
+INSERT INTO places VALUES (4, 'ne_near',  ST_GeomFromText('POINT(1 1)'));
+INSERT INTO places VALUES (5, 'ne_far',   ST_GeomFromText('POINT(1000 1000)'));
+
+--echo # MBRContains-style query covering full set; all 5 rows.
+SELECT name FROM places
+WHERE MBRContains(
+        ST_GeomFromText('POLYGON((-2000 -2000, 2000 -2000, 2000 2000, -2000 2000, -2000 -2000))'),
+        loc)
+ORDER BY id;
+
+--echo # Negative-only window; rows 1, 2.
+SELECT name FROM places
+WHERE MBRContains(
+        ST_GeomFromText('POLYGON((-2000 -2000, -0.5 -2000, -0.5 -0.5, -2000 -0.5, -2000 -2000))'),
+        loc)
+ORDER BY id;
+
+--echo # Window straddling zero; rows 2, 3, 4.
+SELECT name FROM places
+WHERE MBRContains(
+        ST_GeomFromText('POLYGON((-2 -2, 2 -2, 2 2, -2 2, -2 -2))'),
+        loc)
+ORDER BY id;
+
+DROP TABLE places;
+
+--echo #
+--echo # Done.

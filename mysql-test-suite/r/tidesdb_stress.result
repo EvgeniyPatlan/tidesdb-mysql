@@ -131,7 +131,6 @@ SELECT id, val, score FROM stress_main WHERE score BETWEEN 50 AND 120 ORDER BY i
 id	val	score
 1	txn_row_1	110
 2	updated_in_txn	120
-3	autocommit_3	130
 6	idx_6	60
 7	idx_7	70
 8	idx_8	60
