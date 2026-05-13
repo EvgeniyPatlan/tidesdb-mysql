@@ -2,7 +2,7 @@
 
 A **MySQL 9.7 storage engine plugin** that uses [TidesDB](https://github.com/tidesdb/tidesdb) — an LSM-tree key/value engine — as the row store. Builds as a loadable `ha_tidesdb.so`; install at runtime with `INSTALL PLUGIN`.
 
-> **Status: experimental / proof-of-concept.** Single-node CRUD works, type coverage is wide, and the lifted MTR suite is **fully green — 50/50 executed tests pass with 2 cleanly skipped** (each marked with the specific feature gap that prevents it: native partitioning, MySQL vector API). See [Status](#status) for the full breakdown.
+> **Status: experimental / proof-of-concept.** Single-node CRUD works, type coverage is wide, and the MTR suite is **fully green — 58/58 executed tests pass with 2 cleanly skipped** (each marked with the specific feature gap that prevents it: native partitioning, MySQL vector API). See [Status](#status) for the full breakdown.
 
 This is a port of [TideSQL](https://github.com/tidesdb/tidesql) (TidesDB + MariaDB) to MySQL 9.7. Despite the family resemblance, MariaDB and MySQL have diverged enough at the handler API and data-dictionary layers that this is a rewrite-by-replay rather than a drop-in.
 
@@ -40,55 +40,77 @@ INSTALL PLUGIN tidesdb SONAME 'ha_tidesdb.so';
 **Build packages from source:**
 
 ```bash
-./scripts/package-deb.sh 0.1.0       # writes dist/tidesdb-mysql-plugin_0.1.0_amd64.deb
-./scripts/package-rpm.sh 0.1.0       # writes dist/tidesdb-mysql-plugin-0.1.0-1.x86_64.rpm
+./scripts/package-deb.sh 0.2.0       # writes dist/tidesdb-mysql-plugin_0.2.0_amd64.deb
+./scripts/package-rpm.sh 0.2.0       # writes dist/tidesdb-mysql-plugin-0.2.0-1.x86_64.rpm
 ```
 
 Both produce a binary package containing `ha_tidesdb.so` plus docs and an example config snippet. The `.deb` is built on Ubuntu 24.04 and the `.rpm` on Oracle Linux 9 (matching the official `mysql:9.7` image's libstdc++ ABI).
 
 ## Quick start (Docker — for trying it out without installing on the host)
 
-The fastest way to play with it: build a runnable `mysql:9.7` image with the plugin baked in.
+The fastest path: **pull the published image — no build needed.**
 
 ```bash
-git clone https://github.com/EvgeniyPatlan/tidesdb-mysql.git
-cd tidesdb-mysql
+docker pull evgeniypatlan/test-images:mysql-9.7-tidesdb-v0.2.0
 
-# Build the image (cold: ~25-40 min — clones MySQL source, compiles the plugin
-# on Oracle Linux 9 to match the official mysql:9.7 image's libstdc++ ABI).
-docker build -f docker/Dockerfile.mysql -t tidesdb/mysql:9.7 .
-
-# Run.
 docker run -d --name tidesdb \
   -e MYSQL_ROOT_PASSWORD=secret \
   -p 3306:3306 \
-  tidesdb/mysql:9.7
+  evgeniypatlan/test-images:mysql-9.7-tidesdb-v0.2.0
 
 # Verify the engine is available.
 docker exec tidesdb mysql -uroot -psecret -e "SHOW ENGINES;" | grep -i tidesdb
 # Expected: TIDESDB  YES  TidesDB ...
 
-# Connect and try the demo schema.
-docker exec -it tidesdb mysql -uroot -psecret tidesdb_demo
-# mysql> SELECT * FROM kv;
-# mysql> SELECT * FROM metrics ORDER BY ts DESC LIMIT 5;
+# Connect and try a few rows.
+docker exec -it tidesdb mysql -uroot -psecret -e "
+  CREATE DATABASE demo;
+  CREATE TABLE demo.kv (k INT PRIMARY KEY, v VARCHAR(32)) ENGINE=TIDESDB;
+  INSERT INTO demo.kv VALUES (1, 'hello'), (2, 'world');
+  SELECT * FROM demo.kv;
+"
 ```
 
+Tags published to Docker Hub:
+
+- `evgeniypatlan/test-images:mysql-9.7-tidesdb-v0.2.0` — pinned to the v0.2.0 release (recommended for reproducibility; see [the release notes](https://github.com/EvgeniyPatlan/tidesdb-mysql/releases/tag/v0.2.0))
+- `evgeniypatlan/test-images:mysql-9.7-tidesdb-latest` — moves forward with each release
+
 `docker compose -f docker/runtime/docker-compose.yml up -d` works too if you'd rather use compose.
+
+### Building the image yourself (instead of pulling)
+
+If you'd rather verify the build end-to-end, run a custom branch, or you can't reach Docker Hub:
+
+```bash
+git clone https://github.com/EvgeniyPatlan/tidesdb-mysql.git
+cd tidesdb-mysql
+
+# Cold: ~25-40 min (clones MySQL source, compiles the plugin on Oracle
+# Linux 9 to match the official mysql:9.7 image's libstdc++ ABI).
+docker build -f docker/Dockerfile.mysql -t tidesdb/mysql:9.7 .
+
+# Run as above but with the local tag:
+docker run -d --name tidesdb -e MYSQL_ROOT_PASSWORD=secret -p 3306:3306 tidesdb/mysql:9.7
+```
 
 ### Running tests against the Docker image
 
 The repo ships a smoke test that spins up a container, asserts the engine loads, exercises CRUD + composite PK + composite UNIQUE, restarts the container and verifies data persisted. It is the same script CI runs on every push.
 
 ```bash
-# Test the image you just built locally:
-./docker/runtime/smoke-test.sh                     # uses tidesdb/mysql:9.7
+# Test the published image:
+./docker/runtime/smoke-test.sh evgeniypatlan/test-images:mysql-9.7-tidesdb-v0.2.0
 
-# Or test an arbitrary tag (e.g. the published Docker Hub image):
-./docker/runtime/smoke-test.sh evgeniypatlan/test-images:mysql-9.7-tidesdb
+# Test a locally-built image:
+./docker/runtime/smoke-test.sh tidesdb/mysql:9.7
+
+# Default (no argument) uses tidesdb/mysql:9.7 — the local-build tag.
+./docker/runtime/smoke-test.sh
 
 # Override the temp container name / root password if you have a conflict:
-CONTAINER=tdb-test PASSWORD=hunter2 ./docker/runtime/smoke-test.sh tidesdb/mysql:9.7
+CONTAINER=tdb-test PASSWORD=hunter2 \
+  ./docker/runtime/smoke-test.sh evgeniypatlan/test-images:mysql-9.7-tidesdb-v0.2.0
 ```
 
 The script creates a throwaway container named `tidesdb-smoke` and `docker rm -f`s it on exit (including on failure), so it never pollutes your `docker ps` and is safe to re-run.
@@ -144,7 +166,7 @@ If you want to develop the plugin (run tests, edit code, rebuild fast):
 
 ```bash
 ./scripts/build-all.sh        # ~30 min cold (clones MySQL, builds plugin)
-./scripts/test-plugin.sh      # 33/33 hand-rolled tests
+./scripts/test-plugin.sh      # 37/37 hand-rolled tests
 ```
 
 `build-all.sh` runs three steps:
@@ -183,7 +205,7 @@ Server-level system variables: `tidesdb_flush_threads`, `tidesdb_compaction_thre
 |  `test-plugin.sh` (hand-rolled CRUD, 37 cases)        | **37/37 ✓** |
 | `test-persistence.sh` (cross-restart durability)     | **PASS** |
 | `smoke-test.sh` (end-to-end pipeline)                | **all phases ✓** |
-| MTR suite lifted from TideSQL (52 tests)             | **50/50 executed pass, 2 skipped** |
+| MTR suite (lifted from TideSQL + post-review additions) | **58/58 executed pass, 2 skipped** |
 
 What works:
 
