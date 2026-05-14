@@ -127,8 +127,13 @@ static char last_conflict_info[LAST_CONFLICT_INFO_LEN] = "";
  * of this rwlock and touches partition mutexes, you have created a
  * deadlock. Move row_locks_release_all earlier, or restructure to
  * release the rwlock before touching partitions. */
-static mysql_rwlock_t g_trx_lifecycle_lock;
-static PSI_rwlock_key g_trx_lifecycle_lock_key;
+/* External linkage so the row-lock module (tidesdb_row_lock.cc, extracted
+   in the architectural refactor) can reach the lifecycle rwlock from its
+   own translation unit. Used internally by the deadlock walker and by
+   tidesdb_close_connection / tidesdb_hton_kill_query to gate trx-pointer
+   dereferences vs concurrent my_free. */
+mysql_rwlock_t g_trx_lifecycle_lock;
+PSI_rwlock_key g_trx_lifecycle_lock_key;
 
 /* HF-2 fix (follow-up review): the former process-global
  * g_fts_meta_mutex has moved into TidesDB_share::fts_meta_mutex
@@ -295,280 +300,19 @@ static handlerton *tidesdb_hton;
   multi-table transactions.
 */
 
-/* Number of hash partitions for the row lock table.
-   65536 partitions (~512 KB overhead) virtually eliminates false contention
-   between unrelated rows while keeping memory usage negligible. */
-static constexpr ulong ROW_LOCK_PARTITIONS = 65536;
+/* Row-lock manager (lock-table partitions, deadlock walker, acquire,
+   release, init/destroy) moved to tidesdb_row_lock.{h,cc} during the
+   architecture-extraction pass. Symbols still visible:
 
-/* Maximum depth for wait-for-graph traversal during deadlock detection.
-   Prevents infinite loops on corrupted graph state. */
-static constexpr int DEADLOCK_MAX_DEPTH = 100;
-
-/* Row lock entry in the hash table.
-   owner_txn_id and owner_trx are read by deadlock graph walks running on
-   OTHER threads without holding this partition's mutex -- they must be
-   atomic so readers never observe a torn write.  All writes still happen
-   under the owning partition's mutex.  Lock entries are never freed once
-   created (only the owner fields reset to 0/null on release), so pointers
-   traversed during the walk always point to valid memory. */
-struct tdb_row_lock_t
-{
-    uchar *pk;                              /* heap-allocated PK bytes */
-    uint pk_len;                            /* length of PK bytes */
-    std::atomic<uint64_t> owner_txn_id;     /* txn that holds this lock (0 = free) */
-    std::atomic<tidesdb_trx_t *> owner_trx; /* trx struct of the holder */
-    mysql_cond_t cond;                      /* waiters sleep on this */
-    uint waiters;                           /* number of threads waiting (mutex-guarded) */
-    tdb_row_lock_t *hash_next;              /* next in hash chain (mutex-guarded) */
-    tdb_row_lock_t *held_next;              /* next in per-txn held list (owner-only) */
-    uint partition;                         /* which partition this belongs to */
-};
-
-/* One partition of the lock table */
-struct tdb_lock_partition_t
-{
-    mysql_mutex_t mutex;
-    tdb_row_lock_t *chain; /* head of hash chain */
-};
-
-static tdb_lock_partition_t *lock_partitions = NULL;
-
-static inline uint tdb_lock_part(const uchar *key, uint len)
-{
-    uint64_t h = XXH3_64bits(key, len);
-    return (uint)(h % ROW_LOCK_PARTITIONS);
-}
-
-/* Find or create a lock entry in the partition's hash chain.
-   Caller must hold partition mutex. */
-static tdb_row_lock_t *tdb_lock_find_or_create(tdb_lock_partition_t *part, uint part_idx,
-                                               const uchar *pk, uint pk_len)
-{
-    for (tdb_row_lock_t *e = part->chain; e; e = e->hash_next)
-    {
-        if (e->pk_len == pk_len && memcmp(e->pk, pk, pk_len) == 0) return e;
-    }
-    tdb_row_lock_t *e =
-        (tdb_row_lock_t *)my_malloc(PSI_NOT_INSTRUMENTED, sizeof(tdb_row_lock_t), MYF(MY_ZEROFILL));
-    if (!e) return NULL;
-    e->pk = (uchar *)my_malloc(PSI_NOT_INSTRUMENTED, pk_len, MYF(0));
-    if (!e->pk)
-    {
-        my_free(e);
-        return NULL;
-    }
-    memcpy(e->pk, pk, pk_len);
-    e->pk_len = pk_len;
-    e->owner_txn_id.store(0, std::memory_order_relaxed);
-    e->owner_trx.store(NULL, std::memory_order_relaxed);
-    e->waiters = 0;
-    e->partition = part_idx;
-    mysql_cond_init(0, &e->cond);
-    e->hash_next = part->chain;
-    part->chain = e;
-    return e;
-}
-
-/* Deadlock detection -- walk the wait-for graph with atomic loads.
-   Returns true if the requestor waiting on target_lock would create a cycle.
-
-   The walk does not hold any partition mutex, lock and trx structs are never
-   freed (locks stay in their hash chain for the lifetime of the plugin; trx
-   structs are freed only at connection close, which requires the connection
-   to have released all locks first).  The owner / waiting_on fields are
-   atomic so that cross-partition reads never tear.  Racy state observed
-   during the walk can produce a stale answer (false positive rare spurious
-   deadlock return, application retries; false negative wait and rely on
-   the lock-wait-timeout to recover).  Neither outcome corrupts memory. */
-static bool tdb_lock_would_deadlock(tidesdb_trx_t *requestor, tdb_row_lock_t *target_lock)
-{
-    /* Chain is requestor -> target_lock -> target_lock.owner_trx ->
-       owner.waiting_on -> ... -- if we reach the requestor there's a cycle.
-       Depth capped at DEADLOCK_MAX_DEPTH to avoid pathological runs.
-
-       Read-locking g_trx_lifecycle_lock prevents the trx structs we deref
-       (`cur->waiting_on`) from being my_free()d by a concurrent
-       tidesdb_close_connection between our atomic load of the pointer
-       and the subsequent dereference. Lock entries themselves are never
-       freed by design, so target_lock + cur_waiting are safe. */
-    mysql_rwlock_rdlock(&g_trx_lifecycle_lock);
-    tidesdb_trx_t *cur = target_lock->owner_trx.load(std::memory_order_acquire);
-    bool found_cycle = false;
-    for (int depth = 0; depth < DEADLOCK_MAX_DEPTH && cur; depth++)
-    {
-        if (cur == requestor)
-        {
-            found_cycle = true;
-            break;
-        }
-        tdb_row_lock_t *cur_waiting = cur->waiting_on.load(std::memory_order_acquire);
-        if (!cur_waiting) break; /* not currently waiting */
-        cur = cur_waiting->owner_trx.load(std::memory_order_acquire);
-    }
-    mysql_rwlock_unlock(&g_trx_lifecycle_lock);
-    return found_cycle;
-}
-
-/*
-  Acquire a row lock. Returns 0 on success, HA_ERR_LOCK_DEADLOCK on deadlock.
-  Blocks if the row is locked by another transaction (unless deadlock detected).
-  Re-entrant -- returns immediately if already held by this txn.
-
-  Deadlock detection runs without the partition mutex held we publish our
-  wait intent (trx->waiting_on) under the mutex so other walkers see us,
-  drop the mutex, walk the wait-for graph with atomic loads, then re-acquire.
-  This keeps other lockers on the same partition unblocked while we walk
-  and removes the data races that the old code had when traversing pointers
-  in unrelated partitions.
-*/
-static int row_lock_acquire(tidesdb_trx_t *trx, const uchar *key, uint len, THD *thd)
-{
-    if (!lock_partitions || !trx) return 0;
-
-    uint part_idx = tdb_lock_part(key, len);
-    tdb_lock_partition_t *part = &lock_partitions[part_idx];
-
-    mysql_mutex_lock(&part->mutex);
-
-    tdb_row_lock_t *lock = tdb_lock_find_or_create(part, part_idx, key, len);
-    if (!lock)
-    {
-        mysql_mutex_unlock(&part->mutex);
-        return HA_ERR_OUT_OF_MEM;
-    }
-
-    /* Already own it? */
-    if (lock->owner_txn_id.load(std::memory_order_relaxed) == trx->lock_txn_id &&
-        lock->owner_trx.load(std::memory_order_relaxed) == trx)
-    {
-        mysql_mutex_unlock(&part->mutex);
-        return 0;
-    }
-
-    /* Free? Claim it. */
-    if (lock->owner_txn_id.load(std::memory_order_relaxed) == 0)
-    {
-        lock->owner_txn_id.store(trx->lock_txn_id, std::memory_order_release);
-        lock->owner_trx.store(trx, std::memory_order_release);
-        lock->held_next = trx->held_locks_head;
-        trx->held_locks_head = lock;
-        mysql_mutex_unlock(&part->mutex);
-        return 0;
-    }
-
-    /* Owned by someone else -- publish our wait intent so concurrent deadlock
-       walks that traverse through this trx can see what we're waiting on,
-       then drop the mutex to run the walk without blocking our partition. */
-    trx->waiting_on.store(lock, std::memory_order_release);
-    mysql_mutex_unlock(&part->mutex);
-
-    bool deadlock = tdb_lock_would_deadlock(trx, lock);
-
-    mysql_mutex_lock(&part->mutex);
-
-    if (deadlock)
-    {
-        trx->waiting_on.store(NULL, std::memory_order_relaxed);
-        mysql_mutex_unlock(&part->mutex);
-        return HA_ERR_LOCK_DEADLOCK;
-    }
-
-    /* The owner may have released while we were walking.  If so, claim the
-       lock directly instead of falling through to cond_wait. */
-    if (lock->owner_txn_id.load(std::memory_order_relaxed) == 0)
-    {
-        lock->owner_txn_id.store(trx->lock_txn_id, std::memory_order_release);
-        lock->owner_trx.store(trx, std::memory_order_release);
-        lock->held_next = trx->held_locks_head;
-        trx->held_locks_head = lock;
-        trx->waiting_on.store(NULL, std::memory_order_relaxed);
-        mysql_mutex_unlock(&part->mutex);
-        return 0;
-    }
-
-    /* Still owned -- wait for release.  kill_query wakes us by broadcasting
-       on lock->cond; we re-check thd_killed() on every wake-up and bail
-       with HA_ERR_LOCK_WAIT_TIMEOUT so the client sees a proper error
-       instead of hanging until the holder eventually commits.
-
-       We also re-run the deadlock detector on each wake-up: a new
-       wait-for cycle can form AFTER the initial pre-wait check (the
-       lock holder waited on something we now own, for example). Without
-       a re-check, that deadlock turns into a hang until lock_wait_timeout
-       rather than the proper ER_LOCK_DEADLOCK. */
-    lock->waiters++;
-    bool killed = false;
-    bool deadlock_in_wait = false;
-    while (lock->owner_txn_id.load(std::memory_order_relaxed) != 0 &&
-           lock->owner_trx.load(std::memory_order_relaxed) != trx)
-    {
-        if (thd && thd_killed(thd))
-        {
-            killed = true;
-            break;
-        }
-        /* Deadlock walker uses atomic loads only -- safe to call with
-           part->mutex held. We MUST re-publish waiting_on first so the
-           walker (running on another thread) sees the same wait
-           intention it saw before we entered cond_wait; the publish
-           happened on entry to row_lock_acquire and is still valid. */
-        if (tdb_lock_would_deadlock(trx, lock))
-        {
-            deadlock_in_wait = true;
-            break;
-        }
-        mysql_cond_wait(&lock->cond, &part->mutex);
-    }
-    lock->waiters--;
-    trx->waiting_on.store(NULL, std::memory_order_relaxed);
-
-    if (killed)
-    {
-        mysql_mutex_unlock(&part->mutex);
-        return HA_ERR_LOCK_WAIT_TIMEOUT;
-    }
-    if (deadlock_in_wait)
-    {
-        mysql_mutex_unlock(&part->mutex);
-        return HA_ERR_LOCK_DEADLOCK;
-    }
-
-    /* We claim the lock */
-    lock->owner_txn_id.store(trx->lock_txn_id, std::memory_order_release);
-    lock->owner_trx.store(trx, std::memory_order_release);
-    lock->held_next = trx->held_locks_head;
-    trx->held_locks_head = lock;
-    mysql_mutex_unlock(&part->mutex);
-    return 0;
-}
-
-/*
-  Release all row locks held by this transaction.
-  Called from tidesdb_commit() and tidesdb_rollback().
-*/
-static void row_locks_release_all(tidesdb_trx_t *trx)
-{
-    if (!lock_partitions || !trx) return;
-
-    tdb_row_lock_t *lock = trx->held_locks_head;
-    while (lock)
-    {
-        tdb_row_lock_t *next = lock->held_next;
-        uint part_idx = lock->partition;
-        tdb_lock_partition_t *part = &lock_partitions[part_idx];
-
-        mysql_mutex_lock(&part->mutex);
-        lock->owner_txn_id.store(0, std::memory_order_release);
-        lock->owner_trx.store(NULL, std::memory_order_release);
-        lock->held_next = NULL;
-        if (lock->waiters > 0) mysql_cond_broadcast(&lock->cond);
-        mysql_mutex_unlock(&part->mutex);
-
-        lock = next;
-    }
-    trx->held_locks_head = NULL;
-    trx->waiting_on.store(NULL, std::memory_order_relaxed);
-}
+     ROW_LOCK_PARTITIONS, DEADLOCK_MAX_DEPTH       -- constants
+     struct tdb_row_lock_t, tdb_lock_partition_t  -- types (held_locks_head
+                                                     on tidesdb_trx_t still
+                                                     references these)
+     lock_partitions                              -- the global table
+     row_lock_acquire / row_locks_release_all     -- public API
+     tdb_lock_would_deadlock                      -- walker (exposed)
+     tdb_row_lock_init / tdb_row_lock_destroy     -- lifecycle hooks */
+#include "tidesdb_row_lock.h"
 
 static handler *tidesdb_create_handler(handlerton *hton, TABLE_SHARE *table,
                                        bool partitioned, MEM_ROOT *mem_root);
@@ -4197,16 +3941,7 @@ static int tidesdb_init_func(void *p)
 
     mysql_mutex_init(0, &last_conflict_mutex, MY_MUTEX_INIT_FAST);
 
-    lock_partitions = (tdb_lock_partition_t *)my_malloc(
-        PSI_NOT_INSTRUMENTED, ROW_LOCK_PARTITIONS * sizeof(tdb_lock_partition_t), MYF(MY_ZEROFILL));
-    if (lock_partitions)
-    {
-        for (ulong i = 0; i < ROW_LOCK_PARTITIONS; i++)
-        {
-            mysql_mutex_init(0, &lock_partitions[i].mutex, MY_MUTEX_INIT_FAST);
-            lock_partitions[i].chain = NULL;
-        }
-    }
+    tdb_row_lock_init();
 
     /* Initialize trx-lifecycle rwlock (see g_trx_lifecycle_lock comment
        for the UAF it protects against). */
@@ -4509,25 +4244,7 @@ static int tidesdb_deinit_func(void *p)
     mysql_rwlock_destroy(&tdb_blend_lock);
     tdb_stopwords.clear();
 
-    if (lock_partitions)
-    {
-        for (ulong i = 0; i < ROW_LOCK_PARTITIONS; i++)
-        {
-            /*We free all lock entries in the hash chain */
-            tdb_row_lock_t *e = lock_partitions[i].chain;
-            while (e)
-            {
-                tdb_row_lock_t *next = e->hash_next;
-                mysql_cond_destroy(&e->cond);
-                my_free(e->pk);
-                my_free(e);
-                e = next;
-            }
-            mysql_mutex_destroy(&lock_partitions[i].mutex);
-        }
-        my_free(lock_partitions);
-        lock_partitions = NULL;
-    }
+    tdb_row_lock_destroy();
 
     sql_print_information("[TIDESDB] TidesDB closed");
     DBUG_RETURN(0);
