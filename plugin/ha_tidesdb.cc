@@ -3046,55 +3046,7 @@ static ha_table_option_struct *tidesdb_opts_for_table(const TABLE *table) {
 }
 
 
-#if 0  /* MariaDB-only ha_create_table_option DSL -- preserved as historical
-        * reference. MySQL has no HA_TOPTION_* macro family; the equivalent
-        * surface is the ENGINE_ATTRIBUTE JSON path implemented above
-        * (tidesdb_engine_attribute_to_options + tidesdb_seed_opts_from_session
-        * + tidesdb_opts_for_table). Every option listed below is reachable
-        * either via the JSON keys handled in the parser or via the
-        * tidesdb_default_* session variables that the seed helper reads. */
-ha_create_table_option tidesdb_table_option_list[] = {
-    /* Options with SYSVAR defaults inherit from session variables
-       (e.g. SET SESSION tidesdb_default_write_buffer_size=64*1024*1024).
-       When not explicitly set in CREATE TABLE, the session default is used. */
-    HA_TOPTION_SYSVAR("WRITE_BUFFER_SIZE", write_buffer_size, default_write_buffer_size),
-    HA_TOPTION_SYSVAR("MIN_DISK_SPACE", min_disk_space, default_min_disk_space),
-    HA_TOPTION_SYSVAR("KLOG_VALUE_THRESHOLD", klog_value_threshold, default_klog_value_threshold),
-    HA_TOPTION_SYSVAR("SYNC_INTERVAL_US", sync_interval_us, default_sync_interval_us),
-    HA_TOPTION_SYSVAR("INDEX_SAMPLE_RATIO", index_sample_ratio, default_index_sample_ratio),
-    HA_TOPTION_SYSVAR("BLOCK_INDEX_PREFIX_LEN", block_index_prefix_len,
-                      default_block_index_prefix_len),
-    HA_TOPTION_SYSVAR("LEVEL_SIZE_RATIO", level_size_ratio, default_level_size_ratio),
-    HA_TOPTION_SYSVAR("MIN_LEVELS", min_levels, default_min_levels),
-    HA_TOPTION_SYSVAR("DIVIDING_LEVEL_OFFSET", dividing_level_offset,
-                      default_dividing_level_offset),
-    HA_TOPTION_SYSVAR("SKIP_LIST_MAX_LEVEL", skip_list_max_level, default_skip_list_max_level),
-    HA_TOPTION_SYSVAR("SKIP_LIST_PROBABILITY", skip_list_probability,
-                      default_skip_list_probability),
-    HA_TOPTION_SYSVAR("BLOOM_FPR", bloom_fpr, default_bloom_fpr),
-    HA_TOPTION_SYSVAR("L1_FILE_COUNT_TRIGGER", l1_file_count_trigger,
-                      default_l1_file_count_trigger),
-    HA_TOPTION_SYSVAR("L0_QUEUE_STALL_THRESHOLD", l0_queue_stall_threshold,
-                      default_l0_queue_stall_threshold),
-    HA_TOPTION_SYSVAR("COMPRESSION", compression, default_compression),
-    HA_TOPTION_SYSVAR("SYNC_MODE", sync_mode, default_sync_mode),
-    HA_TOPTION_SYSVAR("ISOLATION_LEVEL", isolation_level, default_isolation_level),
-    HA_TOPTION_SYSVAR("BLOOM_FILTER", bloom_filter, default_bloom_filter),
-    HA_TOPTION_SYSVAR("BLOCK_INDEXES", block_indexes, default_block_indexes),
-    HA_TOPTION_SYSVAR("USE_BTREE", use_btree, default_use_btree),
-    HA_TOPTION_SYSVAR("OBJECT_LAZY_COMPACTION", object_lazy_compaction,
-                      default_object_lazy_compaction),
-    HA_TOPTION_SYSVAR("OBJECT_PREFETCH_COMPACTION", object_prefetch_compaction,
-                      default_object_prefetch_compaction),
-    HA_TOPTION_SYSVAR("TOMBSTONE_DENSITY_TRIGGER", tombstone_density_trigger,
-                      default_tombstone_density_trigger),
-    HA_TOPTION_SYSVAR("TOMBSTONE_DENSITY_MIN_ENTRIES", tombstone_density_min_entries,
-                      default_tombstone_density_min_entries),
-    HA_TOPTION_NUMBER("TTL", ttl, 0, 0, ULONGLONG_MAX, 1),
-    HA_TOPTION_BOOL("ENCRYPTED", encrypted, 0),
-    HA_TOPTION_NUMBER("ENCRYPTION_KEY_ID", encryption_key_id, 1, 1, 255, 1),
-    HA_TOPTION_END};
-#endif  /* tidesdb_table_option_list */
+/* (deleted) #if 0: ha_create_table_option DSL -- MariaDB-only dead code; see git history if needed. */
 
 /* ******************** Field options (per-column) ******************** */
 
@@ -3103,10 +3055,7 @@ struct ha_field_option_struct
     bool ttl; /* marks this column as the per-row TTL source (seconds) */
 };
 
-#if 0  /* same MariaDB-only stubbing as tidesdb_table_option_list */
-ha_create_table_option tidesdb_field_option_list[] = {HA_FOPTION_BOOL("TTL", ttl, 0),
-                                                      HA_FOPTION_END};
-#endif
+/* (deleted) #if 0: field_option_list -- MariaDB-only dead code; see git history if needed. */
 
 /* ******************** Index options (per-index) ******************** */
 
@@ -3115,10 +3064,7 @@ struct ha_index_option_struct
     bool use_btree; /* per-index B-tree override; -1 = inherit from table */
 };
 
-#if 0  /* same MariaDB-only stubbing as tidesdb_table_option_list */
-ha_create_table_option tidesdb_index_option_list[] = {HA_IOPTION_BOOL("USE_BTREE", use_btree, 0),
-                                                      HA_IOPTION_END};
-#endif
+/* (deleted) #if 0: index_option_list -- MariaDB-only dead code; see git history if needed. */
 
 /* ******************** Big-endian helpers for hidden PK ********************
    Hidden-PK rows are keyed by an 8-byte big-endian uint64 so that memcmp
@@ -4111,161 +4057,11 @@ static void schema_cf_rename(const char *from, const char *to)
 
     tidesdb_txn_free(txn);
 }
+/* (deleted) comment + #if 0: discover_table -- MariaDB-only dead code; see git history if needed. */
 
-static void schema_cf_ensure_databases();
+/* (deleted) comment + #if 0: discover_table_names -- MariaDB-only dead code; see git history if needed. */
 
-/*
-  Handlerton discover_table callback.
-  Called when MariaDB cannot find a .frm file on disk for a TidesDB table.
-  Reads the .frm binary from the schema CF and initializes the TABLE_SHARE.
-*/
-#if 0 /* MariaDB-only discover_table */
-static int tidesdb_discover_table(handlerton *, THD *thd, TABLE_SHARE *share)
-{
-    if (!schema_cf) return HA_ERR_NO_SUCH_TABLE;
-
-    std::string key = schema_cf_key(share->db, share->table_name);
-
-    tidesdb_txn_t *txn = NULL;
-    int rc = tidesdb_txn_begin(tdb_get_engine(), &txn);
-    if (rc != TDB_SUCCESS) return HA_ERR_NO_SUCH_TABLE;
-
-    uint8_t *val = NULL;
-    size_t val_len = 0;
-    rc = tidesdb_txn_get(txn, schema_cf, (const uint8_t *)key.data(), key.size(), &val, &val_len);
-    tidesdb_txn_rollback(txn); /* read-only, no commit needed */
-    tidesdb_txn_free(txn);
-
-    if (rc != TDB_SUCCESS || !val) return HA_ERR_NO_SUCH_TABLE;
-
-    /* Ensure the database directory exists.  The primary may have created
-       this database after the replica started, and schema_cf_ensure_databases()
-       only runs at plugin init.  A single stat() + conditional mkdir(). */
-    {
-        char db_dir[FN_REFLEN];
-        size_t dh_len = strlen(mysql_real_data_home);
-        snprintf(db_dir, sizeof(db_dir), "%s%s%.*s", mysql_real_data_home,
-                 (dh_len > 0 && mysql_real_data_home[dh_len - 1] != '/') ? "/" : "",
-                 (int)share->db.length, share->db.str);
-        MY_STAT st;
-        if (!my_stat(db_dir, &st, MYF(0))) my_mkdir(db_dir, TIDESDB_DB_DIR_MODE, MYF(0));
-    }
-
-    /* We verify the data CF actually exists before returning the .frm.
-       If the .frm is in the schema CF but the data CF hasn't been synced
-       yet (e.g. replica hasn't downloaded it from S3), returning the .frm
-       would cause handler::open() to fail with HA_ERR_NO_SUCH_TABLE.
-       MariaDB then retries discovery in an infinite loop (delete .frm ->
-       discover -> write .frm -> open fails -> delete .frm -> ...). */
-    {
-        std::string cf_name = std::string(share->db.str, share->db.length) + CF_DB_TABLE_SEP +
-                              std::string(share->table_name.str, share->table_name.length);
-        if (!tidesdb_get_column_family(tdb_get_engine(), cf_name.c_str()))
-        {
-            free(val);
-            return HA_ERR_NO_SUCH_TABLE;
-        }
-    }
-
-    /* MySQL has no init_from_binary_frm_image — schema discovery from
-     * stored .frm bytes is a MariaDB feature; MySQL uses the Data Dictionary.
-     * TODO: re-implement schema rediscovery via MySQL's Data Dictionary
-     * SDI mechanism for object-store replica mode. */
-    rc = HA_ERR_GENERIC;
-    (void)thd; (void)val; (void)val_len;
-
-    free(val);
-    return rc;
-}
-#endif
-
-/*
-  Handlerton discover_table_names callback.
-  Lists all TidesDB tables in a given database by scanning the schema CF
-  for keys with the matching "db\0" prefix.
-*/
-#if 0 /* MariaDB-only discover_table_names: handlerton::discovered_list */
-static int tidesdb_discover_table_names(handlerton *, const LEX_CSTRING *db, MY_DIR *,
-                                        handlerton::discovered_list *result)
-{
-    if (!schema_cf) return 0;
-
-    /* Ensure database directories are up-to-date.  Picks up databases
-       created by the primary after this replica started. */
-    schema_cf_ensure_databases();
-
-    /* We build prefix-- "db_name<SCHEMA_CF_KEY_SEP>" */
-    std::string prefix;
-    prefix.reserve(db->length + sizeof(SCHEMA_CF_KEY_SEP));
-    prefix.append(db->str, db->length);
-    prefix.push_back(SCHEMA_CF_KEY_SEP);
-
-    tidesdb_txn_t *txn = NULL;
-    if (tidesdb_txn_begin(tdb_get_engine(), &txn) != TDB_SUCCESS) return 0;
-
-    tidesdb_iter_t *iter = NULL;
-    if (tidesdb_iter_new(txn, schema_cf, &iter) != TDB_SUCCESS || !iter)
-    {
-        tidesdb_txn_rollback(txn);
-        tidesdb_txn_free(txn);
-        return 0;
-    }
-
-    tidesdb_iter_seek(iter, (const uint8_t *)prefix.data(), prefix.size());
-    while (tidesdb_iter_valid(iter))
-    {
-        uint8_t *kp = NULL;
-        size_t klen = 0;
-        if (tidesdb_iter_key(iter, &kp, &klen) != TDB_SUCCESS || !kp) break;
-
-        /* We stop when prefix no longer matches */
-        if (klen < prefix.size() || memcmp(kp, prefix.data(), prefix.size()) != 0) break;
-
-        /* Table name is everything after the "db\0" prefix */
-        const char *tname = (const char *)kp + prefix.size();
-        size_t tlen = klen - prefix.size();
-        result->add_table(tname, tlen);
-
-        tidesdb_iter_next(iter);
-    }
-
-    tidesdb_iter_free(iter);
-    tidesdb_txn_rollback(txn);
-    tidesdb_txn_free(txn);
-    return 0;
-}
-#endif
-
-/*
-  Handlerton discover_table_existence callback.
-  Returns 1 if the table has an entry in the schema CF, 0 otherwise.
-*/
-#if 0 /* MariaDB-only discover_table_existence */
-static int tidesdb_discover_table_existence(handlerton *, const char *db, const char *table_name)
-{
-    if (!schema_cf) return 0;
-
-    /* Ensure database directories are up-to-date for replica discovery. */
-    schema_cf_ensure_databases();
-
-    LEX_CSTRING db_lex = {db, strlen(db)};
-    LEX_CSTRING tbl_lex = {table_name, strlen(table_name)};
-    std::string key = schema_cf_key(db_lex, tbl_lex);
-
-    tidesdb_txn_t *txn = NULL;
-    if (tidesdb_txn_begin(tdb_get_engine(), &txn) != TDB_SUCCESS) return 0;
-
-    uint8_t *val = NULL;
-    size_t val_len = 0;
-    int rc =
-        tidesdb_txn_get(txn, schema_cf, (const uint8_t *)key.data(), key.size(), &val, &val_len);
-    tidesdb_txn_rollback(txn);
-    tidesdb_txn_free(txn);
-    if (val) free(val);
-
-    return (rc == TDB_SUCCESS) ? 1 : 0;
-}
-#endif
+/* (deleted) comment + #if 0: discover_table_existence -- MariaDB-only dead code; see git history if needed. */
 
 /*
   Scan the schema CF for all unique database names and create any missing
