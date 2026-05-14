@@ -449,50 +449,9 @@ inline void sql_print_error(const char *fmt, ...) {
     va_end(ap);
 }
 
-/* ----- Category 3: Encryption API ports -----
- * MariaDB exposes a public C API for at-rest encryption that storage engines
- * call directly. MySQL has an analogous component-based stack (keyring_aes,
- * keyring_reader_with_status). For our v1 we use the simplest workable
- * mechanism: the DBA puts a 32-byte AES-256 key in a file pointed to by
- * the tidesdb_master_key_file system variable; the plugin reads it once at
- * init and uses my_aes_encrypt/my_aes_decrypt for the actual crypto. This
- * avoids the dependency on a separately-installed keyring component while
- * still giving real encryption-at-rest. Per-table key_id is accepted in
- * the public API but maps to the same master key for now -- key rotation
- * and per-table keys are follow-up work. Real implementations live in
- * plugin/tidesdb_keyring_compat.cc. */
-#ifndef ENCRYPTION_FLAG_DECRYPT
-#define ENCRYPTION_FLAG_DECRYPT 0
-#endif
-#ifndef ENCRYPTION_FLAG_ENCRYPT
-#define ENCRYPTION_FLAG_ENCRYPT 1
-#endif
-#ifndef ENCRYPTION_KEY_VERSION_INVALID
-#define ENCRYPTION_KEY_VERSION_INVALID ((unsigned int)-1)
-#endif
-
-int encryption_crypt(const unsigned char *src, unsigned int src_len,
-                     unsigned char *dst, unsigned int *dst_len,
-                     const unsigned char *key, unsigned int key_len,
-                     const unsigned char *iv, unsigned int iv_len,
-                     int flags, unsigned int key_id,
-                     unsigned int key_version);
-
-unsigned int encryption_encrypted_length(unsigned int src_len,
-                                         unsigned int key_id,
-                                         unsigned int key_version);
-
-int encryption_key_get(unsigned int key_id, unsigned int key_version,
-                       unsigned char *key, unsigned int *key_len);
-
-unsigned int encryption_key_get_latest_version(unsigned int key_id);
-
-/* Master-key bootstrap. Called from plugin init with the path the DBA
-   set in tidesdb_master_key_file. Returns false on success, true on
-   failure (file missing, wrong size, IO error). When the master key is
-   not loaded, encryption_key_get returns -1 and any CREATE TABLE that
-   asks for encryption fails with a clear error. */
-bool tidesdb_master_key_load_from_file(const char *path);
-
-/* Test-only: clears the loaded key. Used between test runs. */
-void tidesdb_master_key_clear();
+/* (extracted) The at-rest encryption / master-key API was hosted here
+ * for the original port. It now lives in its own header
+ * `tidesdb_master_key.h` -- this was the first step of the architectural
+ * extraction recommended by the follow-up code review. compat.h is
+ * sliding toward MariaDB-only renames and stubs as its sole role. */
+#include "tidesdb_master_key.h"

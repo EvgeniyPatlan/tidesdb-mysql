@@ -55,7 +55,7 @@ PLUGIN_DST="vendor/mysql-server/storage/tidesdb"
 echo "[setup] Installing plugin source -> $PLUGIN_DST"
 mkdir -p "$PLUGIN_DST"
 # Copy every file under plugin/ -- safer than naming each one, since new
-# .cc/.h files (e.g. tidesdb_keyring_compat.cc for at-rest encryption)
+# .cc/.h files (e.g. tidesdb_master_key.{cc,h} for at-rest encryption)
 # were silently missed by the explicit list and broke the build.
 cp plugin/*.cc plugin/*.h plugin/CMakeLists.txt "$PLUGIN_DST/"
 

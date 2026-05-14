@@ -14,9 +14,10 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
 
 /*
- * Master-key implementation of the MariaDB-style encryption API the rest
- * of the engine calls. The plugin has its own row-level encrypt/decrypt
- * code (tidesdb_encrypt_row_into / tidesdb_decrypt_row in ha_tidesdb.cc)
+ * Master-key + at-rest encryption subsystem implementation.
+ *
+ * The plugin has its own row-level encrypt/decrypt code
+ * (tidesdb_encrypt_row_into / tidesdb_decrypt_row in ha_tidesdb.cc)
  * that calls these four functions. We back them with a 32-byte AES-256
  * master key loaded once at plugin init from a file path the DBA sets
  * via the tidesdb_master_key_file system variable.
@@ -25,6 +26,10 @@
  * MySQL's keyring_aes component) is follow-up work; this gives real
  * AES-256-CBC encryption-at-rest with a single master key, which is
  * what the existing tidesdb_encryption MTR test exercises.
+ *
+ * Promoted out of the former tidesdb_keyring_compat.cc as the second
+ * step of the architectural extraction recommended in the follow-up
+ * code review.
  */
 
 #include "my_aes.h"
@@ -38,7 +43,8 @@
 #include <sys/mman.h>  /* mlock, madvise -- L-5 master-key hardening */
 #include <unistd.h>    /* sysconf, _SC_PAGESIZE */
 
-#include "tidesdb_compat.h"
+#include "tidesdb_compat.h"     /* sql_print_* shims */
+#include "tidesdb_master_key.h"
 
 namespace {
 
