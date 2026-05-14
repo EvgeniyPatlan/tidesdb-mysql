@@ -1016,3 +1016,11 @@ class ha_tidesdb : public handler
                                     dd::Table *new_table_def) override;
     bool check_if_incompatible_data(HA_CREATE_INFO *create_info, uint table_changes) override;
 };
+
+/* Log sanitizer (MF-6). Replaces every control byte (< 0x20 or 0x7f)
+   in `in` with '?', writes a NUL-terminated copy into `out` (up to
+   out_size - 1 chars). Used wherever a SYSTEM_VARIABLES_ADMIN-
+   controlled value is logged via %s. Exposed at module scope so the
+   FTS TU (tidesdb_fts.cc) can sanitize stop-word table_spec strings
+   before logging. Defined in ha_tidesdb.cc. */
+void tdb_sanitize_for_log(const char *in, char *out, size_t out_size);
