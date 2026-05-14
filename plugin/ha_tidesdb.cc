@@ -49,6 +49,8 @@ extern "C"
 #include "sql/key.h"
 #include "sql/sql_class.h"
 
+#include "tidesdb_engine_context.h"  /* g_engine_ctx, tdb_get_engine/set_engine */
+
 /* See plugin/tidesdb_compat.h's "Category 7: Logging shims" comment
  * for why sql_print_information/warning/error keep their stderr
  * implementation rather than routing through MySQL's structured log
@@ -87,13 +89,9 @@ static void tdb_sanitize_for_log(const char *in, char *out, size_t out_size);
 /* Forward-declared for tdb_rc_to_ha(); defined with sysvars below */
 static my_bool srv_print_all_conflicts = 0;
 static my_bool srv_pessimistic_locking = 0;
-static mysql_mutex_t last_conflict_mutex;
-/* Buffer for the most recent conflict diagnostic surfaced under
-   `Last conflict:` in SHOW ENGINE TIDESDB STATUS.  Sized comfortably above
-   any expected single-line message; updates are bounded by snprintf with
-   sizeof() so the constant only appears here. */
-static constexpr size_t LAST_CONFLICT_INFO_LEN = 1024;
-static char last_conflict_info[LAST_CONFLICT_INFO_LEN] = "";
+/* last_conflict_mutex / last_conflict_info / LAST_CONFLICT_INFO_LEN
+   moved to plugin/tidesdb_engine_context.{h,cc} (architectural
+   extraction A-4). All references go through g_engine_ctx. */
 
 /* Reader-writer lock protecting tidesdb_trx_t lifetime against the
    deadlock-graph walker.
@@ -175,10 +173,10 @@ static int tdb_rc_to_ha(int rc, const char *ctx)
                     "[TIDESDB] %s: transaction aborted due to write-write "
                     "conflict (TDB_ERR_CONFLICT)",
                     ctx);
-                mysql_mutex_lock(&last_conflict_mutex);
-                snprintf(last_conflict_info, sizeof(last_conflict_info), "Last conflict: %s at %ld",
+                mysql_mutex_lock(&g_engine_ctx.last_conflict_mutex);
+                snprintf(g_engine_ctx.last_conflict_info, sizeof(g_engine_ctx.last_conflict_info), "Last conflict: %s at %ld",
                          ctx, (long)time(NULL));
-                mysql_mutex_unlock(&last_conflict_mutex);
+                mysql_mutex_unlock(&g_engine_ctx.last_conflict_mutex);
             }
             return HA_ERR_LOCK_DEADLOCK;
 
@@ -256,30 +254,11 @@ static inline int tidesdb_txn_delete_cf(tidesdb_txn_t *txn, tidesdb_column_famil
 /* MariaDB data directory */
 extern MYSQL_PLUGIN_IMPORT char mysql_real_data_home[];
 
-/* Global TidesDB database handle.
- *
- * Stored as std::atomic<tidesdb_t *> so the shutdown clear in
- * tidesdb_hton_panic / tidesdb_deinit_func is properly synchronized with
- * concurrent handler-thread reads. MySQL does NOT guarantee all handler
- * threads have quiesced before panic runs, so the write/read race was
- * a real null-deref crash risk under shutdown-with-load.
- *
- * All call sites read via tdb_get_engine() (acquire load) and write via
- * tdb_set_engine() (release store). Direct access to g_tdb_engine is
- * confined to those two helpers. */
-static std::atomic<tidesdb_t *> g_tdb_engine{nullptr};
-static inline tidesdb_t *tdb_get_engine()
-{
-    return g_tdb_engine.load(std::memory_order_acquire);
-}
-static inline void tdb_set_engine(tidesdb_t *p)
-{
-    g_tdb_engine.store(p, std::memory_order_release);
-}
-static std::string tdb_path;
-
-/* Schema discovery CF for object store mode (NULL when local-only) */
-static tidesdb_column_family_t *schema_cf = NULL;
+/* engine handle / schema_cf / path moved to EngineContext (see
+   plugin/tidesdb_engine_context.{h,cc}). tdb_get_engine and
+   tdb_set_engine accessors are now header-inline and reach
+   g_engine_ctx.engine. The header itself is included near the top
+   of this file alongside the other plugin-internal includes. */
 
 static handlerton *tidesdb_hton;
 
@@ -1831,7 +1810,7 @@ static MYSQL_SYSVAR_ENUM(log_level, srv_log_level, PLUGIN_VAR_RQCMDARG | PLUGIN_
 /* Conflict information logging.
    Similar to innodb_print_all_deadlocks -- logs all TDB_ERR_CONFLICT
    events to the error log with transaction and table details.
-   (srv_print_all_conflicts, last_conflict_mutex, last_conflict_info
+   (srv_print_all_conflicts, g_engine_ctx.last_conflict_mutex, g_engine_ctx.last_conflict_info
     are forward-declared near tdb_rc_to_ha().) */
 static MYSQL_SYSVAR_BOOL(print_all_conflicts, srv_print_all_conflicts, PLUGIN_VAR_RQCMDARG,
                          "Log all TidesDB conflict errors to the error log "
@@ -3473,7 +3452,7 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
 
     pos += snprintf(buf + pos, sizeof(buf) - pos,
                     "================== TidesDB Engine Status ==================\n");
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "Data directory: %s\n", tdb_path.c_str());
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "Data directory: %s\n", g_engine_ctx.path.c_str());
     pos += snprintf(buf + pos, sizeof(buf) - pos, "Unified memtable: %s\n",
                     srv_unified_memtable ? "ON" : "OFF");
     pos +=
@@ -3550,11 +3529,11 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
     }
 
     /* Last conflict info */
-    mysql_mutex_lock(&last_conflict_mutex);
-    if (last_conflict_info[0])
+    mysql_mutex_lock(&g_engine_ctx.last_conflict_mutex);
+    if (g_engine_ctx.last_conflict_info[0])
         pos +=
-            snprintf(buf + pos, sizeof(buf) - pos, "\n--- Conflicts ---\n%s\n", last_conflict_info);
-    mysql_mutex_unlock(&last_conflict_mutex);
+            snprintf(buf + pos, sizeof(buf) - pos, "\n--- Conflicts ---\n%s\n", g_engine_ctx.last_conflict_info);
+    mysql_mutex_unlock(&g_engine_ctx.last_conflict_mutex);
 
     static constexpr const char TIDESDB_ENGINE_NAME[] = "TIDESDB";
     static constexpr uint TIDESDB_ENGINE_NAME_LEN = sizeof(TIDESDB_ENGINE_NAME) - 1;
@@ -3568,7 +3547,7 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
   directories to create on replicas. The MariaDB discover_table /
   discover_table_names hooks that originally consumed .frm binaries from
   this CF are #if 0'd for MySQL -- MySQL uses the Data Dictionary instead,
-  so no .frm bytes are stored here. On local-only mode schema_cf is NULL
+  so no .frm bytes are stored here. On local-only mode g_engine_ctx.schema_cf is NULL
   and all helpers are no-ops.
 */
 
@@ -3635,11 +3614,11 @@ static std::string schema_cf_key_from_path(const char *path)
   When frm_data is NULL, the .frm is read from disk (ALTER TABLE path
   where MariaDB writes the updated .frm before calling commit).
 
-  No-op when schema_cf is NULL (local-only mode).
+  No-op when g_engine_ctx.schema_cf is NULL (local-only mode).
 */
 static int schema_cf_store_frm(const char *path, const uchar *frm_data = NULL, size_t frm_len = 0)
 {
-    if (!schema_cf) return 0;
+    if (!g_engine_ctx.schema_cf) return 0;
 
     uchar *alloc_buf = NULL;
 
@@ -3680,7 +3659,7 @@ static int schema_cf_store_frm(const char *path, const uchar *frm_data = NULL, s
     int rc = tidesdb_txn_begin(tdb_get_engine(), &txn);
     if (rc == TDB_SUCCESS)
     {
-        rc = tidesdb_txn_put(txn, schema_cf, (const uint8_t *)key.data(), key.size(), frm_data,
+        rc = tidesdb_txn_put(txn, g_engine_ctx.schema_cf, (const uint8_t *)key.data(), key.size(), frm_data,
                              frm_len, TIDESDB_TTL_NONE);
         if (rc == TDB_SUCCESS)
             rc = tidesdb_txn_commit(txn);
@@ -3698,13 +3677,13 @@ static int schema_cf_store_frm(const char *path, const uchar *frm_data = NULL, s
 */
 static void schema_cf_delete(const char *path)
 {
-    if (!schema_cf) return;
+    if (!g_engine_ctx.schema_cf) return;
 
     std::string key = schema_cf_key_from_path(path);
     tidesdb_txn_t *txn = NULL;
     if (tidesdb_txn_begin(tdb_get_engine(), &txn) == TDB_SUCCESS)
     {
-        tidesdb_txn_delete(txn, schema_cf, (const uint8_t *)key.data(), key.size());
+        tidesdb_txn_delete(txn, g_engine_ctx.schema_cf, (const uint8_t *)key.data(), key.size());
         tidesdb_txn_commit(txn);
         tidesdb_txn_free(txn);
     }
@@ -3713,11 +3692,11 @@ static void schema_cf_delete(const char *path)
 /*
   Remove every schema CF entry belonging to a dropped database.
   Keys are "db_name\0table_name" so we iterate the CF and delete entries
-  whose prefix matches.  No-op in local-only mode (schema_cf is NULL).
+  whose prefix matches.  No-op in local-only mode (g_engine_ctx.schema_cf is NULL).
 */
 static void schema_cf_delete_db(const std::string &db_name)
 {
-    if (!schema_cf || db_name.empty()) return;
+    if (!g_engine_ctx.schema_cf || db_name.empty()) return;
 
     /* Match keys beginning with "db_name<SCHEMA_CF_KEY_SEP>". */
     std::string prefix = db_name;
@@ -3727,7 +3706,7 @@ static void schema_cf_delete_db(const std::string &db_name)
     if (tidesdb_txn_begin(tdb_get_engine(), &txn) != TDB_SUCCESS) return;
 
     tidesdb_iter_t *it = NULL;
-    if (tidesdb_iter_new(txn, schema_cf, &it) != TDB_SUCCESS)
+    if (tidesdb_iter_new(txn, g_engine_ctx.schema_cf, &it) != TDB_SUCCESS)
     {
         tidesdb_txn_rollback(txn);
         tidesdb_txn_free(txn);
@@ -3748,7 +3727,7 @@ static void schema_cf_delete_db(const std::string &db_name)
     tidesdb_iter_free(it);
 
     for (const auto &k : to_delete)
-        tidesdb_txn_delete(txn, schema_cf, (const uint8_t *)k.data(), k.size());
+        tidesdb_txn_delete(txn, g_engine_ctx.schema_cf, (const uint8_t *)k.data(), k.size());
 
     if (!to_delete.empty())
         tidesdb_txn_commit(txn);
@@ -3763,7 +3742,7 @@ static void schema_cf_delete_db(const std::string &db_name)
 */
 static void schema_cf_rename(const char *from, const char *to)
 {
-    if (!schema_cf) return;
+    if (!g_engine_ctx.schema_cf) return;
 
     std::string old_key = schema_cf_key_from_path(from);
     std::string new_key = schema_cf_key_from_path(to);
@@ -3774,15 +3753,15 @@ static void schema_cf_rename(const char *from, const char *to)
     /* We read existing .frm from old key */
     uint8_t *val = NULL;
     size_t val_len = 0;
-    int rc = tidesdb_txn_get(txn, schema_cf, (const uint8_t *)old_key.data(), old_key.size(), &val,
+    int rc = tidesdb_txn_get(txn, g_engine_ctx.schema_cf, (const uint8_t *)old_key.data(), old_key.size(), &val,
                              &val_len);
     if (rc == TDB_SUCCESS && val)
     {
         /* We write under new key */
-        tidesdb_txn_put(txn, schema_cf, (const uint8_t *)new_key.data(), new_key.size(), val,
+        tidesdb_txn_put(txn, g_engine_ctx.schema_cf, (const uint8_t *)new_key.data(), new_key.size(), val,
                         val_len, TIDESDB_TTL_NONE);
         /* We delete old key */
-        tidesdb_txn_delete(txn, schema_cf, (const uint8_t *)old_key.data(), old_key.size());
+        tidesdb_txn_delete(txn, g_engine_ctx.schema_cf, (const uint8_t *)old_key.data(), old_key.size());
         tidesdb_txn_commit(txn);
         /* Must be tidesdb_free, not libc free -- val was allocated by
            TidesDB's internal allocator, which may be mimalloc / jemalloc
@@ -3819,13 +3798,13 @@ static void schema_cf_rename(const char *from, const char *to)
 */
 static void schema_cf_ensure_databases()
 {
-    if (!schema_cf) return;
+    if (!g_engine_ctx.schema_cf) return;
 
     tidesdb_txn_t *txn = NULL;
     if (tidesdb_txn_begin(tdb_get_engine(), &txn) != TDB_SUCCESS) return;
 
     tidesdb_iter_t *iter = NULL;
-    if (tidesdb_iter_new(txn, schema_cf, &iter) != TDB_SUCCESS || !iter)
+    if (tidesdb_iter_new(txn, g_engine_ctx.schema_cf, &iter) != TDB_SUCCESS || !iter)
     {
         tidesdb_txn_rollback(txn);
         tidesdb_txn_free(txn);
@@ -3939,7 +3918,9 @@ static int tidesdb_init_func(void *p)
     /* tidesdb_hton->kill_query = tidesdb_hton_kill_query;  -- MariaDB-only.
      * MySQL signals query abort via THD::killed which the engine should poll. */
 
-    mysql_mutex_init(0, &last_conflict_mutex, MY_MUTEX_INIT_FAST);
+    /* Initialize the engine context (last_conflict_mutex). schema_cf,
+       engine, path are populated later by the open / config code. */
+    g_engine_ctx.init();
 
     tdb_row_lock_init();
 
@@ -3964,8 +3945,8 @@ static int tidesdb_init_func(void *p)
        a sibling directory of the MariaDB data directory. */
     if (srv_data_home_dir && srv_data_home_dir[0])
     {
-        tdb_path = srv_data_home_dir;
-        while (!tdb_path.empty() && tdb_path.back() == '/') tdb_path.pop_back();
+        g_engine_ctx.path = srv_data_home_dir;
+        while (!g_engine_ctx.path.empty() && g_engine_ctx.path.back() == '/') g_engine_ctx.path.pop_back();
     }
     else
     {
@@ -3973,9 +3954,9 @@ static int tidesdb_init_func(void *p)
         while (!data_home.empty() && data_home.back() == '/') data_home.pop_back();
         size_t slash_pos = data_home.rfind('/');
         if (slash_pos != std::string::npos)
-            tdb_path = data_home.substr(0, slash_pos + 1) + "tidesdb_data";
+            g_engine_ctx.path = data_home.substr(0, slash_pos + 1) + "tidesdb_data";
         else
-            tdb_path = "tidesdb_data";
+            g_engine_ctx.path = "tidesdb_data";
     }
 
     /* We map log level enum index to TidesDB constants */
@@ -3983,7 +3964,7 @@ static int tidesdb_init_func(void *p)
                                         TDB_LOG_ERROR, TDB_LOG_FATAL, TDB_LOG_NONE};
 
     tidesdb_config_t cfg = tidesdb_default_config();
-    cfg.db_path = const_cast<char *>(tdb_path.c_str());
+    cfg.db_path = const_cast<char *>(g_engine_ctx.path.c_str());
     cfg.num_flush_threads = (int)srv_flush_threads;
     cfg.num_compaction_threads = (int)srv_compaction_threads;
     cfg.log_level = (tidesdb_log_level_t)log_level_map[srv_log_level];
@@ -4065,14 +4046,14 @@ static int tidesdb_init_func(void *p)
     int rc = tidesdb_open(&cfg, &opened);
     if (rc != TDB_SUCCESS)
     {
-        sql_print_error("[TIDESDB] Failed to open TidesDB at %s (err=%d)", tdb_path.c_str(), rc);
+        sql_print_error("[TIDESDB] Failed to open TidesDB at %s (err=%d)", g_engine_ctx.path.c_str(), rc);
         DBUG_RETURN(1);
     }
     /* Publish atomically -- handler threads must observe a fully-constructed
        engine handle, not a torn write. */
     tdb_set_engine(opened);
 
-    sql_print_information("[TIDESDB] TidesDB opened at %s", tdb_path.c_str());
+    sql_print_information("[TIDESDB] TidesDB opened at %s", g_engine_ctx.path.c_str());
 
     /* Schema discovery CF -- created when object store is active so that
        replicas can discover table definitions from the shared storage. */
@@ -4082,9 +4063,9 @@ static int tidesdb_init_func(void *p)
         if (!tidesdb_get_column_family(tdb_get_engine(), SCHEMA_CF_NAME))
             tidesdb_create_column_family(tdb_get_engine(), SCHEMA_CF_NAME, &schema_cfg);
 
-        schema_cf = tidesdb_get_column_family(tdb_get_engine(), SCHEMA_CF_NAME);
+        g_engine_ctx.schema_cf = tidesdb_get_column_family(tdb_get_engine(), SCHEMA_CF_NAME);
 
-        if (schema_cf)
+        if (g_engine_ctx.schema_cf)
         {
             /* MariaDB-only discover_* hooks for engine-driven table discovery
              * (used with object-store mode). MySQL's Data Dictionary handles
@@ -4115,7 +4096,7 @@ static bool tidesdb_hton_flush_logs(handlerton *)
 {
     if (!tdb_get_engine()) return false;
 
-    tidesdb_column_family_t *target = schema_cf;
+    tidesdb_column_family_t *target = g_engine_ctx.schema_cf;
     if (!target)
     {
         char **names = NULL;
@@ -4150,11 +4131,11 @@ static int tidesdb_hton_panic(handlerton *, enum ha_panic_function flag)
     /* Take ownership atomically: any handler thread that loads after this
        point sees nullptr and short-circuits cleanly. We swap rather than
        load+store so no second caller can race us into a double-close. */
-    tidesdb_t *engine = g_tdb_engine.exchange(nullptr, std::memory_order_acq_rel);
+    tidesdb_t *engine = g_engine_ctx.engine.exchange(nullptr, std::memory_order_acq_rel);
     if (engine)
     {
         tidesdb_close(engine);
-        schema_cf = NULL;
+        g_engine_ctx.schema_cf = NULL;
     }
     return 0;
 }
@@ -4227,17 +4208,17 @@ static int tidesdb_deinit_func(void *p)
 {
     DBUG_ENTER("tidesdb_deinit_func");
 
-    schema_cf = NULL;
+    g_engine_ctx.schema_cf = NULL;
 
     /* Atomic exchange: takes ownership of the engine handle and races
        cleanly with tidesdb_hton_panic (which uses the same pattern). */
-    tidesdb_t *engine = g_tdb_engine.exchange(nullptr, std::memory_order_acq_rel);
+    tidesdb_t *engine = g_engine_ctx.engine.exchange(nullptr, std::memory_order_acq_rel);
     if (engine)
     {
         tidesdb_close(engine);
     }
 
-    mysql_mutex_destroy(&last_conflict_mutex);
+    g_engine_ctx.destroy();
     /* HF-2: per-share FTS-meta mutexes destroyed in TidesDB_share dtor. */
     mysql_rwlock_destroy(&g_trx_lifecycle_lock);
     mysql_rwlock_destroy(&tdb_stopword_lock);
@@ -10261,7 +10242,7 @@ static void force_remove_cf_dir(const std::string &cf_name)
 {
     char dir[FN_REFLEN];
     const char sep[] = {FN_LIBCHAR, 0};
-    strxnmov(dir, sizeof(dir) - 1, tdb_path.c_str(), sep, cf_name.c_str(), NullS);
+    strxnmov(dir, sizeof(dir) - 1, g_engine_ctx.path.c_str(), sep, cf_name.c_str(), NullS);
 
     MY_STAT st;
     if (!my_stat(dir, &st, MYF(0))) return; /* already gone */
@@ -10358,7 +10339,7 @@ static std::string tidesdb_path_to_db_name(const char *path)
   Handlerton-level drop_database callback. Invoked when the server-side
   DROP DATABASE has finished removing the database files. Without this
   hook, TidesDB column families belonging to the dropped database (and
-  any object-store-mode entries in schema_cf) would outlive the database
+  any object-store-mode entries in g_engine_ctx.schema_cf) would outlive the database
   and accumulate on disk.
 
   We enumerate every CF whose name starts with "<db_name>__" (the prefix
@@ -10401,7 +10382,7 @@ static void tidesdb_hton_drop_database(handlerton *, char *path)
     }
 
     /* We clean up schema CF entries for this database (object-store mode).
-       No-op when schema_cf is NULL (local-only mode). */
+       No-op when g_engine_ctx.schema_cf is NULL (local-only mode). */
     schema_cf_delete_db(db);
 
     sql_print_information("[TIDESDB] drop_database: removed %zu column famil%s for '%s'",
