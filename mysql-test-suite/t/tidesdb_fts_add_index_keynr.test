@@ -1,0 +1,102 @@
+--source suite/tidesdb/include/have_tidesdb.inc
+#
+# Test: FULLTEXT key-number consistency and meta-counter correctness
+#       across DROP+ADD in one ALTER and across a drop / re-ADD cycle.
+#
+# Guards two review findings:
+#  * keynr remap: DROP a preceding secondary index AND ADD FULLTEXT in
+#    the SAME ALTER -- the FULLTEXT index's key number shifts; the FTS
+#    meta key (in the data CF, keyed by key number) must still line up
+#    with what ft_init_ext uses after commit, or MATCH ranks/returns
+#    nothing.
+#  * F-1: re-adding a FULLTEXT index must not double-count total_docs /
+#    total_words. A clean re-ADD must produce identical MATCH results
+#    and relevance ordering to the first ADD (no skew from stale meta).
+#
+
+--echo #
+--echo # Setup: rows + a throwaway secondary index that we will drop in
+--echo # the same ALTER that adds the FULLTEXT index (forces a keynr shift)
+--echo #
+
+CREATE TABLE docs (
+  id   INT NOT NULL PRIMARY KEY AUTO_INCREMENT,
+  tag  VARCHAR(32),
+  body TEXT,
+  KEY idx_tag (tag)
+) ENGINE=TidesDB;
+
+INSERT INTO docs (tag, body) VALUES
+ ('a', 'alpha widget engine alpha alpha'),
+ ('b', 'beta widget gear'),
+ ('c', 'gamma sprocket only no keyword'),
+ ('d', 'widget widget widget heavy repetition');
+
+--echo #
+--echo # DROP idx_tag AND ADD FULLTEXT ft_body in ONE ALTER
+--echo #
+
+ALTER TABLE docs
+  DROP INDEX idx_tag,
+  ADD FULLTEXT INDEX ft_body (body);
+
+--echo #
+--echo # TEST 1: back-populated rows are found, ranked by relevance
+--echo #         (id 4 has 3x 'widget' -> highest; id 3 has none)
+--echo #
+
+SELECT id FROM docs
+WHERE MATCH(body) AGAINST('widget')
+ORDER BY MATCH(body) AGAINST('widget') DESC, id;
+
+--echo #
+--echo # Capture the relevance ordering as a baseline string
+--echo #
+
+SELECT GROUP_CONCAT(id ORDER BY MATCH(body) AGAINST('widget') DESC, id) AS rank_order
+FROM docs
+WHERE MATCH(body) AGAINST('widget');
+
+--echo #
+--echo # TEST 2: drop the FULLTEXT index, then re-ADD it. F-1 regression:
+--echo # stale meta counters must NOT survive the drop, so the re-built
+--echo # index must yield the IDENTICAL ranking (no double-count skew).
+--echo #
+
+ALTER TABLE docs DROP INDEX ft_body;
+ALTER TABLE docs ADD FULLTEXT INDEX ft_body (body);
+
+SELECT id FROM docs
+WHERE MATCH(body) AGAINST('widget')
+ORDER BY MATCH(body) AGAINST('widget') DESC, id;
+
+SELECT GROUP_CONCAT(id ORDER BY MATCH(body) AGAINST('widget') DESC, id) AS rank_order_after_readd
+FROM docs
+WHERE MATCH(body) AGAINST('widget');
+
+--echo #
+--echo # TEST 3: boolean mode still correct after the re-ADD cycle
+--echo #
+
+SELECT id FROM docs
+WHERE MATCH(body) AGAINST('+widget -gear' IN BOOLEAN MODE)
+ORDER BY id;
+
+--echo #
+--echo # TEST 4: post-readd writes still index, mixed old+new
+--echo #
+
+INSERT INTO docs (tag, body) VALUES ('e', 'fresh widget delivery');
+
+SELECT id FROM docs
+WHERE MATCH(body) AGAINST('widget')
+ORDER BY id;
+
+--echo #
+--echo # Cleanup
+--echo #
+
+DROP TABLE docs;
+
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

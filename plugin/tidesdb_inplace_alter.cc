@@ -321,6 +321,19 @@ bool ha_tidesdb::inplace_alter_table(
     std::vector<fts_token_t> fts_tokens;
     std::unordered_map<std::string, uint16> fts_tf;
 
+    /* F-1: per-added-index FTS meta accumulators. The posting entries go
+       into the new index CF in batched txns, but the meta counters
+       (total_docs / total_words, stored in share->cf, the data CF, which
+       is NOT dropped on ALTER rollback) must be written exactly once and
+       only if the whole build succeeds. Writing them per-row meant an
+       aborted/KILLed build (rollback drops just the new index CF) left
+       inflated counters behind, so a retry double-counted and skewed
+       BM25. We accumulate here and flush a single fts_update_meta per
+       FTS index after the final successful commit; on any abort path
+       nothing is written. Indexed by the ctx->add_cfs position `a`. */
+    std::vector<int64_t> fts_doc_acc(ctx->add_cfs.size(), 0);
+    std::vector<int64_t> fts_word_acc(ctx->add_cfs.size(), 0);
+
     while (tidesdb_iter_valid(iter))
     {
         uint8_t *key_data = NULL;
@@ -409,14 +422,13 @@ bool ha_tidesdb::inplace_alter_table(
                             key_num, frc);
                 }
 
-                /* Index-build runs in its own DDL txn; the bulk-insert
-                   delta accumulator is not active here, so flush the
-                   per-doc meta counters inline like write_row's
-                   non-bulk branch. keynr is the new index's key number
-                   in altered_table, which is what ft_init_ext will use
-                   for fts_load_meta after commit. */
-                fts_update_meta(share, txn, share->cf, key_num, FTS_DOC_DELTA_ADD,
-                                (int64_t)word_count);
+                /* F-1: accumulate; the single fts_update_meta is issued
+                   after the final successful commit (see end of scan).
+                   keynr is the new index's key number in altered_table,
+                   which is what ft_init_ext uses for fts_load_meta after
+                   commit. */
+                fts_doc_acc[a] += FTS_DOC_DELTA_ADD;
+                fts_word_acc[a] += (int64_t)word_count;
                 continue;
             }
             /* SPATIAL still uses a separate path (not back-populated). */
@@ -565,6 +577,54 @@ bool ha_tidesdb::inplace_alter_table(
         tmp_restore_column_map(altered_table->read_set, old_map);
         DBUG_RETURN(true);
     }
+
+    /* F-1: the index postings are now durably committed. Flush the FTS
+       meta counters exactly once, in their own txn. Reaching here means
+       the whole back-populate succeeded; every abort path above returned
+       earlier without touching meta, so an aborted/KILLed build leaves
+       share->cf's FTS counters untouched and a retry starts clean.
+       A meta-write failure here only degrades BM25 ranking (fts_load_meta
+       falls back to neutral avgdl); the index itself is correct, so we
+       log and proceed rather than fail an ALTER whose data is committed. */
+    {
+        bool any_fts = false;
+        for (size_t a = 0; a < fts_doc_acc.size(); a++)
+            if (fts_doc_acc[a] != 0 || fts_word_acc[a] != 0) { any_fts = true; break; }
+
+        if (any_fts)
+        {
+            tidesdb_txn_t *mtxn = NULL;
+            int mrc = tidesdb_txn_begin_with_isolation(tdb_get_engine(),
+                                                       TDB_ISOLATION_READ_COMMITTED, &mtxn);
+            if (mrc != TDB_SUCCESS || !mtxn)
+            {
+                sql_print_warning(
+                    "[TIDESDB] inplace ADD FULLTEXT: meta txn_begin failed (err=%d); "
+                    "BM25 ranking will use fallback stats until the index is rebuilt",
+                    mrc);
+            }
+            else
+            {
+                for (size_t a = 0; a < fts_doc_acc.size(); a++)
+                {
+                    if (fts_doc_acc[a] == 0 && fts_word_acc[a] == 0) continue;
+                    fts_update_meta(share, mtxn, share->cf, ctx->add_key_nums[a],
+                                    fts_doc_acc[a], fts_word_acc[a]);
+                }
+                int mcrc = tidesdb_txn_commit(mtxn);
+                if (mcrc != TDB_SUCCESS)
+                {
+                    tidesdb_txn_rollback(mtxn);
+                    sql_print_warning(
+                        "[TIDESDB] inplace ADD FULLTEXT: meta commit failed (err=%d); "
+                        "BM25 ranking will use fallback stats until the index is rebuilt",
+                        mcrc);
+                }
+                tidesdb_txn_free(mtxn);
+            }
+        }
+    }
+
     tmp_restore_column_map(altered_table->read_set, old_map);
     DBUG_RETURN(false);
 }

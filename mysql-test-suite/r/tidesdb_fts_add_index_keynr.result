@@ -1,0 +1,85 @@
+#
+# Setup: rows + a throwaway secondary index that we will drop in
+# the same ALTER that adds the FULLTEXT index (forces a keynr shift)
+#
+CREATE TABLE docs (
+id   INT NOT NULL PRIMARY KEY AUTO_INCREMENT,
+tag  VARCHAR(32),
+body TEXT,
+KEY idx_tag (tag)
+) ENGINE=TidesDB;
+INSERT INTO docs (tag, body) VALUES
+('a', 'alpha widget engine alpha alpha'),
+('b', 'beta widget gear'),
+('c', 'gamma sprocket only no keyword'),
+('d', 'widget widget widget heavy repetition');
+#
+# DROP idx_tag AND ADD FULLTEXT ft_body in ONE ALTER
+#
+ALTER TABLE docs
+DROP INDEX idx_tag,
+ADD FULLTEXT INDEX ft_body (body);
+#
+# TEST 1: back-populated rows are found, ranked by relevance
+#         (id 4 has 3x 'widget' -> highest; id 3 has none)
+#
+SELECT id FROM docs
+WHERE MATCH(body) AGAINST('widget')
+ORDER BY MATCH(body) AGAINST('widget') DESC, id;
+id
+4
+2
+1
+#
+# Capture the relevance ordering as a baseline string
+#
+SELECT GROUP_CONCAT(id ORDER BY MATCH(body) AGAINST('widget') DESC, id) AS rank_order
+FROM docs
+WHERE MATCH(body) AGAINST('widget');
+rank_order
+4,2,1
+#
+# TEST 2: drop the FULLTEXT index, then re-ADD it. F-1 regression:
+# stale meta counters must NOT survive the drop, so the re-built
+# index must yield the IDENTICAL ranking (no double-count skew).
+#
+ALTER TABLE docs DROP INDEX ft_body;
+ALTER TABLE docs ADD FULLTEXT INDEX ft_body (body);
+SELECT id FROM docs
+WHERE MATCH(body) AGAINST('widget')
+ORDER BY MATCH(body) AGAINST('widget') DESC, id;
+id
+4
+2
+1
+SELECT GROUP_CONCAT(id ORDER BY MATCH(body) AGAINST('widget') DESC, id) AS rank_order_after_readd
+FROM docs
+WHERE MATCH(body) AGAINST('widget');
+rank_order_after_readd
+4,2,1
+#
+# TEST 3: boolean mode still correct after the re-ADD cycle
+#
+SELECT id FROM docs
+WHERE MATCH(body) AGAINST('+widget -gear' IN BOOLEAN MODE)
+ORDER BY id;
+id
+1
+4
+#
+# TEST 4: post-readd writes still index, mixed old+new
+#
+INSERT INTO docs (tag, body) VALUES ('e', 'fresh widget delivery');
+SELECT id FROM docs
+WHERE MATCH(body) AGAINST('widget')
+ORDER BY id;
+id
+1
+2
+4
+5
+#
+# Cleanup
+#
+DROP TABLE docs;
+# Done.
