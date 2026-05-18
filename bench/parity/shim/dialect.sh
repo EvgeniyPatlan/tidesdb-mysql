@@ -65,6 +65,7 @@ render_case() {
         done
         printf '%s\n' "$line"
     done <"$file"
+    return 0
 }
 
 # ---- client transport -------------------------------------------------------
@@ -81,15 +82,26 @@ sut_client() {
 }
 
 # sut_wait_ready <server> <container> [tries]
+# Requires REAL query success via the SAME client path the cases use,
+# and N consecutive hits -- the official mysql image runs a temporary
+# init server then restarts the real one, so a single early success is
+# not proof the durable server is listening (caused ERROR 2002 mid-
+# restart on the first case).
 sut_wait_ready() {
-    local server="$1" cid="$2" tries="${3:-60}" i=0
+    local server="$1" cid="$2" tries="${3:-90}" i=0 streak=0 need=3
     while [ "$i" -lt "$tries" ]; do
+        local ok=1 got
         if [ "$server" = mysql ]; then
-            docker exec "$cid" mysqladmin ping -uroot --silent 2>/dev/null \
-                | grep -q "mysqld is alive" && return 0
+            got=$(docker exec "$cid" mysql -uroot -N -B -e "SELECT 1" 2>/dev/null) || ok=0
         else
-            docker exec "$cid" mariadb --socket=/tmp/mariadb.sock -uroot \
-                -e "SELECT 1" >/dev/null 2>&1 && return 0
+            got=$(docker exec "$cid" mariadb --socket=/tmp/mariadb.sock -uroot \
+                  -N -B -e "SELECT 1" 2>/dev/null) || ok=0
+        fi
+        if [ "$ok" = 1 ] && [ "$got" = "1" ]; then
+            streak=$((streak+1))
+            [ "$streak" -ge "$need" ] && return 0
+        else
+            streak=0
         fi
         i=$((i+1)); sleep 2
     done

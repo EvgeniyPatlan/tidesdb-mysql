@@ -49,10 +49,12 @@ read_meta() {                       # sets CASE_NAME CASE_AXIS CASE_UNORDERED
     local f="$1"
     CASE_NAME=$(grep -E '^-- @case:'  "$f" | head -1 | sed -E 's/^-- @case:[[:space:]]*//')
     CASE_AXIS=$(grep -E '^-- @axis:'  "$f" | head -1 | sed -E 's/^-- @axis:[[:space:]]*//')
+    CASE_NOTE=$(grep -E '^-- @note:' "$f" | head -1 | sed -E 's/^-- @note:[[:space:]]*//')
     CASE_UNORDERED=0
     grep -qE '^-- @unordered' "$f" && CASE_UNORDERED=1
     [ -z "$CASE_NAME" ] && CASE_NAME="$(basename "$f" .case.sql)"
     [ -z "$CASE_AXIS" ] && CASE_AXIS="misc"
+    [ -z "$CASE_NOTE" ] && CASE_NOTE="-"
 }
 expect_block() {                    # @expect: ... (to EOF or @endexpect)
     awk '/^-- @expect:/{f=1;next} /^-- @endexpect/{f=0} f{sub(/^-- ?/,"");print}' "$1"
@@ -72,11 +74,12 @@ run_case_on() {                     # <server> <container> <casefile> -> sets R_
     local server="$1" cid="$2" f="$3"
     local rawf="$RAW/$(basename "$f" .case.sql).$server.out"
     local sql; sql=$(render_case "$server" "$f")
-    set +e
+    # NB: the whole case loop runs with errexit OFF by design (helpers
+    # legitimately return nonzero). Do NOT toggle set -e here -- doing so
+    # re-armed errexit and aborted the suite after case 1.
     printf 'DROP DATABASE IF EXISTS parity;\nCREATE DATABASE parity;\nUSE parity;\n%s\n' "$sql" \
         | sut_run "$server" "$cid" >"$rawf" 2>&1
     local ec=$?
-    set -e
     local cls; cls=$(classify "$rawf" "$ec")
     R_NORM=$(normalize <"$rawf" | maybe_sort)
     if [ "$cls" = RAN ]; then
@@ -95,10 +98,14 @@ run_case_on() {                     # <server> <container> <casefile> -> sets R_
     echo 'SUT B = MariaDB 12.3.1 + upstream tidesql `sut-mariadb:bench`'
     echo "Shared core: TidesDB v9.2.0 (both)."
     echo
-    echo "| Axis | Case | SUT A (MySQL) | SUT B (MariaDB) | Parity |"
-    echo "|------|------|---------------|-----------------|--------|"
+    echo "| Axis | Case | SUT A (MySQL) | SUT B (MariaDB) | Parity | Note |"
+    echo "|------|------|---------------|-----------------|--------|------|"
 } >"$MATRIX"
 
+# Per-case helpers (render/expect/classify) legitimately return nonzero
+# (grep no-match, read EOF). We classify failures ourselves from raw
+# output + exit codes, so errexit must not abort the loop.
+set +e
 shopt -s nullglob
 TOTAL=0; SAME=0
 for f in "$HERE"/cases/*.case.sql; do
@@ -116,7 +123,7 @@ for f in "$HERE"/cases/*.case.sql; do
     else
         verdict="DIFF (A=$A_CLASS B=$B_CLASS)"
     fi
-    echo "| $CASE_AXIS | $CASE_NAME | $A_CLASS | $B_CLASS | $verdict |" >>"$MATRIX"
+    echo "| $CASE_AXIS | $CASE_NAME | $A_CLASS | $B_CLASS | $verdict | $CASE_NOTE |" >>"$MATRIX"
     printf '[parity] %-38s A=%-11s B=%-11s %s\n' "$CASE_NAME" "$A_CLASS" "$B_CLASS" "$verdict"
 done
 

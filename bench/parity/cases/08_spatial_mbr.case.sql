@@ -1,5 +1,6 @@
 -- @case: spatial_mbr_contains
 -- @axis: spatial
+-- @note: ARTIFACT: case uses MySQL-only `POINT ... SRID 0` DDL; needs a per-dialect spatial shim before any capability claim.
 CREATE TABLE g (id INT PRIMARY KEY AUTO_INCREMENT, pt POINT NOT NULL SRID 0,
   SPATIAL INDEX sp (pt)) ENGINE=TidesDB;
 INSERT INTO g (pt) VALUES

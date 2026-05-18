@@ -1,5 +1,6 @@
 -- @case: fulltext_add_backpopulate_existing_rows
 -- @axis: fulltext
+-- @note: HEADLINE: SUT A back-populates existing rows on ADD FULLTEXT (v0.2.1 + F-1); upstream B does not.
 -- Headline divergence: ADD FULLTEXT on a table that ALREADY has rows.
 -- SUT A (tidesdb-mysql v0.2.1) back-populates + F-1 meta fix; upstream
 -- behaviour characterized by this case.
