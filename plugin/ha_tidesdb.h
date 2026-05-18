@@ -39,9 +39,66 @@ extern "C"
 #include <tidesdb/db.h>
 }
 
-/* Forward declaration for TidesDB_share::cached_opts. Full definition
-   lives in ha_tidesdb.cc near the JSON parser that fills it. */
-struct ha_table_option_struct;
+/* Per-table / per-index / per-field engine options. Definitions live
+   here (promoted from ha_tidesdb.cc in the A-7 pass) so the inplace-
+   alter TU can construct ha_table_option_struct and dereference
+   ha_index_option_struct. ha_table_option_struct is also held by
+   TidesDB_share::cached_opts. */
+struct ha_table_option_struct
+{
+    ulonglong write_buffer_size;
+    ulonglong min_disk_space;
+    ulonglong klog_value_threshold;
+    ulonglong sync_interval_us;
+    ulonglong index_sample_ratio;
+    ulonglong block_index_prefix_len;
+    ulonglong level_size_ratio;
+    ulonglong min_levels;
+    ulonglong dividing_level_offset;
+    ulonglong skip_list_max_level;
+    ulonglong skip_list_probability; /* percentage      -- 25 = 0.25 */
+    ulonglong bloom_fpr;             /* parts per 10000 -- 100 = 1% */
+    ulonglong l1_file_count_trigger;
+    ulonglong l0_queue_stall_threshold;
+    uint compression;
+    uint sync_mode;
+    uint isolation_level;
+    bool bloom_filter;
+    bool block_indexes;
+    bool use_btree;
+    bool object_lazy_compaction;     /* double L1 file count trigger in object store mode */
+    bool object_prefetch_compaction; /* prefetch input SSTables before compaction merge */
+    ulonglong ttl;                   /* default TTL in seconds (0 = no expiration) */
+    bool encrypted;                  /* ENCRYPTED=YES enables data-at-rest encryption */
+    ulonglong encryption_key_id;     /* ENCRYPTION_KEY_ID (default 1) */
+    /* Tombstone-density compaction trigger. Stored as parts-per-10000
+       (e.g. 5000 = 0.50 ratio) so the option list can use integer
+       storage; converted to a double at build_cf_config time. */
+    ulonglong tombstone_density_trigger;
+    ulonglong tombstone_density_min_entries;
+};
+
+struct ha_field_option_struct
+{
+    bool ttl; /* marks this column as the per-row TTL source (seconds) */
+};
+
+struct ha_index_option_struct
+{
+    bool use_btree; /* per-index B-tree override; -1 = inherit from table */
+};
+
+/* Empty-value sentinel for index CFs (key-only entries). */
+inline constexpr uint8_t tdb_empty_val = 0;
+
+/* Maps the isolation_level option ordinal to a TidesDB isolation
+   constant. Header-inline so build_cf_config (ha_tidesdb.cc) and the
+   inplace-alter TU share one definition; array_elements() needs the
+   complete type. */
+inline constexpr int tdb_isolation_map[] = {
+    TDB_ISOLATION_READ_UNCOMMITTED, TDB_ISOLATION_READ_COMMITTED,
+    TDB_ISOLATION_REPEATABLE_READ,  TDB_ISOLATION_SNAPSHOT,
+    TDB_ISOLATION_SERIALIZABLE};
 
 /* Key namespace prefixes (first byte of every TidesDB key) */
 static constexpr uint8_t KEY_NS_META = 0x00;
@@ -1024,3 +1081,24 @@ class ha_tidesdb : public handler
    FTS TU (tidesdb_fts.cc) can sanitize stop-word table_spec strings
    before logging. Defined in ha_tidesdb.cc. */
 void tdb_sanitize_for_log(const char *in, char *out, size_t out_size);
+
+/* CF / option helpers promoted to module-scope linkage for the A-7
+   inplace-alter extraction. Their bodies stay in ha_tidesdb.cc (other
+   call sites there are unaffected); tidesdb_inplace_alter.cc reaches
+   them through these declarations. A future TidesStore (A-3) is the
+   natural place to re-encapsulate this CF/option surface. */
+ha_table_option_struct *tidesdb_opts_for_table(const TABLE *table);
+void tidesdb_compute_opts_for_table(const TABLE *table, ha_table_option_struct *out);
+tidesdb_column_family_config_t build_cf_config(const ha_table_option_struct *opts);
+tidesdb_column_family_t *resolve_idx_cf(tidesdb_t *db, const std::string &table_cf,
+                                        const char *key_name, std::string &out_name);
+int schema_cf_store_frm(const char *path, const uchar *frm_data = nullptr, size_t frm_len = 0);
+uint comparable_key_length(const KEY *ki);
+
+/* MariaDB-port option accessors. TDB_TABLE_OPTIONS delegates to
+   tidesdb_opts_for_table(); per-index/field options are not yet wired
+   so they resolve to nullptr. Moved here from ha_tidesdb.cc so the
+   inplace-alter TU sees the same definitions. */
+#define TDB_TABLE_OPTIONS(tbl)    tidesdb_opts_for_table(tbl)
+#define TDB_INDEX_OPTIONS(keyref) (static_cast<ha_index_option_struct *>(nullptr))
+#define TDB_FIELD_OPTIONS(fldref) (static_cast<ha_field_option_struct *>(nullptr))

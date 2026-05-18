@@ -164,7 +164,7 @@ ENDIF()
 ############# Define the storage engine using MySQL's MYSQL_ADD_PLUGIN macro #############
 MYSQL_ADD_PLUGIN(tidesdb ha_tidesdb.cc tidesdb_master_key.cc tidesdb_row_lock.cc
                  tidesdb_engine_context.cc tidesdb_fts.cc tidesdb_spatial.cc
-                 tidesdb_portability.cc
+                 tidesdb_portability.cc tidesdb_inplace_alter.cc
                  STORAGE_ENGINE MODULE_ONLY LINK_LIBRARIES ${TIDESDB_LIBS})
 
 ############# S3 compile definition for the plugin #############
