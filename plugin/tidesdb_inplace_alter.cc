@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "sql/key.h"
@@ -310,6 +311,16 @@ bool ha_tidesdb::inplace_alter_table(
     uchar last_data_key[DATA_KEY_BUF_LEN];
     size_t last_data_key_len = 0;
 
+    /* Reusable FTS tokenization scratch for back-populating FULLTEXT
+       indexes added to a table that already has rows. Declared once
+       and cleared per row to avoid per-row reallocation. Plain locals
+       (not static thread_local) -- this path runs once per ALTER, not
+       on the dlopen'd plugin's hot per-row entrypoint, so the
+       static-TLS budget concern that shapes write_row's scratch does
+       not apply here. */
+    std::vector<fts_token_t> fts_tokens;
+    std::unordered_map<std::string, uint16> fts_tf;
+
     while (tidesdb_iter_valid(iter))
     {
         uint8_t *key_data = NULL;
@@ -367,8 +378,48 @@ bool ha_tidesdb::inplace_alter_table(
             uint key_num = ctx->add_key_nums[a];
             KEY *ki = &altered_table->key_info[key_num];
 
-            /* FULLTEXT and SPATIAL indexes use different population paths */
-            if (is_fts_index(ki)) continue;
+            /* FULLTEXT: back-populate the inverted index for this
+               existing row, mirroring write_row's FTS path. The data
+               was deserialized into table->record[0]; ki's key-part
+               fields are based at altered_table->record[0], so passing
+               altered_table + table->record[0] makes
+               fts_extract_and_tokenize rebase them onto the decoded
+               row (ptrdiff = table->record[0] - altered_table->record[0]). */
+            if (is_fts_index(ki))
+            {
+                CHARSET_INFO *fts_cs = ki->key_part[0].field->charset();
+                fts_tokens.clear();
+                fts_tf.clear();
+                fts_extract_and_tokenize(altered_table, ki, table->record[0], fts_cs, fts_tokens);
+
+                for (auto &tok : fts_tokens) fts_tf[tok.word]++;
+                uint32 word_count = (uint32)fts_tokens.size();
+
+                for (auto &[term, tf] : fts_tf)
+                {
+                    uchar fk[FTS_KEY_BUF_LEN];
+                    uint fk_len = fts_build_key(term.data(), (uint)term.size(), pk, pk_len, fk);
+                    uchar fv[FTS_VALUE_LEN];
+                    fts_build_value(tf, word_count, fv);
+                    int frc = tidesdb_txn_put(txn, ctx->add_cfs[a], fk, fk_len, fv, FTS_VALUE_LEN,
+                                              TIDESDB_TTL_NONE);
+                    if (frc != TDB_SUCCESS)
+                        sql_print_error(
+                            "[TIDESDB] inplace ADD FULLTEXT: put failed for key %u (err=%d)",
+                            key_num, frc);
+                }
+
+                /* Index-build runs in its own DDL txn; the bulk-insert
+                   delta accumulator is not active here, so flush the
+                   per-doc meta counters inline like write_row's
+                   non-bulk branch. keynr is the new index's key number
+                   in altered_table, which is what ft_init_ext will use
+                   for fts_load_meta after commit. */
+                fts_update_meta(share, txn, share->cf, key_num, FTS_DOC_DELTA_ADD,
+                                (int64_t)word_count);
+                continue;
+            }
+            /* SPATIAL still uses a separate path (not back-populated). */
             if (is_spatial_index(ki)) continue;
 
             uchar ik[SEC_IDX_KEY_BUF_LEN];

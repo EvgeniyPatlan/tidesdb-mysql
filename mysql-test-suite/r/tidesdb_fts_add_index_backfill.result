@@ -1,0 +1,80 @@
+#
+# Setup: rows exist BEFORE the FULLTEXT index
+#
+CREATE TABLE docs (
+id   INT NOT NULL PRIMARY KEY AUTO_INCREMENT,
+body TEXT
+) ENGINE=TidesDB;
+INSERT INTO docs (body) VALUES
+('a small reliable widget for everyday use'),
+('a deluxe gadget with widget compatibility'),
+('cheap gizmo, no widget mentioned at all'),
+('completely unrelated text about turtles');
+#
+# Add FULLTEXT index AFTER rows already exist
+#
+ALTER TABLE docs ADD FULLTEXT INDEX ft_body (body);
+#
+# TEST 1: pre-existing rows are found by natural-language MATCH
+#
+SELECT id FROM docs
+WHERE MATCH(body) AGAINST('widget')
+ORDER BY id;
+id
+1
+2
+3
+#
+# TEST 2: boolean mode over back-populated rows
+#
+SELECT id FROM docs
+WHERE MATCH(body) AGAINST('+widget -gizmo' IN BOOLEAN MODE)
+ORDER BY id;
+id
+1
+2
+#
+# TEST 3: no-match query still returns empty
+#
+SELECT id FROM docs
+WHERE MATCH(body) AGAINST('nonexistentkeyword');
+id
+#
+# TEST 4: writes AFTER the index still index correctly
+#         (mixed old + new rows in one result)
+#
+INSERT INTO docs (body) VALUES ('a brand new widget assembly line');
+SELECT id FROM docs
+WHERE MATCH(body) AGAINST('widget')
+ORDER BY id;
+id
+1
+2
+3
+5
+#
+# TEST 5: UPDATE of a back-populated row reindexes correctly
+#
+UPDATE docs SET body = 'turtles all the way down, no hardware here' WHERE id = 1;
+SELECT id FROM docs
+WHERE MATCH(body) AGAINST('widget')
+ORDER BY id;
+id
+2
+3
+5
+#
+# TEST 6: DELETE of a back-populated row removes it from FTS
+#
+DELETE FROM docs WHERE id = 2;
+SELECT id FROM docs
+WHERE MATCH(body) AGAINST('widget')
+ORDER BY id;
+id
+3
+5
+#
+# Cleanup
+#
+DROP TABLE docs;
+# Done.
