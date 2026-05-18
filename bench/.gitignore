@@ -1,0 +1,7 @@
+# Raw run artifacts are large and machine-specific. Commit only the
+# curated summaries (results/<ts>/manifest.json + results.csv + the
+# generated report), never the raw logs / datasets.
+results/**/raw/
+results/**/*.log
+results/**/datadir/
+*.tmp

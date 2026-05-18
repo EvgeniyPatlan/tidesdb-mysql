@@ -1,0 +1,36 @@
+# Frozen version tuple for the TidesDB integration comparison.
+# Committed and never floated. Every results manifest copies this verbatim.
+# Resolution method + date recorded so the pins are auditable.
+
+resolved_at_utc:        2026-05-18T14:27:10Z
+resolved_method:        git ls-remote --tags https://github.com/MariaDB/server.git
+                        | newest mariadb-12.x.y release tag
+
+# --- Shared storage core (the ONE held-constant variable) ---
+tidesdb_version:        v9.2.0        # commit 7bbd138; both SUTs clone this exact tag
+
+# --- SUT A: TidesDB on MySQL (this repo) ---
+sut_a_server:           MySQL 9.7.0
+sut_a_plugin_repo:      tidesdb-mysql
+sut_a_plugin_version:   v0.2.1
+sut_a_plugin_commit:    461f33a       # main @ freeze time
+sut_a_image:            evgeniypatlan/test-images:mysql-9.7-tidesdb-v0.2.1
+sut_a_image_digest:     sha256:822fe343c7788318a5a1f9a3f6eed0af2bc8349d2005cc5cf033c416848eabe0
+
+# --- SUT B: TidesDB on MariaDB (upstream tidesdb/tidesql) ---
+sut_b_server:           MariaDB
+sut_b_mariadb_tag:      mariadb-12.3.1   # newest 12.x release tag at freeze
+sut_b_plugin_repo:      https://github.com/tidesdb/tidesql
+sut_b_plugin_commit:    TBD              # recorded by build-mariadb-sut.sh at build
+sut_b_image:            sut-mariadb:bench
+
+# --- Bench harness provenance ---
+bench_branch:           bench/comparison-framework
+bench_commit_at_freeze: 64a1048
+
+# Note: mariadb-12.3.1 is the newest mariadb-12.x.y tag in MariaDB/server.
+# If the one-time SUT-B build reveals it is a preview/RC rather than a
+# stabilized GA point release, revise this to the newest clearly-GA 12.x
+# tag (e.g. a .2 maintenance release) and re-freeze with a new
+# resolved_at_utc. The reproducibility contract only requires the pin be
+# concrete, frozen, and disclosed -- which it is.
