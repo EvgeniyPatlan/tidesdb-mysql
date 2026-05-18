@@ -1,0 +1,12 @@
+-- @case: replace_and_iodku
+-- @axis: dml
+CREATE TABLE t (id INT PRIMARY KEY, v INT) ENGINE=TidesDB;
+INSERT INTO t VALUES (1,10);
+REPLACE INTO t VALUES (1,11);
+INSERT INTO t VALUES (1,99) ON DUPLICATE KEY UPDATE v=v+1;
+INSERT INTO t VALUES (2,20) ON DUPLICATE KEY UPDATE v=v+1;
+SELECT id, v FROM t ORDER BY id;
+-- @expect:
+-- 1	12
+-- 2	20
+-- @endexpect
