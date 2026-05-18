@@ -87,13 +87,9 @@ struct IO_AND_CPU_COST {
 
 /* MariaDB free functions / globals we stub or alias to MySQL equivalents. */
 
-/* Count set bits — MariaDB exposes my_count_bits. MySQL doesn't, but GCC
- * and clang both ship __builtin_popcountll. */
-#ifndef my_count_bits
-inline unsigned int my_count_bits(unsigned long long v) {
-    return static_cast<unsigned int>(__builtin_popcountll(v));
-}
-#endif
+/* (extracted) my_count_bits moved to tidesdb_portability.{h,cc}
+ * in the A-8 pass. Declaration reaches all includers via the
+ * tidesdb_portability.h include at the foot of this file. */
 
 /* MariaDB exposes reg_ext as a const char* of the .frm extension.
  * MySQL has no .frm files. Map to empty string — only accessed via
@@ -222,97 +218,13 @@ enum thd_kill_levels {
  * time with a clear "undefined reference" rather than silently using
  * an uninitialized mutex. */
 
-/* MariaDB-only utilities. Stub each to compile-only behavior. */
-#ifndef mysql_file_stat
-#include <sys/stat.h>
-inline struct stat *mysql_file_stat(unsigned int /*key*/, const char *path,
-                                    struct stat *st, int /*flags*/) {
-    return ::stat(path, st) == 0 ? st : nullptr;
-}
-#endif
-
-#ifndef my_rmtree
-/* Recursive directory removal. Walks `path` depth-first and unlinks every
- * regular file / directory found, then removes `path` itself. Used by
- * force_remove_cf_dir() to wipe a column-family's on-disk SSTables and
- * WAL after the underlying CF was dropped but stale fds (block cache,
- * background workers) kept the directory partially populated.
- *
- * Returns 0 on success, non-zero on the first unrecoverable error.
- * Missing path is treated as success (caller already stat()'d). Symlinks
- * are not followed (FTW_PHYS). */
-#include <ftw.h>
-inline int my_rmtree_visit_(const char *fpath, const struct stat * /*sb*/,
-                            int /*typeflag*/, struct FTW * /*ftwbuf*/) {
-    /* remove() handles both files (unlink) and empty dirs (rmdir).
-     * FTW_DEPTH guarantees children are visited before their parent. */
-    return ::remove(fpath);
-}
-inline int my_rmtree(const char *path, int /*flags*/) {
-    if (!path) return -1;
-    /* nopenfd=64 caps concurrent fd usage during the walk. */
-    if (nftw(path, my_rmtree_visit_, 64, FTW_DEPTH | FTW_PHYS) != 0) {
-        return (errno == ENOENT) ? 0 : -1;
-    }
-    return 0;
-}
-#endif
-
-#ifndef my_random_bytes
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/random.h>  /* getrandom(2), Linux >= 3.17, glibc >= 2.25 */
-/* Fill `buf` with `n` cryptographically-strong random bytes.
- * Used to generate the IV for each encrypted row write -- one call per
- * write_row/update_row on an encrypted table. The old implementation
- * open()/read()/close()'d /dev/urandom every call (3 syscalls per row);
- * getrandom(2) is a single syscall and drops the fd table footprint
- * entirely. Returns 0 on success, 1 on failure (matches the original
- * contract; callers check for non-zero). */
-inline int my_random_bytes(unsigned char *buf, int n) {
-    int got = 0;
-    while (got < n) {
-        ssize_t r = ::getrandom(buf + got, (size_t)(n - got), 0);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return 1;
-        }
-        if (r == 0) return 1; /* shouldn't happen with blocking getrandom */
-        got += (int)r;
-    }
-    return 0;
-}
-#endif
-
-#ifndef microsecond_interval_timer
-#include <ctime>  /* clock_gettime, CLOCK_MONOTONIC, timespec */
-inline unsigned long long microsecond_interval_timer() {
-    timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<unsigned long long>(ts.tv_sec) * 1000000ULL
-         + static_cast<unsigned long long>(ts.tv_nsec) / 1000ULL;
-}
-#endif
-
-/* MariaDB strxnmov(dst, n, str1, str2, ..., NullS) — variadic string concat
- * with length cap. MySQL doesn't ship it. Provide a 4-arg shim that handles
- * the only pattern TideSQL uses (path = a + b + c + NullS). */
-#ifndef strxnmov
-#include <cstring>
-inline char *strxnmov(char *dst, size_t n, const char *a, const char *b = nullptr,
-                      const char *c = nullptr, const char *d = nullptr,
-                      const char * = nullptr) {
-    auto append = [&](const char *s) {
-        if (!s) return;
-        size_t avail = (n > 0) ? n - 1 : 0;
-        size_t took = 0;
-        while (avail-- && *s) { *dst++ = *s++; ++took; }
-        n -= took;
-    };
-    append(a); append(b); append(c); append(d);
-    if (n > 0) *dst = '\0';
-    return dst;
-}
-#endif
+/* (extracted) The MariaDB-only OS helpers mysql_file_stat, my_rmtree
+ * (+ its nftw visitor), my_random_bytes, microsecond_interval_timer
+ * and strxnmov moved to tidesdb_portability.{h,cc} in the A-8 pass.
+ * They had real function bodies; compat.h now carries only renames,
+ * #define-as-0 stubs and type aliases. Declarations reach all
+ * includers via the tidesdb_portability.h include at the foot of
+ * this file. */
 
 /* MariaDB's per-table option registration type. MySQL uses ha_create_table_option
  * conceptually but exposes it via Sys_variable / Plugin_var. For now stub the
@@ -407,51 +319,25 @@ struct ha_create_table_option {
 
 /* ----- Category 7: Logging shims -----
  *
- * MariaDB exposes free functions sql_print_{information,warning,error};
- * MySQL 8.0+ removed them in favor of LogErr / LogPluginErr / LogEvent.
- * Those replacements all fan out through the `log_bs` service handle
- * declared in mysql/components/services/log_builtins.h. MODULE_ONLY
- * plugins do NOT get that handle linked in automatically -- using them
- * unconditionally produces an `undefined symbol: log_bs` load failure.
- *
- * The older `my_plugin_log_message` API is also unsuitable here: storage
- * engines' handlerton init receives the `handlerton *` rather than the
- * `st_plugin_int *` the service expects, so there is no obvious place
- * to capture a valid plugin handle without registering as a real
- * component plugin -- a much bigger refactor than this surface needs.
- *
- * Pragmatic choice: keep the messages going to stderr. mysqld redirects
- * stderr to the error log file early in startup, so these lines DO end
- * up in the operator-visible log -- they're just plain-formatted rather
- * than structured. Format mimics MySQL's prefix style so grep / log
- * aggregators can still pick them up by component name. */
-inline void sql_print_information(const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    std::fputs("[Note] [tidesdb] ", stderr);
-    std::vfprintf(stderr, fmt, ap);
-    std::fputc('\n', stderr);
-    va_end(ap);
-}
-
-inline void sql_print_warning(const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    std::fputs("[Warning] [tidesdb] ", stderr);
-    std::vfprintf(stderr, fmt, ap);
-    std::fputc('\n', stderr);
-    va_end(ap);
-}
-
-inline void sql_print_error(const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    std::fputs("[ERROR] [tidesdb] ", stderr);
-    std::vfprintf(stderr, fmt, ap);
-    std::fputc('\n', stderr);
-    va_end(ap);
-}
+ * (extracted) sql_print_{information,warning,error} moved to
+ * tidesdb_portability.{h,cc} in the A-8 pass. They had real function
+ * bodies (stderr-backed because MODULE_ONLY plugins can't link the
+ * `log_bs` service the LogErr/LogPluginErr replacements need). The
+ * full rationale now lives at the definition site in
+ * tidesdb_portability.cc; declarations reach all includers via the
+ * tidesdb_portability.h include at the foot of this file. */
 
 /* (extracted) The at-rest encryption / master-key API was hosted here
  * for the original port. It now lives in its own header
  * `tidesdb_master_key.h` -- this was the first step of the architectural
- * extraction recommended by the follow-up code review. compat.h is
- * sliding toward MariaDB-only renames and stubs as its sole role. */
+ * extraction recommended by the follow-up code review. */
 #include "tidesdb_master_key.h"
+
+/* (extracted) The real OS / runtime / logging implementations (A-8
+ * pass). With these and the master-key API gone, compat.h is now
+ * exclusively MariaDB-only renames, #define-as-0 flag stubs and type
+ * aliases -- "renames-only-or-deletable" as the follow-up review
+ * targeted. Pulled in here so every TU that includes compat.h keeps
+ * seeing my_count_bits / mysql_file_stat / my_rmtree / my_random_bytes
+ * / microsecond_interval_timer / strxnmov / sql_print_* unchanged. */
+#include "tidesdb_portability.h"
