@@ -36,6 +36,7 @@ extern "C"
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -6470,8 +6471,42 @@ int ha_tidesdb::maybe_bulk_commit(tidesdb_trx_t *trx)
 {
     if (!trx || !trx->txn) return 0;
 
-    int crc = tidesdb_txn_commit(trx->txn);
-    if (crc != TDB_SUCCESS) sql_print_information("[TIDESDB] bulk mid-commit failed rc=%d", crc);
+    /* A failed mid-bulk commit MUST NOT be swallowed: tidesdb_txn_reset()
+       below discards this batch's buffered ops, so returning success here
+       silently loses up to TIDESDB_BULK_INSERT_BATCH_OPS rows while the
+       loader reports success (observed as an empty table after a "FINISHED
+       SUCCESS" HammerDB bulk build under concurrent load).
+
+       tidesdb_txn_commit() returns the transient/conflict error *before*
+       marking the txn aborted or consuming a commit sequence, so the txn
+       stays intact and re-calling it is safe. Retry the transient resource
+       cases (memory-limit / lock / write-write conflict) with a short
+       exponential backoff -- backpressure clears once flush/compaction
+       frees memory -- then fail loud so the SQL layer rolls the statement
+       back instead of corrupting the table. */
+    int crc = TDB_SUCCESS;
+    for (int attempt = 0; attempt < 4; attempt++)
+    {
+        crc = tidesdb_txn_commit(trx->txn);
+        if (crc == TDB_SUCCESS) break;
+
+        const bool transient = (crc == TDB_ERR_CONFLICT || crc == TDB_ERR_LOCKED ||
+                                crc == TDB_ERR_MEMORY_LIMIT);
+        if (!transient || attempt == 3)
+        {
+            sql_print_warning(
+                "[TIDESDB] bulk mid-commit failed rc=%d after %d attempt(s); "
+                "rolling back statement to avoid silent data loss",
+                crc, attempt + 1);
+            /* Do NOT reset/discard -- leave the txn for the SQL layer's
+               rollback. Returning the mapped error makes the caller abort
+               the statement (a loud, correct failure). */
+            return tdb_rc_to_ha(crc, "bulk mid-commit");
+        }
+        /* 200us, 1ms, 5ms */
+        static constexpr int backoff_us[3] = {200, 1000, 5000};
+        std::this_thread::sleep_for(std::chrono::microseconds(backoff_us[attempt]));
+    }
 
     int rrc = tidesdb_txn_reset(trx->txn, TDB_ISOLATION_READ_COMMITTED);
     if (rrc != TDB_SUCCESS)
