@@ -1,0 +1,11 @@
+HammerDB 5.0 TPROC-C verification -- 20260519T180855Z
+DB image: tidesdb/mysql:9.7 (main HEAD, reverse-ref fix)
+profile : WARE=20 BUILDVU=8 RUNVU=16 RAMP=2m DUR=5m
+
+schema build      : COMPLETED
+reverse-ref probe : FAIL/INCONCLUSIVE
+handler-unsupported errors in run.log : 0  (must be 0)
+expected OCC conflict lines           : 45  (informational)
+throughput: 146 NOPM / 53099 MySQL TPM
+
+verdict: FAIL -- reverse-ref probe did not pass (see reverse_ref_probe.out)

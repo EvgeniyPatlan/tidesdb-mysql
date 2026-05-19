@@ -1,0 +1,11 @@
+HammerDB 5.0 TPROC-C verification -- 20260519T195104Z
+DB image: tidesdb/mysql:9.7 (main HEAD, reverse-ref fix)
+profile : WARE=20 BUILDVU=8 RUNVU=8 RAMP=1m DUR=1m
+
+schema build      : COMPLETED
+reverse-ref probe : FAIL
+handler-unsupported errors in run.log : 0  (must be 0)
+expected OCC conflict lines           : 1  (informational)
+throughput: 1635 NOPM / 20092 MySQL TPM
+
+verdict: FAIL -- reverse-ref probe failed: rows exist but the reverse/OSTAT path errored or skipped them (see reverse_ref_probe.out). This IS the regression guard.
