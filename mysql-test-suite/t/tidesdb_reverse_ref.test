@@ -1,0 +1,84 @@
+--source suite/tidesdb/include/have_tidesdb.inc
+#
+# Test: reverse-ref index access (handler::index_read_last_map)
+#
+# Regression for ER_ILLEGAL_HA (1031) on plans MySQL renders as
+# "Index lookup ... (reverse)". The classic trigger is the TPC-C
+# OSTAT query: WHERE composite-PK-prefix = ... ORDER BY pk DESC
+# LIMIT 1. The optimizer reads the last key matching the prefix via
+# index_read_last_map; the handler base routed that to
+# index_read_last -> HA_ERR_WRONG_COMMAND -> 1031. We now override
+# index_read_last_map to delegate to index_read_map(...,
+# HA_READ_PREFIX_LAST), which was already implemented correctly.
+#
+--disable_warnings
+DROP TABLE IF EXISTS orders;
+--enable_warnings
+
+CREATE TABLE orders (
+  o_w_id       INT NOT NULL,
+  o_d_id       INT NOT NULL,
+  o_id         INT NOT NULL,
+  o_c_id       INT NOT NULL,
+  o_carrier_id INT,
+  o_entry_d    DATETIME,
+  PRIMARY KEY (o_w_id, o_d_id, o_id),
+  KEY ord_cust (o_w_id, o_d_id, o_c_id)
+) ENGINE=TidesDB;
+
+INSERT INTO orders VALUES
+ (1,1,1,5,NULL,'2026-01-01 10:00:00'),
+ (1,1,2,5,7,   '2026-01-01 10:01:00'),
+ (1,1,3,9,NULL,'2026-01-01 10:02:00'),
+ (1,1,4,5,2,   '2026-01-01 10:03:00'),
+ (1,1,5,9,NULL,'2026-01-01 10:04:00'),
+ (1,2,1,5,NULL,'2026-01-01 10:05:00');
+
+--echo #
+--echo # TEST 1: the TPC-C OSTAT shape -- WHERE (w,d,c) ORDER BY o_id DESC LIMIT 1
+--echo #         (this is what raised ER_ILLEGAL_HA before the fix)
+--echo #
+SELECT o_id, o_carrier_id
+FROM orders
+WHERE o_w_id=1 AND o_d_id=1 AND o_c_id=5
+ORDER BY o_id DESC LIMIT 1;
+
+--echo #
+--echo # TEST 2: partial-PK-prefix reverse, no extra filter
+--echo #
+SELECT o_id FROM orders
+WHERE o_w_id=1 AND o_d_id=1
+ORDER BY o_id DESC LIMIT 1;
+
+--echo #
+--echo # TEST 3: full reverse scan over the prefix (not just LIMIT 1)
+--echo #
+SELECT o_id FROM orders
+WHERE o_w_id=1 AND o_d_id=1
+ORDER BY o_id DESC;
+
+--echo #
+--echo # TEST 4: reverse on the other district prefix
+--echo #
+SELECT o_id FROM orders
+WHERE o_w_id=1 AND o_d_id=2
+ORDER BY o_id DESC LIMIT 1;
+
+--echo #
+--echo # TEST 5: forward path still correct (no regression)
+--echo #
+SELECT o_id FROM orders
+WHERE o_w_id=1 AND o_d_id=1 AND o_c_id=5
+ORDER BY o_id ASC LIMIT 1;
+
+--echo #
+--echo # TEST 6: no match -> empty, not an error
+--echo #
+SELECT o_id FROM orders
+WHERE o_w_id=1 AND o_d_id=1 AND o_c_id=999
+ORDER BY o_id DESC LIMIT 1;
+
+DROP TABLE orders;
+
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

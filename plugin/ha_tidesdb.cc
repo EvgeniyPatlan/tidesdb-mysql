@@ -5225,14 +5225,51 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
         else if (find_flag == HA_READ_KEY_OR_PREV || find_flag == HA_READ_BEFORE_KEY ||
                  find_flag == HA_READ_PREFIX_LAST || find_flag == HA_READ_PREFIX_LAST_OR_PREV)
         {
-            tidesdb_iter_seek_for_prev(scan_iter, seek_key, seek_len);
-            if (find_flag == HA_READ_BEFORE_KEY && tidesdb_iter_valid(scan_iter))
+            /* Partial-PK-prefix reverse (e.g. TPC-C OSTAT:
+               WHERE (w,d)=... ORDER BY pk DESC LIMIT 1, reached via
+               index_read_last_map -> HA_READ_PREFIX_LAST). A bare
+               seek_for_prev(prefix) lands on the key *before* the
+               group, because the short prefix sorts below every full
+               key that shares it. Build the upper bound -- prefix
+               padded with KEY_INF_HI_BYTE to a full PK -- and
+               seek_for_prev to that, so we land on the LAST key in the
+               group. Same construction the secondary-index branch
+               already uses. Full-key cases (comp_len >= full PK)
+               keep the exact-key behaviour. */
+            uint full_pk_comp_len = share->idx_comp_key_len[share->pk_index];
+            if (comp_len < full_pk_comp_len)
             {
-                uint8_t *ik = NULL;
-                size_t iks = 0;
-                if (tidesdb_iter_key(scan_iter, &ik, &iks) == TDB_SUCCESS && iks == seek_len &&
-                    memcmp(ik, seek_key, iks) == 0)
-                    tidesdb_iter_prev(scan_iter);
+                uchar upper[DATA_KEY_BUF_LEN];
+                memcpy(upper, seek_key, seek_len);
+                uint pad = full_pk_comp_len - comp_len;
+                memset(upper + seek_len, KEY_INF_HI_BYTE, pad);
+                tidesdb_iter_seek_for_prev(scan_iter, upper, seek_len + pad);
+
+                /* HA_READ_PREFIX_LAST means "last row WITH this prefix,
+                   else not found". If we landed outside the group
+                   (empty group), don't leak a foreign row. _OR_PREV
+                   and the *_KEY variants legitimately fall through to
+                   the previous row, so only guard plain PREFIX_LAST. */
+                if (find_flag == HA_READ_PREFIX_LAST && tidesdb_iter_valid(scan_iter))
+                {
+                    uint8_t *ik = NULL;
+                    size_t iks = 0;
+                    if (tidesdb_iter_key(scan_iter, &ik, &iks) != TDB_SUCCESS ||
+                        iks < seek_len || memcmp(ik, seek_key, seek_len) != 0)
+                        DBUG_RETURN(HA_ERR_KEY_NOT_FOUND);
+                }
+            }
+            else
+            {
+                tidesdb_iter_seek_for_prev(scan_iter, seek_key, seek_len);
+                if (find_flag == HA_READ_BEFORE_KEY && tidesdb_iter_valid(scan_iter))
+                {
+                    uint8_t *ik = NULL;
+                    size_t iks = 0;
+                    if (tidesdb_iter_key(scan_iter, &ik, &iks) == TDB_SUCCESS &&
+                        iks == seek_len && memcmp(ik, seek_key, iks) == 0)
+                        tidesdb_iter_prev(scan_iter);
+                }
             }
 
             int ret = iter_read_current(buf);
@@ -5386,6 +5423,26 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
             DBUG_RETURN(ret);
         }
     }
+}
+
+/*
+  Reverse-ref access (MySQL "Index lookup ... (reverse)" plans, e.g.
+  TPC-C OSTAT: WHERE pk_prefix=... ORDER BY pk DESC LIMIT 1).
+
+  MySQL calls handler::index_read_last_map for the first row; the base
+  implementation routes to index_read_last -> the default
+  HA_ERR_WRONG_COMMAND, surfaced to the client as ER_ILLEGAL_HA (1031).
+  Our index_read_map already implements HA_READ_PREFIX_LAST correctly
+  (seek_for_prev on the partial PK / secondary key, then iterate
+  backward via index_prev), so the fix is a one-line delegate to it --
+  the same bridge MySQL's own default would do if it called
+  index_read_map instead of index_read_last.
+*/
+int ha_tidesdb::index_read_last_map(uchar *buf, const uchar *key,
+                                    key_part_map keypart_map)
+{
+    DBUG_ENTER("ha_tidesdb::index_read_last_map");
+    DBUG_RETURN(index_read_map(buf, key, keypart_map, HA_READ_PREFIX_LAST));
 }
 
 int ha_tidesdb::index_next(uchar *buf)

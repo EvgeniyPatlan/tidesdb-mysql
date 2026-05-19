@@ -955,6 +955,14 @@ class ha_tidesdb : public handler
     int index_end() override;
     int index_read_map(uchar *buf, const uchar *key, key_part_map keypart_map,
                        enum ha_rkey_function find_flag) override;
+    /* Reverse-ref optimizer plans (e.g. `WHERE pk_prefix=... ORDER BY
+       pk DESC LIMIT 1`, as in TPC-C OSTAT) call index_read_last_map.
+       The handler base routes that to index_read_last -> default
+       HA_ERR_WRONG_COMMAND -> ER_ILLEGAL_HA(1031). We already handle
+       HA_READ_PREFIX_LAST correctly in index_read_map, so override to
+       delegate there. */
+    int index_read_last_map(uchar *buf, const uchar *key,
+                            key_part_map keypart_map) override;
     int index_next(uchar *buf) override;
     int index_prev(uchar *buf) override;
     int index_first(uchar *buf) override;

@@ -1,0 +1,73 @@
+DROP TABLE IF EXISTS orders;
+CREATE TABLE orders (
+o_w_id       INT NOT NULL,
+o_d_id       INT NOT NULL,
+o_id         INT NOT NULL,
+o_c_id       INT NOT NULL,
+o_carrier_id INT,
+o_entry_d    DATETIME,
+PRIMARY KEY (o_w_id, o_d_id, o_id),
+KEY ord_cust (o_w_id, o_d_id, o_c_id)
+) ENGINE=TidesDB;
+INSERT INTO orders VALUES
+(1,1,1,5,NULL,'2026-01-01 10:00:00'),
+(1,1,2,5,7,   '2026-01-01 10:01:00'),
+(1,1,3,9,NULL,'2026-01-01 10:02:00'),
+(1,1,4,5,2,   '2026-01-01 10:03:00'),
+(1,1,5,9,NULL,'2026-01-01 10:04:00'),
+(1,2,1,5,NULL,'2026-01-01 10:05:00');
+#
+# TEST 1: the TPC-C OSTAT shape -- WHERE (w,d,c) ORDER BY o_id DESC LIMIT 1
+#         (this is what raised ER_ILLEGAL_HA before the fix)
+#
+SELECT o_id, o_carrier_id
+FROM orders
+WHERE o_w_id=1 AND o_d_id=1 AND o_c_id=5
+ORDER BY o_id DESC LIMIT 1;
+o_id	o_carrier_id
+4	2
+#
+# TEST 2: partial-PK-prefix reverse, no extra filter
+#
+SELECT o_id FROM orders
+WHERE o_w_id=1 AND o_d_id=1
+ORDER BY o_id DESC LIMIT 1;
+o_id
+5
+#
+# TEST 3: full reverse scan over the prefix (not just LIMIT 1)
+#
+SELECT o_id FROM orders
+WHERE o_w_id=1 AND o_d_id=1
+ORDER BY o_id DESC;
+o_id
+5
+4
+3
+2
+1
+#
+# TEST 4: reverse on the other district prefix
+#
+SELECT o_id FROM orders
+WHERE o_w_id=1 AND o_d_id=2
+ORDER BY o_id DESC LIMIT 1;
+o_id
+1
+#
+# TEST 5: forward path still correct (no regression)
+#
+SELECT o_id FROM orders
+WHERE o_w_id=1 AND o_d_id=1 AND o_c_id=5
+ORDER BY o_id ASC LIMIT 1;
+o_id
+1
+#
+# TEST 6: no match -> empty, not an error
+#
+SELECT o_id FROM orders
+WHERE o_w_id=1 AND o_d_id=1 AND o_c_id=999
+ORDER BY o_id DESC LIMIT 1;
+o_id
+DROP TABLE orders;
+# Done.
