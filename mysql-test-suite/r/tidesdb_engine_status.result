@@ -7,7 +7,7 @@ SHOW ENGINE TIDESDB STATUS;
 Type	Name	Status
 TIDESDB		================== TidesDB Engine Status ==================
 Data directory: TIDESDB_DATA_DIR
-Unified memtable: ON
+Unified memtable: OFF
 Column families: N
 Global sequence: N
 

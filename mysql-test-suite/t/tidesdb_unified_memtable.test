@@ -1,7 +1,11 @@
 --source suite/tidesdb/include/have_tidesdb.inc
 #
 # Test: Unified memtable mode behavior
-# This test runs with the server's default unified_memtable=ON.
+# The server default is now unified_memtable=OFF (per-CF memtables) --
+# the v9.2.0 unified path can silently lose committed rows under heavy
+# concurrent writers. This test explicitly opts INTO the unified path
+# via tidesdb_unified_memtable-master.opt so unified WAL/memtable
+# behaviour stays covered.
 # It exercises operations that stress the shared WAL and memtable:
 # concurrent table access, cross-CF consistency, and flush behavior.
 #

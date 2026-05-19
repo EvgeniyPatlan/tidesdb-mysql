@@ -81,7 +81,7 @@ test.t_stats	analyze	status	OK
 # After ANALYZE, the optimizer should estimate ~100 rows for k=0
 EXPLAIN SELECT * FROM t_stats WHERE k = 0;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
-1	SIMPLE	t_stats	NULL	ref	k_idx	k_idx	4	const	2	100.00	NULL
+1	SIMPLE	t_stats	NULL	ref	k_idx	k_idx	4	const	100	100.00	NULL
 Warnings:
 Note	1003	/* select#1 */ select `test`.`t_stats`.`id` AS `id`,`test`.`t_stats`.`k` AS `k`,`test`.`t_stats`.`val` AS `val` from `test`.`t_stats` where (`test`.`t_stats`.`k` = 0)
 DROP TABLE t_stats;
