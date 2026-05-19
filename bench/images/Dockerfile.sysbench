@@ -1,0 +1,13 @@
+# Pinned sysbench client for the performance track. Same client drives
+# both SUTs (MySQL protocol; MariaDB is wire-compatible) so the load
+# generator is never a confound. Version is recorded into versions.lock
+# by build-sysbench.sh.
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
+        sysbench default-mysql-client ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+# Idle; the orchestrator `docker exec`s sysbench invocations into it so
+# one warmed client container serves the whole sweep.
+ENTRYPOINT ["sleep", "infinity"]

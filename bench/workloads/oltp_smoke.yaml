@@ -1,0 +1,36 @@
+# Article-grade contention-sweep spec. Flat key: value (parsed like
+# versions.lock -- no YAML lib in the orchestrator).
+#
+# Fairness: identical container caps + identical benchmarking server
+# config (README §3) + identical TidesDB v9.2.0 default CF config on
+# both SUTs. The ONLY variable is server+glue.
+#
+# Matrix: 4 workloads x table_sizes{1k,100k,1M} x threads{1,8,32}
+#         x 5 reps x 2 SUTs. table_size is the OCC-contention axis
+#         (small table + writes = high conflict on an MVCC/LSM engine).
+# Expect ~2.5-3h wall time.
+
+name:             oltp_contention
+
+# Resource caps applied identically to both SUT containers.
+cpus:             4
+memory:           12g
+
+# sysbench dataset.
+tables:           4
+table_sizes:      1000,100000,1000000   # high / medium / low contention
+mysql_storage_engine: TidesDB           # forces ENGINE=TidesDB on both
+
+# Sweep.
+workloads:        oltp_point_select,oltp_read_write,oltp_write_only,oltp_insert
+threads:          1,8,32
+repetitions:      5
+warmup_seconds:   8
+run_seconds:      15
+
+# Bench DB user (created on both SUTs at provision time so the load
+# generator connects identically over TCP; MariaDB's default root is
+# socket/localhost-only, so a TCP bench user is required for symmetry).
+bench_db:         sbtest
+bench_user:       bench
+bench_pass:       Bench_9xQ!z   # strong: satisfies MariaDB simple_password_check (>=8, mixed case, digit, special)

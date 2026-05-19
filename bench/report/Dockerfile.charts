@@ -1,0 +1,7 @@
+# Pinned chart renderer. No host Python/matplotlib dependency; the
+# orchestrator runs this container against results.csv. Versions pinned
+# for reproducibility (recorded into versions.lock by build wrapper).
+FROM python:3.12-slim
+RUN pip install --no-cache-dir matplotlib==3.9.2 pandas==2.2.3
+COPY gen-charts.py /gen-charts.py
+ENTRYPOINT ["python", "/gen-charts.py"]

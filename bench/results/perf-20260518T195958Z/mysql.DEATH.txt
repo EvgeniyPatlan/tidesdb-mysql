@@ -1,0 +1,72 @@
+==== SUT DEATH: mysql at oltp_read_write ts=1000000 t=1 r=4  2026-05-18T20:29:14Z ====
+state=exited oom=true exit=137 err="" started=2026-05-18T19:59:59.50083511Z finished=2026-05-18T20:29:14.357350996Z
+-- cgroup memory.events / peak --
+Error response from daemon: container 8e71bed4cad86a354eec1454c6cceddcffc68de6153b76bfedfdbaa44a7b49ba is not running
+-- df / datadir --
+Error response from daemon: container 8e71bed4cad86a354eec1454c6cceddcffc68de6153b76bfedfdbaa44a7b49ba is not running
+-- host dmesg (oom/segfault) --
+-- mysqld/.err tail --
+Error response from daemon: container 8e71bed4cad86a354eec1454c6cceddcffc68de6153b76bfedfdbaa44a7b49ba is not running
+-- docker logs tail (200) --
+2026-05-18 19:59:59+00:00 [Note] [Entrypoint]: Entrypoint script for MySQL Server 9.7.0-1.el9 started.
+2026-05-18 20:00:00+00:00 [Note] [Entrypoint]: Initializing database files
+2026-05-18T20:00:00.575939Z 0 [System] [MY-015017] [Server] MySQL Server Initialization - start.
+2026-05-18T20:00:00.580145Z 0 [Warning] [MY-015655] [Server] Server ignores the discovered container restrictions as --container_aware is OFF
+2026-05-18T20:00:00.580209Z 0 [System] [MY-013169] [Server] /usr/sbin/mysqld (mysqld 9.7.0) initializing of server in progress as process 47
+2026-05-18T20:00:00.604674Z 1 [System] [MY-013576] [InnoDB] InnoDB initialization has started.
+2026-05-18T20:00:01.388990Z 1 [System] [MY-013577] [InnoDB] InnoDB initialization has ended.
+2026-05-18T20:00:02.657810Z 0 [Warning] [MY-013501] [Server] Ignoring --plugin-load[_add] list as the server is running with --initialize(-insecure).
+2026-05-18T20:00:04.181458Z 0 [Warning] [MY-000067] [Server] unknown variable 'loose_tidesdb_data_home_dir=/var/lib/mysql/tidesdb_data/'.
+2026-05-18T20:00:04.183855Z 6 [Warning] [MY-010453] [Server] root@localhost is created with an empty password ! Please consider switching off the --initialize-insecure option.
+2026-05-18T20:00:07.684798Z 0 [System] [MY-015018] [Server] MySQL Server Initialization - end.
+2026-05-18 20:00:07+00:00 [Note] [Entrypoint]: Database files initialized
+2026-05-18 20:00:07+00:00 [Note] [Entrypoint]: Starting temporary server
+2026-05-18T20:00:07.780383Z 0 [System] [MY-015015] [Server] MySQL Server - start.
+2026-05-18T20:00:08.159344Z 0 [Warning] [MY-015655] [Server] Server ignores the discovered container restrictions as --container_aware is OFF
+2026-05-18T20:00:08.159407Z 0 [System] [MY-010116] [Server] /usr/sbin/mysqld (mysqld 9.7.0) starting as process 111
+2026-05-18T20:00:08.159438Z 0 [System] [MY-015603] [Server] MySQL Server has access to 20 logical CPUs.
+2026-05-18T20:00:08.159467Z 0 [System] [MY-015603] [Server] MySQL Server has access to 67080372224 bytes of physical memory.
+2026-05-18T20:00:08.211816Z 1 [System] [MY-013576] [InnoDB] InnoDB initialization has started.
+2026-05-18T20:00:08.919913Z 1 [System] [MY-013577] [InnoDB] InnoDB initialization has ended.
+[Note] [tidesdb] [TIDESDB] Loaded 35 default stop words
+[Note] [tidesdb] [TIDESDB] TidesDB opened at /var/lib/mysql/tidesdb_data
+2026-05-18T20:00:09.542804Z 0 [Warning] [MY-010068] [Server] CA certificate ca.pem is self signed.
+2026-05-18T20:00:09.542905Z 0 [System] [MY-013602] [Server] Channel mysql_main configured to support TLS. Encrypted connections are now supported for this channel.
+2026-05-18T20:00:09.550583Z 0 [Warning] [MY-011810] [Server] Insecure configuration for --pid-file: Location '/var/run/mysqld' in the path is accessible to all OS users. Consider choosing a different directory.
+2026-05-18T20:00:09.595642Z 0 [System] [MY-011323] [Server] X Plugin ready for connections. Socket: /var/run/mysqld/mysqlx.sock
+2026-05-18T20:00:09.595718Z 0 [System] [MY-010931] [Server] /usr/sbin/mysqld: ready for connections. Version: '9.7.0'  socket: '/var/run/mysqld/mysqld.sock'  port: 0  MySQL Community Server - GPL.
+2026-05-18 20:00:09+00:00 [Note] [Entrypoint]: Temporary server started.
+'/var/lib/mysql/mysql.sock' -> '/var/run/mysqld/mysqld.sock'
+Warning: Unable to load '/usr/share/zoneinfo/iso3166.tab' as time zone. Skipping it.
+Warning: Unable to load '/usr/share/zoneinfo/leap-seconds.list' as time zone. Skipping it.
+Warning: Unable to load '/usr/share/zoneinfo/leapseconds' as time zone. Skipping it.
+Warning: Unable to load '/usr/share/zoneinfo/tzdata.zi' as time zone. Skipping it.
+Warning: Unable to load '/usr/share/zoneinfo/zone.tab' as time zone. Skipping it.
+Warning: Unable to load '/usr/share/zoneinfo/zone1970.tab' as time zone. Skipping it.
+
+2026-05-18 20:00:12+00:00 [Note] [Entrypoint]: /usr/local/bin/docker-entrypoint.sh: running /docker-entrypoint-initdb.d/00-tidesdb-welcome.sql
+
+
+2026-05-18 20:00:12+00:00 [Note] [Entrypoint]: Stopping temporary server
+2026-05-18T20:00:12.632308Z 13 [System] [MY-013172] [Server] Received SHUTDOWN from user root. Shutting down mysqld (Version: 9.7.0).
+[Note] [tidesdb] [TIDESDB] TidesDB closed
+2026-05-18T20:00:14.571828Z 0 [System] [MY-010910] [Server] /usr/sbin/mysqld: Shutdown complete (mysqld 9.7.0)  MySQL Community Server - GPL.
+2026-05-18T20:00:14.571864Z 0 [System] [MY-015016] [Server] MySQL Server - end.
+2026-05-18 20:00:14+00:00 [Note] [Entrypoint]: Temporary server stopped
+
+2026-05-18 20:00:14+00:00 [Note] [Entrypoint]: MySQL init process done. Ready for start up.
+
+2026-05-18T20:00:14.685692Z 0 [System] [MY-015015] [Server] MySQL Server - start.
+2026-05-18T20:00:15.026837Z 0 [Warning] [MY-015655] [Server] Server ignores the discovered container restrictions as --container_aware is OFF
+2026-05-18T20:00:15.026916Z 0 [System] [MY-010116] [Server] /usr/sbin/mysqld (mysqld 9.7.0) starting as process 1
+2026-05-18T20:00:15.026952Z 0 [System] [MY-015603] [Server] MySQL Server has access to 20 logical CPUs.
+2026-05-18T20:00:15.026989Z 0 [System] [MY-015603] [Server] MySQL Server has access to 67080372224 bytes of physical memory.
+2026-05-18T20:00:15.049606Z 1 [System] [MY-013576] [InnoDB] InnoDB initialization has started.
+2026-05-18T20:00:15.742716Z 1 [System] [MY-013577] [InnoDB] InnoDB initialization has ended.
+[Note] [tidesdb] [TIDESDB] Loaded 35 default stop words
+[Note] [tidesdb] [TIDESDB] TidesDB opened at /var/lib/mysql/tidesdb_data
+2026-05-18T20:00:16.248661Z 0 [Warning] [MY-010068] [Server] CA certificate ca.pem is self signed.
+2026-05-18T20:00:16.248717Z 0 [System] [MY-013602] [Server] Channel mysql_main configured to support TLS. Encrypted connections are now supported for this channel.
+2026-05-18T20:00:16.255789Z 0 [Warning] [MY-011810] [Server] Insecure configuration for --pid-file: Location '/var/run/mysqld' in the path is accessible to all OS users. Consider choosing a different directory.
+2026-05-18T20:00:16.294670Z 0 [System] [MY-011323] [Server] X Plugin ready for connections. Bind-address: '::' port: 33060, socket: /var/run/mysqld/mysqlx.sock
+2026-05-18T20:00:16.294761Z 0 [System] [MY-010931] [Server] /usr/sbin/mysqld: ready for connections. Version: '9.7.0'  socket: '/var/run/mysqld/mysqld.sock'  port: 3306  MySQL Community Server - GPL.

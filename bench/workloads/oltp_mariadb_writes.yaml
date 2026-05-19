@@ -1,0 +1,26 @@
+# Re-run of MariaDB write workloads only, with a server-side statement
+# cap so extreme-contention cells fail fast instead of ~100s hangs.
+# Merged with the clean base (MySQL 180/180 + MariaDB point_select 45)
+# for the final report. MySQL is NOT re-run: it never hit the hang
+# (its conflicts return in ms), so the 12g base stays comparable; the
+# max_statement_time cap is non-effective for sub-second MySQL txns.
+# Disclosed in FINDINGS.
+name:             oltp_mariadb_writes
+suts:             mariadb
+cpus:             4
+memory:           12g
+tables:           4
+table_sizes:      1000,100000,1000000
+mysql_storage_engine: TidesDB
+workloads:        oltp_read_write,oltp_write_only,oltp_insert
+threads:          1,8,32
+repetitions:      5
+warmup_seconds:   8
+run_seconds:      15
+# 5s server-side statement cap (MariaDB max_statement_time, seconds).
+# Hung TidesDB lock waits are killed at 5s -> sysbench sees error 1969
+# (tolerated via --mysql-ignore-errors) instead of a 100s wall hang.
+mariadb_extra_opts: --max-statement-time=5
+bench_db:         sbtest
+bench_user:       bench
+bench_pass:       Bench_9xQ!z

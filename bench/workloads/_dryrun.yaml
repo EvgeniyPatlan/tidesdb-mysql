@@ -1,0 +1,16 @@
+# Fast end-to-end validation of the perf orchestrator (~minutes, not
+# article data). One light workload, one thread, one rep, tiny dataset.
+name:             dryrun
+cpus:             4
+memory:           4g
+tables:           2
+table_sizes:      1000,20000          # validates the sweep dimension
+mysql_storage_engine: TidesDB
+workloads:        oltp_point_select,oltp_read_write
+threads:          8
+repetitions:      1
+warmup_seconds:   3
+run_seconds:      5
+bench_db:         sbtest
+bench_user:       bench
+bench_pass:       Bench_9xQ!z   # strong: satisfies MariaDB simple_password_check (>=8, mixed case, digit, special)

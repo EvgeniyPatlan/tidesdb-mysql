@@ -34,3 +34,11 @@ bench_commit_at_freeze: 64a1048
 # tag (e.g. a .2 maintenance release) and re-freeze with a new
 # resolved_at_utc. The reproducibility contract only requires the pin be
 # concrete, frozen, and disclosed -- which it is.
+
+# --- Load generator ---
+sysbench_version:       sysbench 1.0.20
+sysbench_image:         sut-sysbench:bench
+
+# --- Chart renderer ---
+charts_versions:        matplotlib 3.9.2, pandas 2.2.3
+charts_image:           sut-charts:bench
