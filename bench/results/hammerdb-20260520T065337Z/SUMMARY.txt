@@ -1,0 +1,12 @@
+HammerDB 5.0 TPROC-C verification -- 20260520T065337Z
+DB image: tidesdb/mysql:9.7 (main HEAD, reverse-ref fix)
+profile : WARE=10 BUILDVU=1 RUNVU=1 RAMP=1m DUR=1m
+tidesdb_unified_memtable = OFF
+
+schema build      : COMPLETED
+reverse-ref probe : PASS
+handler-unsupported errors in run.log : 0  (must be 0)
+expected OCC conflict lines           : 0  (informational)
+throughput: 1435 NOPM / 3390 MySQL TPM
+
+verdict: PASS -- schema built on TidesDB, reverse-ref/OSTAT works, TPC-C mix ran with no handler-unsupported errors (1435 NOPM)
