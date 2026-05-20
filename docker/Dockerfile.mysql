@@ -75,10 +75,29 @@ WORKDIR /build
 RUN git clone --depth=1 --branch ${MYSQL_TAG} \
         https://github.com/mysql/mysql-server.git mysql-server
 
-# 2) Clone TidesDB and build its static archive (PIC so it can link into a .so).
+# 2) Clone TidesDB, apply local durability/sync-mode fixes, then build the
+#    static archive (PIC so it can link into a .so).
+#
+#    docker/patches/0001-walfix.patch fixes three engine bugs in v9.2.0 that
+#    together cause silent loss of every committed write on SIGKILL/power-
+#    loss with sync_mode=FULL:
+#      (1) block_manager.c convert_sync_mode() had inverted case logic
+#          (TDB_SYNC_INTERVAL=1 -> FULL, TDB_SYNC_FULL=2 -> default -> NONE).
+#      (2) Multiple WAL block_manager_open call sites in src/tidesdb.c passed
+#          the raw engine sync_mode enum without calling convert_sync_mode().
+#      (3) tidesdb_create_column_family unconditionally called
+#          block_manager_truncate on the WAL, wiping it before
+#          recover_wals had a chance to replay -- so even with sync working,
+#          recovery saw an empty WAL. Replaced with validate_last_block in
+#          PERMISSIVE mode, which preserves valid blocks and behaves the
+#          same as truncate for a fresh/empty file.
+#    Remove the patch step once these fixes land upstream in TidesDB.
 RUN git clone --depth=1 --branch ${TIDESDB_TAG} \
-        https://github.com/tidesdb/tidesdb.git tidesdb && \
-    cd tidesdb && \
+        https://github.com/tidesdb/tidesdb.git tidesdb
+COPY docker/patches/0001-walfix.patch /tmp/0001-walfix.patch
+RUN cd tidesdb && \
+    patch -p1 < /tmp/0001-walfix.patch && \
+    rm -f /tmp/0001-walfix.patch && \
     cmake -S . -B build-static \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_SHARED_LIBS=OFF \
