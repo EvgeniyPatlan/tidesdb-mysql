@@ -12,10 +12,10 @@ tidesdb_version:        v9.2.0        # commit 7bbd138; both SUTs clone this exa
 # --- SUT A: TidesDB on MySQL (this repo) ---
 sut_a_server:           MySQL 9.7.0
 sut_a_plugin_repo:      tidesdb-mysql
-sut_a_plugin_version:   v0.2.3
-sut_a_plugin_commit:    4a26395       # main @ freeze time
-sut_a_image:            evgeniypatlan/test-images:mysql-9.7-tidesdb-v0.2.3
-sut_a_image_digest:     sha256:d2a80d515d392f93975bde76ed3d9d19d5c64744521a5114c5bd180e57108341
+sut_a_plugin_version:   v0.2.4
+sut_a_plugin_commit:    945b05a       # main @ freeze time
+sut_a_image:            evgeniypatlan/test-images:mysql-9.7-tidesdb-v0.2.4
+sut_a_image_digest:     sha256:b4e226acb6713f43652d676fbf63defd28e7cbd3ed56d9da9b64ea9fb3736740
 
 # --- SUT B: TidesDB on MariaDB (upstream tidesdb/tidesql) ---
 sut_b_server:           MariaDB
