@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Render a self-contained REPORT.md from a v0.2.3 suite output directory.
+# Render a self-contained REPORT.md from a suite output directory.
 # Usage: render-report.sh <suite-dir> <image> <baseline-engine> <cpus> <mem>
 set -uo pipefail
 
@@ -10,6 +10,27 @@ CPUS=${4:-?}
 MEM=${5:-?}
 
 TS=$(basename "$SUITE" | sed 's/^suite-//')
+
+# Derive the SUT-A version so the report's title tracks the
+# actually-shipping release without anyone needing to bump this script
+# per tag. Search order:
+#   1. bench/images/versions.lock (exists when checked out on the
+#      bench/comparison-framework branch).
+#   2. git describe --tags --abbrev=0 (works from any branch with tags).
+#   3. literal 'current'.
+VERSION=""
+for guess in \
+    "$(cd "$SUITE" 2>/dev/null && cd ../../images 2>/dev/null && pwd)/versions.lock" \
+    "$(dirname "$0")/../images/versions.lock"; do
+    if [ -f "$guess" ]; then
+        VERSION=$(awk -F'[: ]+' '/^sut_a_plugin_version:/{print $2; exit}' "$guess")
+        [ -n "$VERSION" ] && break
+    fi
+done
+if [ -z "$VERSION" ]; then
+    VERSION=$(git -C "$(dirname "$0")" describe --tags --abbrev=0 2>/dev/null)
+fi
+VERSION=${VERSION:-current}
 
 # small helpers (silent if file missing) -----------------------------------
 val()   { awk -F': *' "/^$2/{v=\$2; sub(/  +.*/,\"\",v); print v; exit}" "$1" 2>/dev/null; }
@@ -71,12 +92,12 @@ SUS_TPM_STATS=$(grep -aoE '[0-9]+ MySQL tpm$' "$SUS_RUNLOG" 2>/dev/null \
 SUS_NOPM=$(nopm "$SUS_SUM")
 
 cat <<EOF
-# TidesDB on MySQL — v0.2.3 verification suite
+# TidesDB on MySQL — ${VERSION} verification suite
 
 **Run timestamp:** \`$TS\`
 **Image:** \`$IMAGE\`
 **Container caps:** ${CPUS} CPU / ${MEM} RAM
-**Engine (TidesDB defaults):** \`tidesdb_unified_memtable=OFF\`, \`sync_mode=FULL\` (the v0.2.3 durability defaults).
+**Engine (TidesDB defaults):** \`tidesdb_unified_memtable=OFF\`, \`sync_mode=FULL\` (the v0.2.3+ durability defaults).
 
 A self-contained run of every HammerDB-based test we have, executed
 sequentially against a single image build. Each section explains the

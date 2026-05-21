@@ -1,0 +1,12 @@
+HammerDB 5.0 TPROC-H verification -- 20260521T201116Z
+DB image: tidesdb/mysql:9.7
+profile : SCALE=1 BUILDVU=4 RUNVU=4 caps=6cpu/16g
+tidesdb_unified_memtable = OFF
+
+schema build       : COMPLETED
+row-count gate     : FAIL
+  lineitem: 6004560 (expected 6001215)
+  orders  : 1500000 (expected 1500000)
+power test         : NOT RUN/FAILED
+
+verdict: FAIL -- row-count gate: expected lineitem=6001215 got 6004560; this is silent bulk-load data loss

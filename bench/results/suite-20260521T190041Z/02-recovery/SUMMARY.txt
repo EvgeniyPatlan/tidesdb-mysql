@@ -1,0 +1,10 @@
+Crash-recovery test -- 20260521T190756Z
+DB image: tidesdb/mysql:9.7  unified_memtable=OFF
+profile : WARE=10 BUILDVU=4 RUNVU=4 pre_kill_secs=30
+
+schema build       : COMPLETED
+post-kill recovery : OK
+committed-row loss : NONE
+order-row gaps     : NONE
+
+verdict: PASS -- WAL durably recovered all committed work after SIGKILL
