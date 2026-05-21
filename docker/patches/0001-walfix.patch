@@ -1,6 +1,28 @@
 --- a/src/tidesdb.c
 +++ b/src/tidesdb.c
-@@ -17266,7 +17266,7 @@
+@@ -10760,9 +10760,18 @@
+                                     source->source.sstable.lazy.bmblock = NULL;
+                                     source->source.sstable.lazy.decompressed = NULL;
+                                     source->source.sstable.current_entry_idx = 0;
+-                                    source->source.sstable.klog_cursor->current_block_size =
+-                                        bdata_size;
+-                                    source->source.sstable.klog_cursor->block_size_valid = 1;
++                                    /* Do NOT cache bdata_size on the cursor.
++                                       bdata_size = cached_size - hdr_size is
++                                       the size of the cache entry's
++                                       decompressed/indexed content, not the
++                                       on-disk block size that
++                                       block_manager_cursor_next must add to
++                                       current_pos. Caching it causes the
++                                       cursor to jump past
++                                       klog_data_end_offset in 2-3 hops,
++                                       dropping virtually all entries from
++                                       multi-SSTable level-1 reads on the
++                                       post-recovery path. */
+                                     return TDB_SUCCESS;
+                                 }
+                             }
+@@ -17266,7 +17275,7 @@
                   TDB_U64_CAST(0));
  
          block_manager_t *uwal = NULL;
@@ -9,7 +31,7 @@
              block_manager_truncate(uwal) != 0)
          {
              if (uwal) block_manager_close(uwal);
-@@ -18597,7 +18597,7 @@
+@@ -18597,7 +18606,7 @@
                   "%s" PATH_SEPARATOR TDB_WAL_PREFIX TDB_U64_FMT TDB_WAL_EXT, cf->directory,
                   TDB_U64_CAST(0));
  
@@ -18,7 +40,7 @@
          {
              queue_free(cf->immutable_memtables);
              skip_list_free(new_memtable);
-@@ -18607,7 +18607,21 @@
+@@ -18607,7 +18616,21 @@
              return TDB_ERR_IO;
          }
  
@@ -41,7 +63,7 @@
          {
              block_manager_close(new_wal);
              queue_free(cf->immutable_memtables);
-@@ -19171,7 +19185,7 @@
+@@ -19171,7 +19194,7 @@
              char wal_path[MAX_FILE_PATH_LENGTH];
              snprintf(wal_path, sizeof(wal_path), "%s" PATH_SEPARATOR "wal_%" PRIu64 ".log",
                       cf->directory, old_wal_id);
@@ -50,7 +72,7 @@
          }
          atomic_store_explicit(&cf->marked_for_deletion, 0, memory_order_release);
          pthread_rwlock_unlock(&db->cf_list_lock);
-@@ -19187,7 +19201,7 @@
+@@ -19187,7 +19210,7 @@
                       new_directory, old_wal_id);
          if (wal_written > 0 && (size_t)wal_written < sizeof(new_wal_path))
          {
@@ -59,7 +81,7 @@
              {
                  TDB_DEBUG_LOG(TDB_LOG_ERROR, "Failed to reopen WAL at %s after rename",
                                new_wal_path);
-@@ -23295,7 +23309,7 @@
+@@ -23295,7 +23318,7 @@
               TDB_U64_CAST(new_gen));
  
      block_manager_t *new_wal = NULL;
@@ -68,6 +90,40 @@
          block_manager_truncate(new_wal) != 0)
      {
          if (new_wal) block_manager_close(new_wal);
+@@ -25253,8 +25276,10 @@
+                 source->source.sstable.lazy.entry_idx = found;
+                 source->source.sstable.current_entry_idx = found;
+                 /* cache block size so cursor_next skips pread */
+-                cursor->current_block_size = source->source.sstable.lazy.block_data_size;
+-                cursor->block_size_valid = 1;
++                /* Do NOT cache block_data_size on the cursor -- it is the
++                   decompressed/indexed cache content size, not the on-disk
++                   block size cursor_next must use to advance current_pos.
++                   See matching fix in tidesdb_merge_source_advance. */
+                 return;
+             }
+         }
+@@ -25601,15 +25626,14 @@
+             source->source.sstable.lazy.bmblock = bmblock;
+             source->source.sstable.lazy.decompressed = decompressed;
+             source->source.sstable.current_entry_idx = found_idx;
+-            cursor->current_block_size = block_data_size;
+-            cursor->block_size_valid = 1;
++            /* Do NOT cache block_data_size -- see matching fix above. */
+             return;
+         }
+ 
+-        /** target is past this block -- we set cached block size so
+-         *  cursor_next can advance without a pread syscall */
+-        cursor->current_block_size = block_data_size;
+-        cursor->block_size_valid = 1;
++        /* Do NOT cache block_data_size as the cursor's block_size: it is the
++           decompressed/indexed cache content size, not the on-disk block
++           size. Letting cursor_next pread the real size avoids the multi-
++           SSTable post-recovery iterator-jumping-past-end-offset bug. */
+ 
+         if (pin) clock_cache_release(pin);
+         if (decompressed) free(decompressed);
 --- a/src/block_manager.c
 +++ b/src/block_manager.c
 @@ -1660,11 +1660,24 @@

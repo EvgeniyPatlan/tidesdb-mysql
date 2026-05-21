@@ -1,11 +1,11 @@
 # Known issues
 
 This document tracks defects we've confirmed in the bundled TidesDB engine
-that affect `tidesdb-mysql` users. Three are patched in v0.2.3 via
-`docker/patches/0001-walfix.patch`; one is precisely localized but not
-yet patched.
+that affect `tidesdb-mysql` users. **All four engine bugs found during
+the v0.2.3/v0.2.4 investigation are now patched** in
+`docker/patches/0001-walfix.patch`.
 
-## Patched (v0.2.3)
+## Patched (v0.2.3 + v0.2.4)
 
 The bundled `docker/patches/0001-walfix.patch` applies three engine
 fixes against vendored TidesDB v9.2.0 inside the Docker build (before
@@ -51,114 +51,65 @@ minimal repro (5 INSERTs → `docker kill -9` → restart → SELECT) returns
 all 5 rows pre/post-restart; mixed 100-row `BEGIN/COMMIT` + 5-row
 autocommit recovers 105/105.
 
-## Localized but not patched (residual bug #4)
+### 4. SSTable cursor cached the wrong `block_size`, causing iterator to skip past `klog_data_end_offset`
 
-Under **concurrent bulk writes followed by SIGKILL**, the engine still
-exhibits partial silent loss on tables whose post-recovery state ends
-up with **two SSTables in level 1** — one loaded from disk via
-`tidesdb_sstable_load` (the pre-kill flushed SSTable) plus one newly
-created during recovery via `tidesdb_level_add_sstable` (the
-recovery-flushed memtable). Tables with only one SSTable post-recovery
-read correctly.
+**File:** `tidesdb/src/tidesdb.c`, four sites (lines ~10763, ~25279,
+~25629, ~25636) that set `cursor->current_block_size = bdata_size` /
+`= block_data_size` plus `cursor->block_size_valid = 1`.
+**Symptom:** After heavy concurrent bulk writes + SIGKILL, tables
+whose post-recovery `level 1` ended up with **two SSTables** (one
+loaded from disk + one newly recovery-flushed) returned a tiny
+fraction of their rows on full scans:
+`tpcc__order_line` 2,669 of 3.18M (0.08%), `tpcc__stock` 717 of 1M
+(0.07%). Tables with one SSTable were unaffected.
+**Root cause:** the four sites cached the **cache-entry size**
+(`bdata_size = cached_size - hdr_size`, i.e. decompressed block data
++ appended per-entry index entries) as the cursor's "current block
+size". The next `block_manager_cursor_next` call used this inflated
+value to advance `current_pos` by `header + bdata_size + footer` —
+which can be HUGE (we measured deltas of 160 MB / 318 MB / 812 MB /
+1.2 GB / 1.7 GB per cursor advance). `current_pos` then exceeded
+`klog_data_end_offset` after 2–3 calls and `cursor_next` returned
+`TDB_ERR_NOT_FOUND`, dropping the rest of the SSTable.
+**Fix:** removed the `current_block_size = bdata_size` /
+`block_size_valid = 1` assignments at all four sites. The next
+`cursor_next` call now `pread`'s the real 4-byte on-disk size header
+— one cheap syscall per block, in the host page cache anyway.
+**Verification:** MTR 61/61 PASS; recovery-diag post-fix shows full
+row counts (`tpcc__order_line` 3,100,951, `tpcc__stock` 1,000,000,
+`tpcc__orders_w1` per-district matches `district.d_next_o_id - 1`
+exactly).
 
-### Observed signature (WARE=10 BUILDVU=4 RUNVU=4 + 30s NewOrder mix)
+## How the bugs were found
 
-| CF | Level 1 contents | Expected | `SELECT COUNT(*)` |
-|---|---|---|---|
-| `tpcc__orders` | sst_id=0 only (recovery-flushed) | ~310k | **307,540 ✓** |
-| `tpcc__customer` | sst_id=0 only (recovery-flushed) | 300k | **300,000 ✓** |
-| `tpcc__stock` | sst_id=0 (605k, pre-kill) + sst_id=1 (454k, recovery) | ~1.05M | **717** ❌ |
-| `tpcc__order_line` | sst_id=0 (2.4M, pre-kill) + sst_id=1 (770k, recovery) | ~3.18M | **2,669** ❌ |
+All four were found via a single repeatable scenario: build a TPC-C
+schema, run a brief NewOrder mix, `docker kill -9` mid-write, restart
+on the same volume, compare row counts to the loader's claim
+(`district.d_next_o_id`). The harness in `bench/hammerdb/`:
 
-### Root-cause localization (four rounds of instrumentation)
+- `recovery-test.sh` — end-to-end pass/fail recovery verdict.
+- `recovery-diag.sh` — captures pre-kill + T+0/T+30/T+60 row counts,
+  TidesDB LOG, per-CF on-disk state, and (with instrumented binaries)
+  per-source heap-pop / cursor traces.
+- `run-all.sh` step 2 — includes recovery in the v0.2.3 suite.
 
-1. **Write side correct.** `[sstinstr]` confirmed
-   `tidesdb_sstable_write_from_memtable` writes all entries
-   (`entry_count == skip_list_count_entries` for every CF, e.g.
-   308,267/308,267 for orders, 2,411,249/2,411,249 for order_line).
+Bug #4 was nailed across five focused instrumentation rounds. The
+write side, metadata persistence, level array, iterator setup, and
+heap pop all checked out. The bug was inside the cursor: a single
+`fprintf` inside `block_manager_cursor_next` showed `current_pos`
+jumping by 160 MB → 1.7 GB per call when the cursor's cached
+`current_block_size` had been set from a cache-entry size by the
+upstream lazy path.
 
-2. **Metadata persistence correct.** `[ssfooter]` (written) and
-   `[ssload]` (loaded post-restart) match exactly:
-   `num_entries`, `klog_data_end_offset`, `min/max_key_size`, `max_seq`.
-
-3. **Level state correct.** `[level_add]` shows both SSTables appended
-   to `cf->levels[0]` (`num_sstables: 0→1→2`); `[iter_level]` shows
-   the iterator picks up both as sources (`level->num_ssts=2,
-   added_now=2`).
-
-4. **SSTable advance returns `TDB_ERR_NOT_FOUND` (-3) prematurely.**
-   `[heap_pop]` exhaustion log shows each SSTable source dying after
-   only ~300–1,400 pops (vs. `num_entries` in the millions). For
-   `order_line`: sst_id=0 exhausts at 1,338 pops out of 2.4M expected;
-   sst_id=1 exhausts at 1,329 out of 770k expected. The sum (~2,667)
-   matches `SELECT COUNT(*)` (2,669) almost exactly. Same pattern for
-   `stock` (433 + 323 = 756 ≈ 717).
-
-### Code location (10-line region)
-
-`tidesdb/src/tidesdb.c` around line 10620, in the SSTable branch of
-`tidesdb_merge_source_advance`:
-
-```c
-while (block_manager_cursor_next(source->source.sstable.klog_cursor) == 0)
-{
-    if (source->source.sstable.sst->klog_data_end_offset > 0 &&
-        source->source.sstable.klog_cursor->current_pos >=
-            source->source.sstable.sst->klog_data_end_offset)
-    {
-        return TDB_ERR_NOT_FOUND;   // <-- fires too early
-    }
-    ...
-}
-```
-
-The check itself is correct; the bug is upstream of it — either
-`block_manager_cursor_next` is advancing `current_pos` by more than
-one entry's worth (likely a block-sized jump), or some shared state
-between two SSTable sources corrupts one source's cursor when both are
-active simultaneously. The 300×–1800× ratio between expected and
-actual pops strongly suggests block-size jumps.
-
-### Why we haven't patched it yet
-
-The fix requires reading `block_manager.c`'s cursor advance logic
-carefully — it isn't a one-line patch, and our instrumentation evidence
-points to multiple candidate causes. We've stopped here to land what
-we have rather than do an unsupported speculative engine edit.
-
-### Workarounds today
-
-- **Single-SSTable case is unaffected.** A small-enough working set
-  that never triggers a pre-kill memtable flush will recover cleanly.
-- **Avoid two-SSTable post-recovery state** by either: not crashing
-  mid-write (graceful shutdown is fine — the engine's
-  `Flushing all active memtables before close` path works), or
-  pre-flushing via `FLUSH TABLE` so the recovery side has nothing to
-  add.
-- **Use `tidesdb_unified_memtable=ON`** at your own risk (the bug it
-  introduces — catastrophic loss under heavy bulk writes — is worse
-  than this one). v0.2.3 defaults to OFF for that reason.
-
-### Reproducing the bug
+### Verifying after a future TidesDB upgrade
 
 ```bash
 cd bench/hammerdb
-WARE=10 BUILDVU=4 RUNVU=4 PRE_KILL_SECS=30 ./recovery-diag.sh
-# inspect bench/results/recovery-diag-*/snapshots.txt
-# look for tables where `orders_by_w` returns ~30k per warehouse
-# but `unfiltered` COUNT(*) is far below 308k+
+./recovery-diag.sh
+# bench/results/recovery-diag-*/snapshots.txt -- post-restart counts
+# must match `district.d_next_o_id - 1` for each (w, d).
 ```
 
-The instrumented build that captured the per-source pop counts is
-preserved as Docker image `tidesdb/mysql:9.7-instr4` locally (rebuildable
-via `docker build -f docker/Dockerfile.mysql -t tidesdb/mysql:9.7-instr4`
-with the instrumentation diff applied on top of the v0.2.3 patches).
-
-### Affected tests
-
-These tests cover the recovery path and will flag the bug if it
-reappears or worsens:
-
-- `bench/hammerdb/recovery-test.sh` — end-to-end recovery verdict
-- `bench/hammerdb/recovery-diag.sh` — detailed per-CF diagnostic
-- `bench/hammerdb/run-all.sh` step 2 — included in the suite
+`run-all.sh` runs the full suite (correctness baseline, recovery,
+VU sweep, head-to-head vs InnoDB, TPROC-H, sustained) and generates
+a self-contained `REPORT.md`.
