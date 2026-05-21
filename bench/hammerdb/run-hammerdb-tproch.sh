@@ -98,16 +98,22 @@ echo "[hdbh] build $([ $BUILD_OK = 1 ] && echo COMPLETED || echo FAILED)"
 # regression if anyone re-enables unified_memtable=ON without the
 # upstream rotation-race fix). Spec at SF=1: 6,001,215 lineitems.
 # Other tables scale linearly; we sanity-check the largest two.
+#
+# HammerDB's mysql TPROC-H builder creates tables UPPERCASE
+# (LINEITEM/ORDERS/...), which on Linux's case-sensitive filesystem
+# with MySQL default `lower_case_table_names=0` is the literal table
+# name. Use the exact name HammerDB writes -- a lowercase query would
+# error "table doesn't exist" and look like data loss.
 LI_EXPECTED=$((SCALE * 6001215))
 ORD_EXPECTED=$((SCALE * 1500000))
 ROW_OK=0
 if [ $BUILD_OK = 1 ]; then
   LI_ACTUAL=$(docker exec "$DB" mysql -uroot -N -B \
-    -e "SELECT COUNT(*) FROM tpch.lineitem" 2>/dev/null)
+    -e "SELECT COUNT(*) FROM tpch.LINEITEM" 2>/dev/null)
   ORD_ACTUAL=$(docker exec "$DB" mysql -uroot -N -B \
-    -e "SELECT COUNT(*) FROM tpch.orders" 2>/dev/null)
-  echo "[hdbh] lineitem: ${LI_ACTUAL:-?} (expected ${LI_EXPECTED})"
-  echo "[hdbh] orders  : ${ORD_ACTUAL:-?} (expected ${ORD_EXPECTED})"
+    -e "SELECT COUNT(*) FROM tpch.ORDERS" 2>/dev/null)
+  echo "[hdbh] LINEITEM: ${LI_ACTUAL:-?} (expected ${LI_EXPECTED})"
+  echo "[hdbh] ORDERS  : ${ORD_ACTUAL:-?} (expected ${ORD_EXPECTED})"
   if [ "${LI_ACTUAL:-0}" = "$LI_EXPECTED" ] && [ "${ORD_ACTUAL:-0}" = "$ORD_EXPECTED" ]; then
     ROW_OK=1
   fi

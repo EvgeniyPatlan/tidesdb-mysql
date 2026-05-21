@@ -113,7 +113,8 @@ echo "[tdq] starting HammerDB 5.0 client"
 docker run -d --name "$CLI" --network "$NET" hammerdb:5.0 >/dev/null
 
 render(){ sed -e "s/@DBHOST@/$DB/g" -e "s/@USER@/$USER/g" -e "s/@PASS@/$PASS/g" \
-              -e "s/@WARE@/$WARE/g" -e "s/@BUILDVU@/$BUILDVU/g" "$1"; }
+              -e "s/@WARE@/$WARE/g" -e "s/@BUILDVU@/$BUILDVU/g" \
+              -e "s/@ENGINE@/tidesdb/g" "$1"; }
 
 echo "[tdq] === schema build (ENGINE=tidesdb, $WARE warehouses, $BUILDVU VUs) ==="
 render "$HERE/build.tcl" > /tmp/tdq_build.tcl

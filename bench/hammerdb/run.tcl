@@ -16,7 +16,7 @@ diset connection mysql_socket /tmp/mysql.sock
 diset tpcc mysql_user @USER@
 diset tpcc mysql_pass @PASS@
 diset tpcc mysql_dbase tpcc
-diset tpcc mysql_storage_engine tidesdb
+diset tpcc mysql_storage_engine @ENGINE@
 diset tpcc mysql_count_ware @WARE@
 diset tpcc mysql_driver timed
 diset tpcc mysql_rampup @RAMP@

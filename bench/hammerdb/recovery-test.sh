@@ -96,7 +96,8 @@ echo "[rec] === STAGE 2: TPROC-C schema build (WARE=$WARE) ==="
 docker run -d --name "$CLI" --network "$NET" hammerdb:5.0 >/dev/null
 render(){ sed -e "s/@DBHOST@/$DB/g" -e "s/@USER@/$USER/g" -e "s/@PASS@/$PASS/g" \
               -e "s/@WARE@/$WARE/g" -e "s/@BUILDVU@/$BUILDVU/g" -e "s/@RUNVU@/$RUNVU/g" \
-              -e "s/@RAMP@/0/g" -e "s/@DUR@/10/g" -e "s/@RUNTIMER@/700/g" "$1"; }
+              -e "s/@RAMP@/0/g" -e "s/@DUR@/10/g" -e "s/@RUNTIMER@/700/g" \
+              -e "s/@ENGINE@/tidesdb/g" "$1"; }
 render "$HERE/build.tcl" > /tmp/rec_build.tcl
 docker cp /tmp/rec_build.tcl "$CLI":/opt/hammerdb/build.tcl
 docker exec "$CLI" sh -c 'cd /opt/hammerdb && ./hammerdbcli auto build.tcl' \

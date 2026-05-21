@@ -1,0 +1,10 @@
+Crash-recovery test -- 20260521T110755Z
+DB image: tidesdb/mysql:9.7  unified_memtable=OFF
+profile : WARE=10 BUILDVU=4 RUNVU=4 pre_kill_secs=30
+
+schema build       : COMPLETED
+post-kill recovery : OK
+committed-row loss : NONE
+order-row gaps     : DETECTED --  w=1 d=1 expected_max=3093 got_max=2017; w=1 d=2 expected_max=3088 got_max=NONE; w=1 d=3 expected_max=3099 got_max=NONE; w=1 d=4 expected_max=3092 got_max=NONE; w=1 d=5 expected_max=3118 got_max=NONE; w=1 d=6 expected_max=3114 got_max=NONE; w=1 d=7 expected_max=3117 got_max=NONE; w=1 d=8 expected_max=3113 got_max=NONE; w=1 d=9 expected_max=3093 got_max=NONE; w=1 d=10 expected_max=3102 got_max=NONE;
+
+verdict: FAIL -- committed orders missing post-recovery (WAL replay incomplete)

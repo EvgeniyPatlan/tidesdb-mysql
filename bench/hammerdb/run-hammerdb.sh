@@ -25,6 +25,7 @@ fi
 CPUS=${CPUS:-4}; MEM=${MEM:-12g}
 RUNTIMER=$(( (RAMP + DUR) * 60 + 90 ))
 USER=bench; PASS='Bench_9xQ!z'
+ENGINE=${ENGINE:-tidesdb}        # ENGINE=innodb for the head-to-head baseline
 
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 OUT="$BENCH/results/hammerdb-$TS"; mkdir -p "$OUT"
@@ -106,7 +107,8 @@ docker run -d --name "$CLI" --network "$NET" hammerdb:5.0 >/dev/null
 
 render(){ sed -e "s/@DBHOST@/$DB/g" -e "s/@USER@/$USER/g" -e "s/@PASS@/$PASS/g" \
               -e "s/@WARE@/$WARE/g" -e "s/@BUILDVU@/$BUILDVU/g" -e "s/@RUNVU@/$RUNVU/g" \
-              -e "s/@RAMP@/$RAMP/g" -e "s/@DUR@/$DUR/g" -e "s/@RUNTIMER@/$RUNTIMER/g" "$1"; }
+              -e "s/@RAMP@/$RAMP/g" -e "s/@DUR@/$DUR/g" -e "s/@RUNTIMER@/$RUNTIMER/g" \
+              -e "s/@ENGINE@/$ENGINE/g" "$1"; }
 
 echo "[hdb] === schema build (ENGINE=tidesdb, $WARE warehouses) ==="
 render "$HERE/build.tcl" > /tmp/hdb_build.tcl
@@ -223,6 +225,7 @@ CONFLICTS=$(grep -aciE '1213|1205| 1180|deadlock|Lock wait timeout' "$OUT/run.lo
   echo "HammerDB 5.0 TPROC-C verification -- $TS"
   echo "DB image: tidesdb/mysql:9.7 (main HEAD, reverse-ref fix)"
   echo "profile : WARE=$WARE BUILDVU=$BUILDVU RUNVU=$RUNVU RAMP=${RAMP}m DUR=${DUR}m"
+  echo "engine  : $ENGINE"
   echo "tidesdb_unified_memtable = ${UNIFIED_MT:-?}"
   echo
   echo "schema build      : $([ $BUILD_OK = 1 ] && echo COMPLETED || echo FAILED)"

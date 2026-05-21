@@ -16,7 +16,7 @@ diset tpcc mysql_num_vu @BUILDVU@
 diset tpcc mysql_user @USER@
 diset tpcc mysql_pass @PASS@
 diset tpcc mysql_dbase tpcc
-diset tpcc mysql_storage_engine tidesdb
+diset tpcc mysql_storage_engine @ENGINE@
 diset tpcc mysql_partition false
 puts "SCHEMA BUILD STARTED"
 buildschema

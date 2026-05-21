@@ -1,0 +1,5 @@
+orders(w1,d1) COUNT(*)=3000
+--partial-prefix-reverse--
+3000
+--ostat-shape--
+2100	8
