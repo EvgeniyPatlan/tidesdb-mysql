@@ -171,7 +171,7 @@ If you want to develop the plugin (run tests, edit code, rebuild fast):
 
 `build-all.sh` runs three steps:
 
-1. **`setup-workspace.sh`** — clones `mysql-server@mysql-9.7.0` and `tidesdb@v9.2.0` into `vendor/`, then installs `plugin/` and `mysql-test-suite/` into the MySQL tree.
+1. **`setup-workspace.sh`** — clones `mysql-server@mysql-9.7.0` and `tidesdb@v9.2.5` into `vendor/`, then installs `plugin/` and `mysql-test-suite/` into the MySQL tree.
 2. **`build-tidesdb.sh`** — builds `libtidesdb.a` (Debug, with symbols) into `vendor/tidesdb-prefix/`.
 3. **`build-plugin.sh`** — configures MySQL with `WITH_TIDESDB_STORAGE_ENGINE=DYNAMIC`, builds `ha_tidesdb.so`.
 

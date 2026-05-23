@@ -80,16 +80,18 @@ docker run --rm --user "$(id -u):$(id -g)" \
     tidesdb-builder-rpm \
     bash -e -c '
 set -e
-echo "[builder] cloning + compiling against MySQL 9.7.0 + TidesDB v9.2.0"
+echo "[builder] cloning + compiling against MySQL 9.7.0 + TidesDB v9.2.5"
 mkdir -p /tmp/build
 cd /tmp/build
 git clone --depth=1 --branch mysql-9.7.0 \
     https://github.com/mysql/mysql-server.git mysql-server >/dev/null
-git clone --depth=1 --branch v9.2.0 \
+git clone --depth=1 --branch v9.2.5 \
     https://github.com/tidesdb/tidesdb.git tidesdb >/dev/null
 
 # TidesDB static archive
 cd tidesdb
+# bloom_filter_new use-after-free fix (TidesDB PR #626); remove once upstream.
+patch -p1 < /repo/docker/patches/0001-bloomfix.patch
 cmake -S . -B build-static \
       -DCMAKE_BUILD_TYPE=Release \
       -DBUILD_SHARED_LIBS=OFF \

@@ -21,7 +21,7 @@ cd "$REPO"
 
 # Pin versions for reproducibility. Bump when known-compatible.
 MYSQL_TAG="${MYSQL_TAG:-mysql-9.7.0}"
-TIDESDB_TAG="${TIDESDB_TAG:-v9.2.0}"
+TIDESDB_TAG="${TIDESDB_TAG:-v9.2.5}"
 WITH_TIDESQL_REFERENCE="${WITH_TIDESQL_REFERENCE:-0}"
 
 mkdir -p vendor
@@ -40,6 +40,8 @@ if [ ! -d vendor/tidesdb/.git ]; then
     echo "[setup] Cloning TidesDB $TIDESDB_TAG"
     git clone --depth=1 --branch "$TIDESDB_TAG" \
         https://github.com/tidesdb/tidesdb.git vendor/tidesdb
+    # bloom_filter_new use-after-free fix (TidesDB PR #626); remove once upstream.
+    ( cd vendor/tidesdb && patch -p1 < "$REPO/docker/patches/0001-bloomfix.patch" )
 else
     echo "[setup] vendor/tidesdb already present — skipping clone"
 fi

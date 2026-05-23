@@ -1,0 +1,63 @@
+diff --git a/src/bloom_filter.c b/src/bloom_filter.c
+index 54615c1..4ee031a 100644
+--- a/src/bloom_filter.c
++++ b/src/bloom_filter.c
+@@ -196,6 +196,7 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
+     if (m_double <= 0.0 || m_double > (double)UINT32_MAX)
+     {
+         free(*bf);
++        *bf = NULL;
+         return -1;
+     }
+ 
+@@ -212,6 +213,7 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
+     if (h_double <= 0.0 || h_double > (double)BF_MAX_HASH_FUNCTIONS)
+     {
+         free(*bf);
++        *bf = NULL;
+         return -1;
+     }
+ 
+@@ -224,6 +226,7 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
+     if ((*bf)->size_in_words == 0 || (*bf)->size_in_words > UINT32_MAX / sizeof(uint64_t))
+     {
+         free(*bf);
++        *bf = NULL;
+         return -1;
+     }
+ 
+@@ -232,6 +235,7 @@ int bloom_filter_new(bloom_filter_t **bf, double p, const int n)
+     if ((*bf)->bitset == NULL)
+     {
+         free(*bf);
++        *bf = NULL;
+         return -1;
+     }
+ 
+diff --git a/src/tidesdb.c b/src/tidesdb.c
+index 9e0a50a..d0254da 100644
+--- a/src/tidesdb.c
++++ b/src/tidesdb.c
+@@ -15898,8 +15898,20 @@ static int tidesdb_partitioned_merge(tidesdb_column_family_t *cf, int start_leve
+                             block_indexes = NULL;
+                             if (cf->config.enable_bloom_filter)
+                             {
+-                                bloom_filter_new(&bloom, cf->config.bloom_fpr,
+-                                                 (int)estimated_entries);
++                                /* bloom_filter_new nulls bloom on failure
++                                 * (see contract in src/bloom_filter.c), so a
++                                 * miss here leaves bloom NULL and the merge
++                                 * loop skips bloom_filter_add */
++                                if (bloom_filter_new(&bloom, cf->config.bloom_fpr,
++                                                     (int)estimated_entries) != 0)
++                                {
++                                    TDB_DEBUG_LOG(
++                                        TDB_LOG_WARN,
++                                        "Partitioned merge partition %d: bloom_filter_new "
++                                        "failed on file_max split (estimated_entries=%" PRIu64
++                                        "), continuing without bloom for this split sstable",
++                                        partition, estimated_entries);
++                                }
+                             }
+                             if (cf->config.enable_block_indexes && !cf->config.use_btree)
+                             {

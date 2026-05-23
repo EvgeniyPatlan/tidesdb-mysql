@@ -113,3 +113,31 @@ docker run -d -e MYSQL_ROOT_PASSWORD=secret -p 3306:3306 tidesdb/mysql:9.7
 `docker/runtime/smoke-test.sh` exercises engine load, CRUD, composite PK + AUTO_INC, composite UNIQUE constraint enforcement, and durability across container restart.
 
 `docker/runtime/docker-compose.yml` provides one-command bring-up with a named volume for data persistence.
+
+### Data directory default moved inside the datadir
+
+The auto-computed default for TidesDB's data was a *sibling* of the MySQL datadir (`<datadir>/../tidesdb_data`) — a port artifact carried over from TideSQL on MariaDB. That placed engine data outside the datadir, where MySQL's backup, clone, and `--datadir` relocation tooling doesn't expect it, and a source build would scatter `tidesdb_data/` next to the data dir.
+
+The default is now `<datadir>/.tidesdb`:
+
+- **Inside the datadir**, matching TideSQL on MariaDB and the location MySQL tooling expects (same volume / permissions / backup treatment as InnoDB).
+- **Leading dot**, following the MyRocks (`.rocksdb`) / InnoDB (`#innodb_*`) convention, so the directory is never mistaken for a schema directory. A bare `tidesdb_data` would have collided with `CREATE DATABASE tidesdb_data`.
+
+`tidesdb_data_home_dir` still overrides the location. The Docker/packaging `tidesdb.cnf` set this explicitly and now point at `/var/lib/mysql/.tidesdb/`.
+
+**Migration:** data written by an earlier build lives at the old path (`<datadir>/../tidesdb_data` from a source build, or `/var/lib/mysql/tidesdb_data` in the Docker image). Move it to the new location or set `tidesdb_data_home_dir` to the old path. Requires a plugin rebuild to take effect.
+
+### Bundled engine bumped to TidesDB v9.2.5
+
+The vendored engine moved from v9.2.0 to **v9.2.5** across the Docker images, the RPM packaging, and `setup-workspace.sh`.
+
+The headline reason: all four durability bugs we had been carrying as `0001-walfix.patch` against v9.2.0 are **fixed upstream in v9.2.5**, verified one by one:
+
+- **`convert_sync_mode` inversion** — the engine sync enum was reordered (`NONE=0, FULL=1, INTERVAL=2`), making the existing switch correct. Our old rewrite would now map `FULL→NONE` and re-break durability, so the patch is **retired, not ported**.
+- **Raw sync_mode at WAL opens** — `block_manager_open` now calls `convert_sync_mode` internally, so passing the raw enum is correct.
+- **Unconditional WAL truncate before recovery** — `tidesdb_create_column_family` now validates (preserves) an existing WAL and only truncates a genuinely fresh CF.
+- **SSTable cursor block_size caching** — the cursor now caches the real on-disk size only when a block was read from disk, else forces a re-read; the row-dropping multi-SSTable recovery scan is gone.
+
+What we still carry is `docker/patches/0001-bloomfix.patch` (TidesDB **PR #626**): a use-after-free in `bloom_filter_new` whose post-malloc failure paths `free(*bf)` without nulling, which a compaction worker turned into a GPF in `bloom_filter_add`. Removed once PR #626 lands upstream. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md) for the full per-bug writeup.
+
+The migration was gated on a clean HammerDB SIGKILL recovery run (TPC-C load → `docker kill -9` mid-write → restart → committed row counts match `district.d_next_o_id - 1`) against the v9.2.5-based image.
