@@ -46,10 +46,10 @@ mh_kill_prior () {
 
 mh_bootstrap () {
     rm -rf "$DATA"; mkdir -p "$DATA"
-    # TidesDB stores its CFs in $REPO/tidesdb_data/, which is NOT inside the
-    # MySQL datadir; clearing only $DATA leaves stale CFs from prior runs.
-    # Without this, a fresh test that re-creates a table sees existing CF
-    # data and trips false UNIQUE / PK conflicts on the very first INSERT.
+    # TidesDB stores its CFs in $DATA/.tidesdb (inside the datadir), so wiping
+    # $DATA above already clears them. Also remove the pre-0.2.5 sibling
+    # location ($REPO/tidesdb_data) in case an old checkout left data there;
+    # stale CFs would otherwise trip false UNIQUE / PK conflicts on first INSERT.
     rm -rf "$REPO/tidesdb_data"
     # NB: --no-defaults must precede --initialize-insecure (it's a meta-option
     # consumed before the initialization options are parsed).

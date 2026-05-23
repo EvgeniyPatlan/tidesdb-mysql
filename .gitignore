@@ -21,8 +21,15 @@ mtr-tmp/
 # Hand-rolled test artifacts
 test-data/
 tidesdb_data/
+.tidesdb/
 tidesdb-prefix/
 tests/results-*/
+
+# Benchmark run artifacts (large, ephemeral) -- keep the harness, not the output
+bench/results/
+
+# LibreOffice/Office lock files
+.~lock.*#
 
 # Logs
 *.log

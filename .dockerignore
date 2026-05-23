@@ -15,6 +15,7 @@ mtr-tmp/
 # Hand-rolled test data
 test-data/
 tidesdb_data/
+.tidesdb/
 tidesdb-prefix/
 
 # Logs

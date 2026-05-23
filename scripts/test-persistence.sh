@@ -36,7 +36,7 @@ sleep 1
 # Verify on-disk artifacts.
 echo
 echo "[persistence] on-disk after shutdown:"
-ls -la "$REPO/vendor/tidesdb_data/" 2>/dev/null | head -10
+ls -la "$DATA/.tidesdb/" 2>/dev/null | head -10
 echo
 
 # ---------- phase 2: restart, read ----------

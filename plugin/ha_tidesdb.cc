@@ -687,13 +687,13 @@ static MYSQL_SYSVAR_ULONGLONG(unified_memtable_sync_interval, srv_unified_memtab
                               NULL, NULL, 128000, 0, ULONGLONG_MAX, 0);
 
 /* Configurable data directory.
-   Defaults to NULL which means the plugin computes a sibling directory
-   of mysql_real_data_home.  Setting this overrides the auto-computed path. */
+   Defaults to NULL which means the plugin places its data in
+   <mysql_datadir>/.tidesdb.  Setting this overrides the auto-computed path. */
 static char *srv_data_home_dir = NULL;
 
 static MYSQL_SYSVAR_STR(data_home_dir, srv_data_home_dir, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
                         "Directory where TidesDB stores its data files; "
-                        "defaults to <mysql_datadir>/../tidesdb_data; "
+                        "defaults to <mysql_datadir>/.tidesdb; "
                         "must be set before server startup (read-only)",
                         NULL, NULL, NULL);
 
@@ -2644,8 +2644,13 @@ static int tidesdb_init_func(void *p)
        Moved to tidesdb_fts.cc during the A-2 extraction. */
     tdb_fts_init();
 
-    /* We use tidesdb_data_home_dir if set, otherwise compute
-       a sibling directory of the MariaDB data directory. */
+    /* We use tidesdb_data_home_dir if set, otherwise place the engine's
+       data inside the MySQL data directory as ".tidesdb". Keeping it under
+       the datadir matches TideSQL on MariaDB and the location backup/
+       relocation tools expect; the leading dot follows the MyRocks
+       (".rocksdb") / InnoDB ("#innodb_*") convention so the directory is
+       never mistaken for a schema directory (a bare "tidesdb_data" would
+       collide with CREATE DATABASE tidesdb_data). */
     if (srv_data_home_dir && srv_data_home_dir[0])
     {
         g_engine_ctx.path = srv_data_home_dir;
@@ -2655,11 +2660,10 @@ static int tidesdb_init_func(void *p)
     {
         std::string data_home(mysql_real_data_home);
         while (!data_home.empty() && data_home.back() == '/') data_home.pop_back();
-        size_t slash_pos = data_home.rfind('/');
-        if (slash_pos != std::string::npos)
-            g_engine_ctx.path = data_home.substr(0, slash_pos + 1) + "tidesdb_data";
+        if (!data_home.empty())
+            g_engine_ctx.path = data_home + "/.tidesdb";
         else
-            g_engine_ctx.path = "tidesdb_data";
+            g_engine_ctx.path = ".tidesdb";
     }
 
     /* We map log level enum index to TidesDB constants */

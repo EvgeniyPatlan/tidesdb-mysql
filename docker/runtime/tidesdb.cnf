@@ -13,14 +13,15 @@ plugin-load-add = ha_tidesdb.so
 
 # Keep TidesDB's column-family data inside the MySQL datadir so it gets
 # the same volume / permissions / backups treatment as InnoDB tables.
-# (Default would be /var/lib/tidesdb_data, which the mysql user can't
-# write to in the official mysql:9.7 image.)
+# This matches the plugin's own default (<datadir>/.tidesdb); it's set
+# explicitly here so the location is obvious and stable across upgrades.
+# The leading dot keeps the directory from being mistaken for a schema.
 #
 # `loose_` prefix: this variable is plugin-defined, so it's unknown during
 # the initial mysqld --initialize-insecure step (which runs before any
 # plugin loads). Without `loose_`, that step would abort with
 # "unknown variable". `loose_` makes mysqld warn-and-continue.
-loose_tidesdb_data_home_dir = /var/lib/mysql/tidesdb_data/
+loose_tidesdb_data_home_dir = /var/lib/mysql/.tidesdb/
 
 # Optional defaults you may want to tune. Uncomment / set as you like.
 #tidesdb_default_compression       = LZ4
