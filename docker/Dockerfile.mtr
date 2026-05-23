@@ -1,0 +1,101 @@
+# syntax=docker/dockerfile:1.6
+###############################################################################
+#  TidesDB-on-MySQL 9.7 — MTR test image
+#
+#  Unlike Dockerfile.mysql (which builds ONLY the plugin target and drops the
+#  .so into the stock mysql:9.7 image), this image builds the FULL mysqld +
+#  mysqltest harness from source so the project's mysql-test suite can run
+#  via mtr against the exact patched TidesDB engine + v0.2.5 plugin.
+#
+#  The clone / patched-tidesdb / configure layers are byte-identical to
+#  Dockerfile.mysql so they reuse the v0.2.5 build cache; only the final
+#  `cmake --build` (full server, not `--target tidesdb`) is new work.
+#
+#  Build:
+#    docker build -f docker/Dockerfile.mtr -t tidesdb/mysql-mtr:9.7 .
+#  Run the suite:
+#    docker run --rm tidesdb/mysql-mtr:9.7 \
+#      bash -lc "cd /build/mysql-server/build/mysql-test && \
+#                ./mtr --suite=tidesdb --force --max-test-fail=0"
+###############################################################################
+FROM oraclelinux:9 AS builder
+
+ARG MYSQL_TAG=mysql-9.7.0
+ARG TIDESDB_TAG=v9.2.5
+
+RUN dnf -y install --setopt=install_weak_deps=False \
+        oracle-epel-release-el9 oraclelinux-developer-release-el9 && \
+    dnf -y config-manager --enable ol9_codeready_builder && \
+    dnf -y install --setopt=install_weak_deps=False \
+        gcc-toolset-14-gcc gcc-toolset-14-gcc-c++ gcc-toolset-14-binutils \
+        gcc-toolset-14-annobin-annocheck gcc-toolset-14-annobin-plugin-gcc \
+        make cmake ninja-build bison git pkgconf-pkg-config \
+        diffutils tar which patch findutils \
+        openssl-devel ncurses-devel readline-devel \
+        libtirpc-devel libcurl-devel \
+        libzstd-devel lz4-devel snappy-devel && \
+    dnf clean all
+
+ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:$PATH \
+    CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc \
+    CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++
+
+WORKDIR /build
+
+RUN git clone --depth=1 --branch ${MYSQL_TAG} \
+        https://github.com/mysql/mysql-server.git mysql-server
+
+RUN git clone --depth=1 --branch ${TIDESDB_TAG} \
+        https://github.com/tidesdb/tidesdb.git tidesdb
+COPY docker/patches/0001-bloomfix.patch /tmp/0001-bloomfix.patch
+RUN cd tidesdb && \
+    patch -p1 < /tmp/0001-bloomfix.patch && \
+    rm -f /tmp/0001-bloomfix.patch && \
+    cmake -S . -B build-static \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_SHARED_LIBS=OFF \
+          -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+          -DTIDESDB_BUILD_TESTS=OFF \
+          -DTIDESDB_BUILD_BENCHMARK=OFF && \
+    cmake --build build-static -j"$(nproc)" && \
+    cmake --install build-static --prefix /build/tidesdb-prefix
+
+COPY plugin/ /build/mysql-server/storage/tidesdb/
+
+RUN cd mysql-server && \
+    TIDESDB_ROOT=/build/tidesdb-prefix \
+    cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DDOWNLOAD_BOOST=1 \
+          -DWITH_BOOST=/build/boost \
+          -DWITH_UNIT_TESTS=OFF \
+          -DCMAKE_PREFIX_PATH=/build/tidesdb-prefix \
+          -DPLUGIN_ROCKSDB=NO \
+          -DPLUGIN_NDB=NO \
+          -DPLUGIN_FEDERATED=NO \
+          -DPLUGIN_ARCHIVE=NO \
+          -DPLUGIN_BLACKHOLE=NO \
+          -DPLUGIN_EXAMPLE=NO \
+          -DPLUGIN_GROUP_REPLICATION=NO \
+          -DWITH_GROUP_REPLICATION=OFF \
+          -DWITH_AUTHENTICATION_LDAP=OFF \
+          -DWITH_AUTHENTICATION_KERBEROS=OFF \
+          -DWITH_AUTHENTICATION_FIDO=OFF \
+          -DWITH_AUTHENTICATION_WEBAUTHN=OFF
+
+# --- new vs Dockerfile.mysql: perl for mtr + full server build + suite ---
+RUN dnf -y install --setopt=install_weak_deps=False \
+        perl perl-Data-Dumper perl-Getopt-Long perl-Time-HiRes \
+        perl-Test-Simple perl-Socket perl-Sys-Hostname procps-ng && \
+    dnf clean all
+
+RUN cd mysql-server && \
+    TIDESDB_ROOT=/build/tidesdb-prefix \
+    cmake --build build -j"$(nproc)"
+
+RUN ls -la /build/mysql-server/build/plugin_output_directory/ha_tidesdb.so
+
+# Bake the project's MTR suite into the server test tree.
+COPY mysql-test-suite/ /build/mysql-server/mysql-test/suite/tidesdb/
+
+WORKDIR /build/mysql-server/build/mysql-test

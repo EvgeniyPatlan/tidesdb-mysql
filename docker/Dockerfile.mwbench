@@ -1,0 +1,91 @@
+# syntax=docker/dockerfile:1.6
+###############################################################################
+#  mwbench — engine-level integrity/stress harness for the bundled TidesDB
+#
+#  Unlike Dockerfile.mysql (which builds the MySQL plugin), this image builds
+#  the TidesDB C library directly + the upstream `mwbench` tool and runs it
+#  AGAINST THE EXACT SAME engine source we ship (v9.2.5 + 0001-bloomfix.patch).
+#  It exercises heavy sequential ingest + concurrent readers with byte-level
+#  verification of every value read back, so lost writes (misses) or corrupted
+#  bytes (mismatches) surface as CSV counters — the area where our four
+#  durability bugs and the bloom UAF lived (flush/compaction/cursor paths).
+#
+#  No MySQL involved: this is a fast pre-MySQL gate on the storage engine.
+#
+#  Build:
+#    docker build -f docker/Dockerfile.mwbench -t tidesdb/mwbench:9.2.5 .
+#  Run (see bench/mwbench/run-mwbench.sh which wraps this):
+#    docker run --rm -v "$PWD/out":/out tidesdb/mwbench:9.2.5 \
+#      /build/mwbench/build/mwbench --quick --out-dir /out
+###############################################################################
+FROM oraclelinux:9 AS builder
+
+# NB: the FROM + these two ARG lines + the dnf RUN below are kept BYTE-IDENTICAL
+# to docker/Dockerfile.mysql so the legacy builder reuses that image's cached
+# ~127-package toolchain layer instead of reinstalling it. MYSQL_TAG is unused
+# here; it exists only to keep the layer cache key aligned.
+ARG MYSQL_TAG=mysql-9.7.0
+ARG TIDESDB_TAG=v9.2.5
+
+RUN dnf -y install --setopt=install_weak_deps=False \
+        oracle-epel-release-el9 oraclelinux-developer-release-el9 && \
+    dnf -y config-manager --enable ol9_codeready_builder && \
+    dnf -y install --setopt=install_weak_deps=False \
+        gcc-toolset-14-gcc gcc-toolset-14-gcc-c++ gcc-toolset-14-binutils \
+        gcc-toolset-14-annobin-annocheck gcc-toolset-14-annobin-plugin-gcc \
+        make cmake ninja-build bison git pkgconf-pkg-config \
+        diffutils tar which patch findutils \
+        openssl-devel ncurses-devel readline-devel \
+        libtirpc-devel libcurl-devel \
+        libzstd-devel lz4-devel snappy-devel && \
+    dnf clean all
+
+# Extra dep specific to this image: the SHARED libtidesdb.so link pulls in
+# -latomic (the static archive used by Dockerfile.mysql defers that to the
+# final exe link). The libatomic rpm ships only the versioned
+# /usr/lib64/libatomic.so.1; the unversioned .so symlink that `-latomic`
+# resolves at link time is absent, so we create it (the toolset linker
+# already searches /usr/lib64 -- lz4/zstd/snappy/openssl all resolve there).
+# Kept in its own layer so the big toolchain layer above stays byte-identical
+# to Dockerfile.mysql and reuses its cache.
+RUN dnf -y install --setopt=install_weak_deps=False libatomic && dnf clean all && \
+    ln -sf libatomic.so.1 /usr/lib64/libatomic.so
+
+ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:$PATH \
+    CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc \
+    CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++
+
+WORKDIR /build
+
+# Clone TidesDB at the pinned tag and apply the bloom-filter UAF fix
+# (TidesDB PR #626) — the same patch the shipped MySQL image carries.
+# Built SHARED here (default): mwbench links libtidesdb.so from the build dir
+# via an embedded rpath, and the build dir already lays out include/tidesdb/.
+RUN git clone --depth=1 --branch ${TIDESDB_TAG} \
+        https://github.com/tidesdb/tidesdb.git tidesdb
+COPY docker/patches/0001-bloomfix.patch /tmp/0001-bloomfix.patch
+RUN cd tidesdb && \
+    patch -p1 < /tmp/0001-bloomfix.patch && \
+    rm -f /tmp/0001-bloomfix.patch && \
+    cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DTIDESDB_BUILD_TESTS=OFF \
+          -DTIDESDB_BUILD_BENCHMARK=OFF && \
+    cmake --build build -j"$(nproc)"
+
+# Clone + build mwbench against the patched engine.
+ARG MWBENCH_REF=master
+RUN git clone --depth=1 --branch ${MWBENCH_REF} \
+        https://github.com/tidesdb/mwbench.git mwbench
+RUN cd mwbench && \
+    cmake -S . -B build \
+          -DTIDESDB_ROOT=/build/tidesdb \
+          -DTIDESDB_BUILD=/build/tidesdb/build && \
+    cmake --build build -j"$(nproc)" && \
+    test -x build/mwbench
+
+# Sanity: the binary links and prints help/banner under the toolset runtime.
+RUN /build/mwbench/build/mwbench --help >/dev/null 2>&1 || true
+
+WORKDIR /build/mwbench
+ENTRYPOINT ["/build/mwbench/build/mwbench"]

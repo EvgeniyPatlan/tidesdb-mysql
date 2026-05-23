@@ -1,0 +1,41 @@
+# Pinned HammerDB 5.0 (Ubuntu 24 prod build) for TPC-C correctness
+# verification against the TidesDB MySQL engine.
+#
+# HammerDB 5.0 is a self-contained zipfs binary; its `mysqltcl` driver
+# is extracted at runtime but dynamically links the SYSTEM
+# libmysqlclient.so.24 (MySQL 8.0 Connector/C soname). The bundle does
+# NOT include it and mysql:9.7 doesn't ship a client lib, so we pull
+# libmysqlclient24 from MySQL's official APT repo (pinned component).
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+# libmysqlclient.so.24 ships only in MySQL's mysql-8.4-lts component
+# (mysql-8.0 has .so.21). MySQL's APT signing keys are expired
+# upstream, so instead of fighting rotating keys we fetch the exact
+# pinned .deb from the repo pool and let apt resolve its (ubuntu) deps.
+# Fully reproducible; do NOT copy this key-skipping pattern to prod.
+# libmysqlclient24 (8.4.9) depends on mysql-common +
+# mysql-community-client-plugins (needed for caching_sha2_password
+# auth). All three pinned debs are fetched from the pool and
+# installed together; apt pulls the ubuntu deps (libssl3t64, zlib,
+# libstdc++).
+ARG MYSQL_POOL=http://repo.mysql.com/apt/ubuntu/pool/mysql-8.4-lts/m/mysql-community
+ARG MYSQL_V=8.4.9-1ubuntu24.04
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
+        curl ca-certificates libxml2 && \
+    cd /tmp && \
+    curl -fsSL "$MYSQL_POOL/mysql-common_${MYSQL_V}_amd64.deb" -o c.deb && \
+    curl -fsSL "$MYSQL_POOL/mysql-community-client-plugins_${MYSQL_V}_amd64.deb" -o p.deb && \
+    curl -fsSL "$MYSQL_POOL/libmysqlclient24_${MYSQL_V}_amd64.deb" -o l.deb && \
+    apt-get install -y -qq /tmp/c.deb /tmp/p.deb /tmp/l.deb && \
+    rm -f /tmp/c.deb /tmp/p.deb /tmp/l.deb && \
+    ldconfig && ldconfig -p | grep -q 'libmysqlclient.so.24' && \
+    rm -rf /var/lib/apt/lists/*
+
+ARG HDB_URL=https://github.com/TPC-Council/HammerDB/releases/download/v5.0/HammerDB-5.0-Prod-Lin-UBU24.tar.gz
+RUN curl -fsSL "$HDB_URL" -o /tmp/hdb.tgz && \
+    mkdir -p /opt && tar -xzf /tmp/hdb.tgz -C /opt && \
+    rm /tmp/hdb.tgz && \
+    ln -s /opt/HammerDB-5.0 /opt/hammerdb
+WORKDIR /opt/hammerdb
+ENTRYPOINT ["sleep", "infinity"]
