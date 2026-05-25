@@ -141,3 +141,18 @@ The headline reason: all four durability bugs we had been carrying as `0001-walf
 What we still carry is `docker/patches/0001-bloomfix.patch` (TidesDB **PR #626**): a use-after-free in `bloom_filter_new` whose post-malloc failure paths `free(*bf)` without nulling, which a compaction worker turned into a GPF in `bloom_filter_add`. Removed once PR #626 lands upstream. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md) for the full per-bug writeup.
 
 The migration was gated on a clean HammerDB SIGKILL recovery run (TPC-C load → `docker kill -9` mid-write → restart → committed row counts match `district.d_next_o_id - 1`) against the v9.2.5-based image.
+
+### Bundled engine bumped to TidesDB v9.3.0 (release v0.3.0)
+
+The vendored engine moved from v9.2.5 to **v9.3.0** across the Docker images (`mysql`, `mtr`, `mwbench`), the RPM packaging, and `setup-workspace.sh`.
+
+The headline reason: **we now ship the engine with zero patches.** The last fix we carried, `0001-bloomfix.patch` (TidesDB **PR #626** — the `bloom_filter_new` use-after-free), landed upstream verbatim in v9.3.0: the four `*bf = NULL;` guards on the post-malloc failure paths and the return-checked `tidesdb_partitioned_merge` file-max-split caller with its `TDB_LOG_WARN`. The patch file is deleted and the `docker/patches/` step removed from every Dockerfile and script. (`0001-walfix.patch` was already retired at v9.2.5.)
+
+Plugin-side changes that come with the bump:
+
+- **New error code `TDB_ERR_BUSY` (-14) mapped.** v9.3.0 returns this from the backpressure-stall timeout sites (L0-queue, active-memtable ceiling, memory-pressure critical) that previously returned `TDB_ERR_IO` or `TDB_ERR_MEMORY_LIMIT`. `tdb_rc_to_ha` now maps it to `HA_ERR_LOCK_WAIT_TIMEOUT` (transient, statement-only rollback, retriable) instead of letting it fall through to `HA_ERR_CRASHED` — which would have looked like corruption — and it joins the transient-error lists in the prepare/commit/bulk-commit retry paths.
+- **`default_l0_queue_stall_threshold` default lowered 20 → 10**, matching upstream's new default. With v9.3.0's active-memtable ceiling now bounding the active memtable to 2× `write_buffer_size`, the L0 queue was the last unbounded-growth surface; 20 immutables at the 64 MiB default allowed ~1.3 GiB of headroom before the stall fired, which is too lenient.
+
+Engine improvements inherited from v9.3.0 (no plugin change needed): a hard active-memtable backpressure ceiling at 2× `write_buffer_size` (directly addresses the unbounded memtable growth behind the WARE=100 OOM seen during v0.2.5 validation), four additional use-after-free/race fixes (`tidesdb_memtable_try_ref`, level reclamation, `tidesdb_checkpoint`, deferred-free reaper), compaction-trigger correctness fixes, and `max_concurrent_flushes` now pinned 1:1 to `num_flush_threads` (we never set it, so no warning). See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
+
+Gated on the full validation suite: MTR, the HammerDB SIGKILL recovery gate, the mwbench engine-integrity gate (0 mismatches / 0 misses), and a full HammerDB WARE=100 throughput run. See [docs/v9.3.0-validation-report.md](docs/v9.3.0-validation-report.md).

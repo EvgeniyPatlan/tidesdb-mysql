@@ -3,17 +3,32 @@
 This document tracks defects we've confirmed in the bundled TidesDB engine
 that affect `tidesdb-mysql` users.
 
-## Current: bundled on TidesDB v9.2.5
+## Current: bundled on TidesDB v9.3.0 — shipped unpatched
 
-As of this release the engine is pinned to **TidesDB v9.2.5**. The four
-durability bugs found during the v0.2.3/v0.2.4 investigation (documented
-below) are **all fixed upstream in v9.2.5**, so the former
-`0001-walfix.patch` has been **retired** — see "Verified fixed upstream"
-for how each one was resolved in the upstream tree.
+As of release **v0.3.0** the engine is pinned to **TidesDB v9.3.0** and we
+ship it **with zero patches**. Both fixes we used to carry are now upstream:
 
-The one fix we still carry is `docker/patches/0001-bloomfix.patch`
-(TidesDB **PR #626**), applied to the vendored v9.2.5 source inside the
-build before `cmake`. It will be removed once PR #626 lands upstream.
+- `0001-walfix.patch` (four durability bugs) — fixed in **v9.2.5**, retired then.
+- `0001-bloomfix.patch` (the `bloom_filter_new` UAF, TidesDB **PR #626**) —
+  landed upstream **verbatim in v9.3.0**, retired now.
+
+The `docker/patches/` directory is gone; no Dockerfile or script applies a
+patch. The per-bug write-ups below are kept as a record and as a regression
+checklist for future upgrades.
+
+Two behavioural items came in with v9.3.0 and are handled plugin-side
+(see [CHANGELOG.md](CHANGELOG.md)):
+
+- **`TDB_ERR_BUSY` (-14)** is now returned from backpressure-stall timeouts
+  that previously surfaced as `TDB_ERR_IO`. `tdb_rc_to_ha` maps it to
+  `HA_ERR_LOCK_WAIT_TIMEOUT` (retriable), so a transient stall no longer looks
+  like `HA_ERR_CRASHED` (corruption).
+- The new **active-memtable backpressure ceiling** (2× `write_buffer_size`)
+  bounds the unbounded memtable growth that produced the WARE=100 OOM during
+  v0.2.5 validation; the plugin's `default_l0_queue_stall_threshold` default
+  was lowered 20 → 10 to match upstream now that this is the gating surface.
+
+## Verified fixed upstream in v9.3.0 (formerly our bloomfix patch)
 
 ### `bloom_filter_new()` use-after-free on its failure paths
 
@@ -30,10 +45,12 @@ dangling pointer that the next `bloom_filter_add` faulted on (the freed
 chunk could be recycled by another thread in between). The failure paths
 are reached on `m`/`h`/`size_in_words` overflow or a `bitset` calloc
 failure.
-**Fix:** set `*bf = NULL` on every post-malloc failure path so the
-post-condition matches what callers assume, and have the file_max split
-path check the return value and log a `TDB_LOG_WARN` when bloom creation
-declines so a future regression is visible.
+**Upstream (v9.3.0):** `bloom_filter_new` now sets `*bf = NULL` on all four
+post-malloc failure paths, and the `tidesdb_partitioned_merge` file-max-split
+caller checks the return value and logs a `TDB_LOG_WARN` on decline — the
+exact change we had carried as `0001-bloomfix.patch`. A new
+`bloom_filter_tests` case exercises each failure path and asserts the
+post-condition.
 
 ## Verified fixed upstream in v9.2.5 (formerly our walfix patch)
 
