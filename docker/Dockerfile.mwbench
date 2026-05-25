@@ -4,7 +4,7 @@
 #
 #  Unlike Dockerfile.mysql (which builds the MySQL plugin), this image builds
 #  the TidesDB C library directly + the upstream `mwbench` tool and runs it
-#  AGAINST THE EXACT SAME engine source we ship (v9.2.5 + 0001-bloomfix.patch).
+#  AGAINST THE EXACT SAME engine source we ship (v9.3.0, unpatched).
 #  It exercises heavy sequential ingest + concurrent readers with byte-level
 #  verification of every value read back, so lost writes (misses) or corrupted
 #  bytes (mismatches) surface as CSV counters — the area where our four
@@ -13,9 +13,9 @@
 #  No MySQL involved: this is a fast pre-MySQL gate on the storage engine.
 #
 #  Build:
-#    docker build -f docker/Dockerfile.mwbench -t tidesdb/mwbench:9.2.5 .
+#    docker build -f docker/Dockerfile.mwbench -t tidesdb/mwbench:9.3.0 .
 #  Run (see bench/mwbench/run-mwbench.sh which wraps this):
-#    docker run --rm -v "$PWD/out":/out tidesdb/mwbench:9.2.5 \
+#    docker run --rm -v "$PWD/out":/out tidesdb/mwbench:9.3.0 \
 #      /build/mwbench/build/mwbench --quick --out-dir /out
 ###############################################################################
 FROM oraclelinux:9 AS builder
@@ -25,7 +25,7 @@ FROM oraclelinux:9 AS builder
 # ~127-package toolchain layer instead of reinstalling it. MYSQL_TAG is unused
 # here; it exists only to keep the layer cache key aligned.
 ARG MYSQL_TAG=mysql-9.7.0
-ARG TIDESDB_TAG=v9.2.5
+ARG TIDESDB_TAG=v9.3.0
 
 RUN dnf -y install --setopt=install_weak_deps=False \
         oracle-epel-release-el9 oraclelinux-developer-release-el9 && \
@@ -57,26 +57,37 @@ ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:$PATH \
 
 WORKDIR /build
 
-# Clone TidesDB at the pinned tag and apply the bloom-filter UAF fix
-# (TidesDB PR #626) — the same patch the shipped MySQL image carries.
+# Clone TidesDB at the pinned tag — shipped unpatched as of v9.3.0 (bloomfix
+# from PR #626 landed upstream in v9.3.0), the same source the MySQL image uses.
 # Built SHARED here (default): mwbench links libtidesdb.so from the build dir
 # via an embedded rpath, and the build dir already lays out include/tidesdb/.
 RUN git clone --depth=1 --branch ${TIDESDB_TAG} \
         https://github.com/tidesdb/tidesdb.git tidesdb
-COPY docker/patches/0001-bloomfix.patch /tmp/0001-bloomfix.patch
 RUN cd tidesdb && \
-    patch -p1 < /tmp/0001-bloomfix.patch && \
-    rm -f /tmp/0001-bloomfix.patch && \
     cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=Release \
           -DTIDESDB_BUILD_TESTS=OFF \
           -DTIDESDB_BUILD_BENCHMARK=OFF && \
     cmake --build build -j"$(nproc)"
 
-# Clone + build mwbench against the patched engine.
-ARG MWBENCH_REF=master
-RUN git clone --depth=1 --branch ${MWBENCH_REF} \
-        https://github.com/tidesdb/mwbench.git mwbench
+# Clone + build mwbench against the engine built above.
+#
+# Pinned to a commit (not a moving branch) for reproducibility -- the current
+# mwbench master is API-coupled to TidesDB v9.3.0 (it references TDB_ERR_BUSY,
+# which does not exist in v9.2.x) and we carry a one-hunk harness fix below
+# that only applies cleanly against this revision.
+ARG MWBENCH_REF=d214ed837461767c90ffdbcb5ecd233e557124a5
+RUN git clone https://github.com/tidesdb/mwbench.git mwbench && \
+    cd mwbench && git checkout ${MWBENCH_REF}
+# Harness correctness fix (NOT an engine patch): delete_phase_run published its
+# deleted-set predicate (g_del_step/g_del_total/g_del_max_key) only AFTER the
+# batched delete loop, so during the loop g_del_step==0 and pick_read_id could
+# not classify reads of just-deleted keys as expected_miss -- scoring them as
+# false data-loss "misses". The fix publishes the predicate before the loop
+# (all inputs are known up front). Engine integrity is unaffected; this only
+# corrects the harness's own bookkeeping. Reported upstream; drop once merged.
+COPY docker/patches/mwbench/0001-publish-delete-predicate-before-loop.patch /tmp/mwbench.patch
+RUN cd mwbench && patch -p1 < /tmp/mwbench.patch && rm -f /tmp/mwbench.patch
 RUN cd mwbench && \
     cmake -S . -B build \
           -DTIDESDB_ROOT=/build/tidesdb \

@@ -1,0 +1,27 @@
+diff --git a/main.c b/main.c
+index ac87306..4206387 100644
+--- a/main.c
++++ b/main.c
+@@ -2966,6 +2966,22 @@ static void delete_phase_run(FILE *out) {
+    * batch (off does not advance) with exponential backoff so the delete
+    * phase still completes when the engine is throttling */
+   int del_backoff_us = MWB_WRITER_BACKPRESSURE_MIN_US;
++
++  /* tidesdb-mysql harness fix: publish the deletion predicate BEFORE issuing
++   * any deletes. step / total_delete / max_key are all known up front, so a
++   * concurrent reader can classify a read of any to-be-deleted key
++   * (id == i*step, i < total_delete, id <= max_key) as expected_miss for the
++   * whole delete window. A not-yet-deleted key still reads as a hit (miss
++   * stays 0 and its value is still mismatch-checked); an already-deleted key
++   * is correctly suppressed. The original code published only after the loop
++   * (below), leaving a window in which g_del_step == 0 and every read of a
++   * just-deleted key was scored as a false data-loss miss. g_del_step is
++   * stored last so a torn read never produces a false positive. The post-loop
++   * publish remains and harmlessly refines g_del_total to the actual count. */
++  atomic_store_explicit(&g_del_max_key, max_key, memory_order_release);
++  atomic_store_explicit(&g_del_total, total_delete, memory_order_release);
++  atomic_store_explicit(&g_del_step, step, memory_order_release);
++
+   for (uint64_t off = 0; off < total_delete; /* advanced on commit-ok */) {
+     tidesdb_txn_t *txn = NULL;
+     int brc = tidesdb_txn_begin(G.db, &txn);

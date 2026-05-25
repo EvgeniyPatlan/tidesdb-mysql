@@ -11,7 +11,7 @@
 # Env knobs:
 #   SMOKE=1        shrinks every test profile for a fast pipeline check
 #   IMAGE          DB image (default tidesdb/mysql:9.7)
-#   MWBENCH_IMAGE  engine-integrity image (default tidesdb/mwbench:9.2.5)
+#   MWBENCH_IMAGE  engine-integrity image (default tidesdb/mwbench:9.3.0)
 #   ENGINE_B       baseline engine for the head-to-head (default innodb)
 #   SKIP=<n,n,n>   skip steps by number; step 0 is the mwbench integrity gate
 set -uo pipefail
@@ -19,7 +19,7 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 BENCH=$(cd "$HERE/.." && pwd)
 IMAGE=${IMAGE:-tidesdb/mysql:9.7}
-MWBENCH_IMAGE=${MWBENCH_IMAGE:-tidesdb/mwbench:9.2.5}
+MWBENCH_IMAGE=${MWBENCH_IMAGE:-tidesdb/mwbench:9.3.0}
 ENGINE_B=${ENGINE_B:-innodb}
 SKIP=${SKIP:-}
 
