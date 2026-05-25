@@ -5,10 +5,10 @@
 #  Unlike Dockerfile.mysql (which builds ONLY the plugin target and drops the
 #  .so into the stock mysql:9.7 image), this image builds the FULL mysqld +
 #  mysqltest harness from source so the project's mysql-test suite can run
-#  via mtr against the exact patched TidesDB engine + v0.2.5 plugin.
+#  via mtr against the exact (unpatched, v9.3.0) TidesDB engine + v0.3.0 plugin.
 #
-#  The clone / patched-tidesdb / configure layers are byte-identical to
-#  Dockerfile.mysql so they reuse the v0.2.5 build cache; only the final
+#  The clone / build-tidesdb / configure layers are byte-identical to
+#  Dockerfile.mysql so they reuse the v0.3.0 build cache; only the final
 #  `cmake --build` (full server, not `--target tidesdb`) is new work.
 #
 #  Build:
@@ -21,7 +21,7 @@
 FROM oraclelinux:9 AS builder
 
 ARG MYSQL_TAG=mysql-9.7.0
-ARG TIDESDB_TAG=v9.2.5
+ARG TIDESDB_TAG=v9.3.0
 
 RUN dnf -y install --setopt=install_weak_deps=False \
         oracle-epel-release-el9 oraclelinux-developer-release-el9 && \
@@ -47,10 +47,9 @@ RUN git clone --depth=1 --branch ${MYSQL_TAG} \
 
 RUN git clone --depth=1 --branch ${TIDESDB_TAG} \
         https://github.com/tidesdb/tidesdb.git tidesdb
-COPY docker/patches/0001-bloomfix.patch /tmp/0001-bloomfix.patch
+# Engine is shipped unpatched as of v9.3.0 (walfix landed in v9.2.5, bloomfix
+# in v9.3.0); see Dockerfile.mysql for the full provenance note.
 RUN cd tidesdb && \
-    patch -p1 < /tmp/0001-bloomfix.patch && \
-    rm -f /tmp/0001-bloomfix.patch && \
     cmake -S . -B build-static \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_SHARED_LIBS=OFF \

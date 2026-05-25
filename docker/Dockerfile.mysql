@@ -44,7 +44,7 @@ FROM oraclelinux:9 AS builder
 
 # Pin sources for reproducibility; bump when the engine is known-compatible.
 ARG MYSQL_TAG=mysql-9.7.0
-ARG TIDESDB_TAG=v9.2.5
+ARG TIDESDB_TAG=v9.3.0
 
 # Build dependencies. MySQL 9.7 requires GCC 14, which OL9 ships only as
 # the gcc-toolset-14 SCL; the default GCC is 11. Other -devel packages
@@ -75,29 +75,27 @@ WORKDIR /build
 RUN git clone --depth=1 --branch ${MYSQL_TAG} \
         https://github.com/mysql/mysql-server.git mysql-server
 
-# 2) Clone TidesDB, apply the bloom-filter UAF fix, then build the static
-#    archive (PIC so it can link into a .so).
+# 2) Clone TidesDB and build the static archive (PIC so it can link into a .so).
 #
-#    The four durability bugs we carried as 0001-walfix.patch against v9.2.0
-#    (inverted convert_sync_mode, raw sync_mode at WAL opens, unconditional
-#    WAL truncate before recovery, and the SSTable-cursor block_size caching
-#    that dropped rows on multi-SSTable recovery scans) are ALL fixed upstream
-#    in v9.2.5, so that patch is retired. Applying it here would be harmful
-#    (the enum was reordered, so the old convert_sync_mode rewrite would
-#    re-break FULL -> NONE).
-#
-#    docker/patches/0001-bloomfix.patch is the remaining fix (TidesDB PR #626):
-#    bloom_filter_new() free()d *bf on its post-malloc failure paths without
-#    setting *bf = NULL, leaving a dangling pointer that the one unchecked
-#    caller (tidesdb_partitioned_merge file_max split) turned into a
-#    use-after-free / GPF inside bloom_filter_add under heavy compaction.
-#    Remove the patch step once PR #626 lands upstream.
+#    We ship the engine source UNPATCHED as of v9.3.0 -- every fix we used to
+#    carry is now upstream:
+#      * 0001-walfix.patch (four durability bugs we carried against v9.2.0:
+#        inverted convert_sync_mode, raw sync_mode at WAL opens, unconditional
+#        WAL truncate before recovery, SSTable-cursor block_size caching that
+#        dropped rows on multi-SSTable recovery scans) -- all fixed in v9.2.5.
+#      * 0001-bloomfix.patch (TidesDB PR #626: bloom_filter_new() free()d *bf
+#        on its post-malloc failure paths without setting *bf = NULL, which the
+#        unchecked tidesdb_partitioned_merge file_max-split caller turned into a
+#        use-after-free in bloom_filter_add under heavy compaction) -- landed
+#        upstream verbatim in v9.3.0 (both the *bf=NULL guards and the
+#        return-checked caller with the WARN log).
+#    v9.3.0 also adds the active-memtable backpressure ceiling (bounds the
+#    active memtable to 2x write_buffer_size) and the TDB_ERR_BUSY (-14) code
+#    that the plugin's tdb_rc_to_ha now maps. Re-add a patches/ step here only
+#    if a future regression forces it.
 RUN git clone --depth=1 --branch ${TIDESDB_TAG} \
         https://github.com/tidesdb/tidesdb.git tidesdb
-COPY docker/patches/0001-bloomfix.patch /tmp/0001-bloomfix.patch
 RUN cd tidesdb && \
-    patch -p1 < /tmp/0001-bloomfix.patch && \
-    rm -f /tmp/0001-bloomfix.patch && \
     cmake -S . -B build-static \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_SHARED_LIBS=OFF \
