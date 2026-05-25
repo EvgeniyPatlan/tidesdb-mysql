@@ -186,6 +186,15 @@ static int tdb_rc_to_ha(int rc, const char *ctx)
         case TDB_ERR_LOCKED:
             return HA_ERR_LOCK_WAIT_TIMEOUT;
 
+        /* Backpressure timeout (TidesDB v9.3.0+): the engine gave up after an
+           ingest stall (L0 queue, active-memtable ceiling, or memory-pressure
+           critical) exhausted its no-progress budget. Transient and retriable;
+           map to lock-wait-timeout so only the statement rolls back. Before
+           v9.3.0 these sites returned TDB_ERR_IO (-> HA_ERR_CRASHED, a false
+           corruption signal) or TDB_ERR_MEMORY_LIMIT. */
+        case TDB_ERR_BUSY:
+            return HA_ERR_LOCK_WAIT_TIMEOUT;
+
         /* Memory pressure -- retriable, back off and let flush/compaction
            free memory. mapped to deadlock so MariaDB retries. */
         case TDB_ERR_MEMORY_LIMIT:
@@ -340,15 +349,17 @@ static ulong srv_max_open_sstables = 256;
 static ulonglong srv_max_memory_usage = 0; /* 0 = auto (library decides) */
 static my_bool srv_log_to_file = 1;        /* write TidesDB logs to file (default is yes) */
 static ulonglong srv_log_truncation_at = 24ULL * 1024 * 1024; /* log file truncation size (24MB) */
-/* Default OFF (per-CF memtables). The unified WAL+memtable path in
-   TidesDB v9.2.0 silently loses committed rows under many concurrent
-   committers (rotation race): a HammerDB TPROC-C build with 8 parallel
-   loaders dropped ~95% of bulk-loaded rows while every commit returned
-   TDB_SUCCESS and loaders reported success. The same workload with
-   per-CF memtables persists 100% of rows. Until the engine fixes the
-   rotation race, correctness wins over the unified path's O(1)-fsync /
-   atomic-cross-CF benefits. Opt back in explicitly with
-   tidesdb_unified_memtable=ON if your workload is low-concurrency. */
+/* Default OFF (per-CF memtables). The unified WAL+memtable path was
+   observed on TidesDB v9.2.0 to silently lose committed rows under many
+   concurrent committers (rotation race): a HammerDB TPROC-C build with 8
+   parallel loaders dropped ~95% of bulk-loaded rows while every commit
+   returned TDB_SUCCESS and loaders reported success. The same workload
+   with per-CF memtables persists 100% of rows. v9.3.0 fixed several
+   memtable-related UAFs/races (tidesdb_memtable_try_ref, the unified
+   active-memtable ceiling), but we have NOT re-verified the unified path
+   persists 100% of rows under that workload, so correctness keeps it OFF
+   pending a fresh high-concurrency persistence run. Opt back in explicitly
+   with tidesdb_unified_memtable=ON if your workload is low-concurrency. */
 static my_bool srv_unified_memtable = 0; /* 0 = per-CF (default, safe), 1 = unified WAL+memtable */
 static ulonglong srv_unified_memtable_write_buffer_size = 128ULL * 1024 * 1024; /* 128MB */
 
@@ -461,7 +472,7 @@ static MYSQL_THDVAR_ULONGLONG(default_klog_value_threshold, PLUGIN_VAR_RQCMDARG,
                               NULL, NULL, 512, 0, ULONGLONG_MAX, 1);
 
 static MYSQL_THDVAR_ULONGLONG(default_l0_queue_stall_threshold, PLUGIN_VAR_RQCMDARG,
-                              "Default L0 queue stall threshold for new tables", NULL, NULL, 20, 1,
+                              "Default L0 queue stall threshold for new tables", NULL, NULL, 10, 1,
                               1024, 1);
 
 static MYSQL_THDVAR_ULONGLONG(default_l1_file_count_trigger, PLUGIN_VAR_RQCMDARG,
@@ -654,9 +665,10 @@ static MYSQL_SYSVAR_BOOL(unified_memtable, srv_unified_memtable,
                          "Use a single unified WAL and memtable across all column families. "
                          "Reduces WAL fsync overhead from O(num_tables) to O(1) and provides "
                          "atomic cross-CF commits. Requires all CFs to use the same comparator. "
-                         "Default OFF: the v9.2.0 unified path can silently lose committed "
-                         "rows under heavy concurrent writers (rotation race). Enable only "
-                         "for low-concurrency multi-table OLTP (default: OFF)",
+                         "Default OFF: the unified path was seen to silently lose committed "
+                         "rows under heavy concurrent writers (rotation race, observed on v9.2.0; "
+                         "not re-verified on the current engine). Enable only for low-concurrency "
+                         "multi-table OLTP (default: OFF)",
                          NULL, NULL, 0);
 
 static MYSQL_SYSVAR_ULONGLONG(unified_memtable_write_buffer_size,
@@ -1897,7 +1909,8 @@ static int tidesdb_prepare(handlerton *, THD *thd, bool all)
     if (rc != TDB_SUCCESS)
     {
         /* Truly unexpected errors get logged; transient conflicts don't spam. */
-        if (rc != TDB_ERR_CONFLICT && rc != TDB_ERR_LOCKED && rc != TDB_ERR_MEMORY_LIMIT)
+        if (rc != TDB_ERR_CONFLICT && rc != TDB_ERR_LOCKED &&
+            rc != TDB_ERR_MEMORY_LIMIT && rc != TDB_ERR_BUSY)
             sql_print_error(
                 "[TIDESDB] hton_prepare: tidesdb_txn_commit returned %d "
                 "(dirty=%d gen=%lu)",
@@ -1992,7 +2005,8 @@ static int tidesdb_commit(handlerton *, THD *thd, bool all)
         int rc = tidesdb_txn_commit(trx->txn);
         if (rc != TDB_SUCCESS)
         {
-            if (rc != TDB_ERR_CONFLICT && rc != TDB_ERR_LOCKED && rc != TDB_ERR_MEMORY_LIMIT)
+            if (rc != TDB_ERR_CONFLICT && rc != TDB_ERR_LOCKED &&
+                rc != TDB_ERR_MEMORY_LIMIT && rc != TDB_ERR_BUSY)
                 sql_print_error(
                     "[TIDESDB] hton_commit: tidesdb_txn_commit returned %d "
                     "(dirty=%d gen=%lu)",
@@ -6506,7 +6520,7 @@ int ha_tidesdb::maybe_bulk_commit(tidesdb_trx_t *trx)
         if (crc == TDB_SUCCESS) break;
 
         const bool transient = (crc == TDB_ERR_CONFLICT || crc == TDB_ERR_LOCKED ||
-                                crc == TDB_ERR_MEMORY_LIMIT);
+                                crc == TDB_ERR_MEMORY_LIMIT || crc == TDB_ERR_BUSY);
         if (!transient || attempt == 3)
         {
             sql_print_warning(
