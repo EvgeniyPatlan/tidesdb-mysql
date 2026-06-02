@@ -5,7 +5,7 @@
 #  Unlike Dockerfile.mysql (which builds ONLY the plugin target and drops the
 #  .so into the stock mysql:9.7 image), this image builds the FULL mysqld +
 #  mysqltest harness from source so the project's mysql-test suite can run
-#  via mtr against the exact (unpatched, v9.3.0) TidesDB engine + v0.3.0 plugin.
+#  via mtr against the exact (unpatched, v9.3.2) TidesDB engine + v0.3.1 plugin.
 #
 #  The clone / build-tidesdb / configure layers are byte-identical to
 #  Dockerfile.mysql so they reuse the v0.3.0 build cache; only the final
@@ -21,7 +21,7 @@
 FROM oraclelinux:9 AS builder
 
 ARG MYSQL_TAG=mysql-9.7.0
-ARG TIDESDB_TAG=v9.3.0
+ARG TIDESDB_TAG=v9.3.2
 
 RUN dnf -y install --setopt=install_weak_deps=False \
         oracle-epel-release-el9 oraclelinux-developer-release-el9 && \

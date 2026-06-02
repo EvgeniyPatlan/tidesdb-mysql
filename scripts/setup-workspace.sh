@@ -21,7 +21,7 @@ cd "$REPO"
 
 # Pin versions for reproducibility. Bump when known-compatible.
 MYSQL_TAG="${MYSQL_TAG:-mysql-9.7.0}"
-TIDESDB_TAG="${TIDESDB_TAG:-v9.3.0}"
+TIDESDB_TAG="${TIDESDB_TAG:-v9.3.2}"
 WITH_TIDESQL_REFERENCE="${WITH_TIDESQL_REFERENCE:-0}"
 
 mkdir -p vendor

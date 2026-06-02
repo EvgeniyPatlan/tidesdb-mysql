@@ -80,12 +80,12 @@ docker run --rm --user "$(id -u):$(id -g)" \
     tidesdb-builder-rpm \
     bash -e -c '
 set -e
-echo "[builder] cloning + compiling against MySQL 9.7.0 + TidesDB v9.3.0"
+echo "[builder] cloning + compiling against MySQL 9.7.0 + TidesDB v9.3.2"
 mkdir -p /tmp/build
 cd /tmp/build
 git clone --depth=1 --branch mysql-9.7.0 \
     https://github.com/mysql/mysql-server.git mysql-server >/dev/null
-git clone --depth=1 --branch v9.3.0 \
+git clone --depth=1 --branch v9.3.2 \
     https://github.com/tidesdb/tidesdb.git tidesdb >/dev/null
 
 # TidesDB static archive (engine shipped unpatched as of v9.3.0: walfix landed

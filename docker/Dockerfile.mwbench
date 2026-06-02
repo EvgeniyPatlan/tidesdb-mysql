@@ -4,7 +4,7 @@
 #
 #  Unlike Dockerfile.mysql (which builds the MySQL plugin), this image builds
 #  the TidesDB C library directly + the upstream `mwbench` tool and runs it
-#  AGAINST THE EXACT SAME engine source we ship (v9.3.0, unpatched).
+#  AGAINST THE EXACT SAME engine source we ship (v9.3.2, unpatched).
 #  It exercises heavy sequential ingest + concurrent readers with byte-level
 #  verification of every value read back, so lost writes (misses) or corrupted
 #  bytes (mismatches) surface as CSV counters — the area where our four
@@ -13,9 +13,9 @@
 #  No MySQL involved: this is a fast pre-MySQL gate on the storage engine.
 #
 #  Build:
-#    docker build -f docker/Dockerfile.mwbench -t tidesdb/mwbench:9.3.0 .
+#    docker build -f docker/Dockerfile.mwbench -t tidesdb/mwbench:9.3.2 .
 #  Run (see bench/mwbench/run-mwbench.sh which wraps this):
-#    docker run --rm -v "$PWD/out":/out tidesdb/mwbench:9.3.0 \
+#    docker run --rm -v "$PWD/out":/out tidesdb/mwbench:9.3.2 \
 #      /build/mwbench/build/mwbench --quick --out-dir /out
 ###############################################################################
 FROM oraclelinux:9 AS builder
@@ -25,7 +25,7 @@ FROM oraclelinux:9 AS builder
 # ~127-package toolchain layer instead of reinstalling it. MYSQL_TAG is unused
 # here; it exists only to keep the layer cache key aligned.
 ARG MYSQL_TAG=mysql-9.7.0
-ARG TIDESDB_TAG=v9.3.0
+ARG TIDESDB_TAG=v9.3.2
 
 RUN dnf -y install --setopt=install_weak_deps=False \
         oracle-epel-release-el9 oraclelinux-developer-release-el9 && \

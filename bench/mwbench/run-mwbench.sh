@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Engine-level integrity gate for the bundled TidesDB (v9.3.0, unpatched).
+# Engine-level integrity gate for the bundled TidesDB (v9.3.2, unpatched).
 #
 # Drives the upstream `mwbench` tool (https://github.com/tidesdb/mwbench)
 # against the EXACT engine source we ship — built by docker/Dockerfile.mwbench.
@@ -23,7 +23,7 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 BENCH=$(cd "$HERE/.." && pwd)
 
-IMG=${IMG:-tidesdb/mwbench:9.3.0}
+IMG=${IMG:-tidesdb/mwbench:9.3.2}
 
 # --- profile (env-overridable) ---------------------------------------------
 # Small write-buffer on purpose: it forces many memtable flushes -> many
