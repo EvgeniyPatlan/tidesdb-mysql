@@ -2,11 +2,16 @@
 # =============================================================================
 #  release-upstream-bump.sh
 #
-#  One-shot release automation for bumping the bundled TidesDB engine to a
-#  new upstream release and shipping it as the next tidesdb-mysql version.
-#  Replays the exact workflow used for v0.2.5, v0.3.0, and v0.3.1:
+#  Prepare-and-tag stage of the tidesdb-mysql release flow. Stops after
+#  pushing the git tag; the Docker Hub push and GitHub release are a
+#  separate manual step (scripts/release-docker.sh) so that Docker Hub
+#  credentials stay on the workstation and the GitHub release advertising
+#  the docker pull is created only after the push lands.
 #
-#    1. Preflight (clean tree, docker access, on main, logged into docker hub).
+#  Designed to drive cleanly from the Release GitHub Action OR from the
+#  command line. Replays the exact workflow used for v0.2.5, v0.3.0, v0.3.1:
+#
+#    1. Preflight (clean tree, on main, in sync with origin, docker + gh).
 #    2. Resolve TIDESDB_VERSION (default: latest upstream release) +
 #       PLUGIN_VERSION (default: patch-bump the current tag).
 #    3. Sanity-check the public-API diff of tidesdb.h between the current
@@ -23,12 +28,12 @@
 #       results.
 #    8. Update CHANGELOG.md (insert a new section) and KNOWN-ISSUES.md
 #       (rewrite the "current" header). Upstream release notes are embedded
-#       for context; you can edit before the script commits if you want
-#       hand-polished prose.
+#       for context.
 #    9. Two themed commits (engine bump + docs), tag v<plugin>.
-#   10. Confirm.
-#   11. Push main, push tag, push Docker Hub images (perconalab/tidesdb-mysql
-#       + evgeniypatlan/test-images), create the GitHub release.
+#   10. Confirm, push main, push tag. Done.
+#
+#  Then run scripts/release-docker.sh on your workstation to tag + push the
+#  Docker Hub images and create the GitHub release.
 #
 #  Usage:
 #    ./scripts/release-upstream-bump.sh                      # latest upstream, auto-bump plugin patch
@@ -395,48 +400,6 @@ push_main_and_tag() {
     run "git push origin v$PLUGIN_VERSION"
 }
 
-push_docker_hub() {
-    log "tagging + pushing Docker Hub images"
-    run "sgd tag tidesdb/mysql:9.7 perconalab/tidesdb-mysql:$PLUGIN_VERSION"
-    run "sgd tag tidesdb/mysql:9.7 perconalab/tidesdb-mysql:latest"
-    run "sgd tag tidesdb/mysql:9.7 evgeniypatlan/test-images:mysql-9.7-tidesdb-v$PLUGIN_VERSION"
-    run "sgd push perconalab/tidesdb-mysql:$PLUGIN_VERSION"
-    run "sgd push perconalab/tidesdb-mysql:latest"
-    run "sgd push evgeniypatlan/test-images:mysql-9.7-tidesdb-v$PLUGIN_VERSION"
-}
-
-github_release() {
-    log "creating GitHub release v$PLUGIN_VERSION"
-    local notes="$LOG_DIR/release-notes.md"
-    local body
-    body=$(gh api "repos/tidesdb/tidesdb/releases/tags/$TIDESDB_VERSION" --jq .body 2>/dev/null)
-    cat > "$notes" <<EOF
-## v$PLUGIN_VERSION — TidesDB engine $TIDESDB_VERSION
-
-Patch-level upstream bump from $OLD_TIDESDB_VERSION to **$TIDESDB_VERSION**, shipped
-unpatched; no plugin code changes (verified header diff has no new public
-enums / error codes).
-
-### Upstream release notes ($TIDESDB_VERSION)
-
-$body
-
-### Validation
-
-All four gates green (see [docs/${TIDESDB_VERSION}-validation-report.md](https://github.com/EvgeniyPatlan/tidesdb-mysql/blob/main/docs/${TIDESDB_VERSION}-validation-report.md)):
-MTR · mwbench (deletes on, 0/0/0/0) · HammerDB SIGKILL recovery · HammerDB WARE=100 throughput$( [ "$SKIP_THROUGHPUT" = "1" ] && echo "  (throughput gate skipped on this run)" || echo "" ).
-
-### Docker
-
-\`\`\`
-docker pull perconalab/tidesdb-mysql:$PLUGIN_VERSION
-\`\`\`
-EOF
-    run "gh release create v$PLUGIN_VERSION \
-        --title 'v$PLUGIN_VERSION -- TidesDB engine $TIDESDB_VERSION' \
-        --notes-file '$notes' --verify-tag"
-}
-
 # ---- main ------------------------------------------------------------------
 preflight
 resolve_versions
@@ -453,19 +416,18 @@ update_known_issues
 commit_and_tag
 
 if [ "$NO_PUBLISH" = "1" ]; then
-    log "NO_PUBLISH set -- stopping after local commit + tag. Run the publish steps manually if you want to ship."
-    log "  done. artifacts in $LOG_DIR"
+    log "NO_PUBLISH set -- stopping after local commit + tag. Run 'git push' + scripts/release-docker.sh when ready."
+    log "  artifacts: $LOG_DIR"
     exit 0
 fi
 
-confirm "All gates green. Push main + tag v$PLUGIN_VERSION, push Docker Hub images, create GitHub release?" || {
+confirm "All gates green. Push main + tag v$PLUGIN_VERSION to origin?" || {
     log "publish aborted by user; commits + tag are still local"
     exit 0
 }
 
 push_main_and_tag
-push_docker_hub
-github_release
 
-log "v$PLUGIN_VERSION shipped."
+log "v$PLUGIN_VERSION prepared on main and tagged."
+log "  Docker Hub + GitHub release: run scripts/release-docker.sh on this machine to finish."
 log "  artifacts: $LOG_DIR"

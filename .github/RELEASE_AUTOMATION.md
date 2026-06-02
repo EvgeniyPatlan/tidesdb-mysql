@@ -1,14 +1,16 @@
 # Release automation — setup
 
-Two-workflow setup so that new upstream TidesDB releases get caught fast but
-publishing always happens behind a one-click manual trigger:
+Three-stage flow that automates everything the repo can do safely while
+keeping Docker Hub credentials on your workstation:
 
-| Workflow | Trigger | Runner | What it does |
-|----------|---------|--------|--------------|
-| **`check-upstream-tidesdb.yml`** | daily @ 04:00 UTC + manual | GitHub-hosted (free) | Diffs `Dockerfile.mysql` against `gh api repos/tidesdb/tidesdb/releases/latest`; opens an issue when there's something to bump (labelled `upstream-bump`; also `needs-plugin-update` if `tidesdb.h` adds new public enums / error codes). |
-| **`release.yml`** | manual `workflow_dispatch` only | self-hosted | Runs `scripts/release-upstream-bump.sh` end-to-end on your hardware. Builds the three images, runs the four validation gates, commits, tags, pushes Docker Hub, creates the GitHub release. |
+| Stage | Where | What it does |
+|-------|-------|--------------|
+| **1. Detect** — `.github/workflows/check-upstream-tidesdb.yml` | GitHub-hosted runner (free), daily @ 04:00 UTC + manual | Diffs `Dockerfile.mysql` against `gh api repos/tidesdb/tidesdb/releases/latest`; opens an issue when there's something to bump (`upstream-bump`; also `needs-plugin-update` if `tidesdb.h` adds new public enums / error codes). |
+| **2. Prepare + tag** — `.github/workflows/release.yml` | self-hosted runner, manual `workflow_dispatch` | Runs `scripts/release-upstream-bump.sh`: bumps refs, rebuilds images, runs the four validation gates, writes the validation report, commits + tags, pushes main, pushes the tag. **Stops there.** |
+| **3. Publish** — `scripts/release-docker.sh` | your workstation, manual | Tags and pushes the three Docker Hub destinations from the local `tidesdb/mysql:9.7` image and creates the GitHub release. Docker Hub credentials never leave the workstation. |
 
-The detection workflow is unattended; the release workflow is one click.
+Detection is unattended; the prepare+tag workflow is one click in Actions; the
+publish step is one command on your machine when you're ready to ship.
 
 ## One-time setup
 
@@ -36,18 +38,18 @@ multi-contributor setting, lock the runner down via
 **Settings → Actions → Require approval for first-time contributors** and
 restrict who can trigger `workflow_dispatch`.
 
-### 2. Docker Hub credentials
+### 2. Docker Hub login on your workstation (one-time)
 
-Repo → **Settings → Secrets and variables → Actions → New repository secret**,
-add two secrets the release workflow expects:
+```
+docker login
+```
 
-| Secret | Value |
-|--------|-------|
-| `DOCKERHUB_USERNAME` | the Docker Hub user that can push to `perconalab/tidesdb-mysql` + `evgeniypatlan/test-images` |
-| `DOCKERHUB_TOKEN`    | a Docker Hub **access token** (Settings → Security → New Access Token, scope: Read & Write) — *not* the account password |
+That's it — the credentials live on your machine, never in CI. The Release
+workflow does not touch Docker Hub.
 
-`GITHUB_TOKEN` is injected automatically by Actions — no manual setup needed
-for the tag push and `gh release create`.
+`GITHUB_TOKEN` for the workflow's git push + tag push is injected automatically
+by Actions; `gh release create` is done by `release-docker.sh` on your machine
+using your existing `gh auth`.
 
 ### 3. (Optional) Issue labels
 
@@ -83,17 +85,28 @@ Both workflows reference two labels for triage; create them once under
    - writes `docs/<engine>-validation-report.md`,
    - updates CHANGELOG.md and KNOWN-ISSUES.md,
    - commits two themed commits and tags `v<plugin>`,
-   - pushes main and the tag, pushes Docker Hub images
-     (`perconalab/tidesdb-mysql:<plugin>` + `:latest` and
-     `evgeniypatlan/test-images:mysql-9.7-tidesdb-v<plugin>`),
-   - creates the GitHub release.
-   The job log uploads all per-stage logs as a `release-logs-<run-id>` artifact
-   (retained 60 days), and you can review the validation report and Docker
-   digests there if anything looks off.
+   - **pushes main and the tag, then stops.**
+   All per-stage logs upload as a `release-logs-<run-id>` artifact (retained
+   60 days).
 
-   If any gate fails the script bails before publish — no commits are pushed,
-   no images go out, the run fails the workflow and the artifact carries the
-   failure logs for triage.
+   If any gate fails the script bails before any push — no commits go out, no
+   tag is pushed, the workflow fails and the artifact carries the failure logs
+   for triage.
+
+4. **On your workstation, run the publish step:**
+   ```
+   git pull
+   ./scripts/release-docker.sh
+   ```
+   The script verifies the local `tidesdb/mysql:9.7` image (still cached from
+   the workflow's build), tags + pushes
+   `perconalab/tidesdb-mysql:<plugin>` + `:latest` and
+   `evgeniypatlan/test-images:mysql-9.7-tidesdb-v<plugin>`, then creates the
+   GitHub release (whose notes reference the validation report and advertise
+   the `docker pull` — which is now actually pullable). Flags:
+   `--dry-run`, `--yes`, `--no-gh-release`, `--plugin=X.Y.Z`,
+   `--tidesdb=vX.Y.Z` (versions auto-resolve from `Dockerfile.mysql` + the
+   latest tag if you omit them).
 
 ## Running the detection workflow on demand
 

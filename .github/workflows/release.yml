@@ -1,17 +1,18 @@
-# Manual one-click release of a new tidesdb-mysql version, executing the
-# scripts/release-upstream-bump.sh workflow on a self-hosted runner.
+# Manual one-click "prepare and tag" workflow. Runs scripts/release-upstream-bump.sh
+# end-to-end on a self-hosted runner: bumps version refs, rebuilds images,
+# runs the four validation gates, writes the validation report and updates
+# CHANGELOG / KNOWN-ISSUES, makes the two themed commits, pushes main, and
+# pushes the tag. STOPS THERE. Any validation gate failing fails the job
+# before any of the push steps.
 #
-# Triggered by hand from Actions → Release (or via gh workflow run release).
-# Inputs let you pin the engine and plugin versions explicitly, or leave them
-# empty for "latest upstream + auto-patch-bump." The whole publish chain
-# (commits, tag, Docker Hub push, GitHub release) runs at the end of the job;
-# any validation gate failing inside the script will fail the job before any
-# of that happens.
+# Docker Hub publishing and the GitHub release are deliberately NOT in this
+# workflow — they're done manually on the workstation via
+# scripts/release-docker.sh so Docker Hub credentials never leave your box.
+# See .github/RELEASE_AUTOMATION.md for the full flow.
 #
 # Self-hosted runner is required because the validation gates (image builds +
 # WARE=100 HammerDB throughput) need ~12 CPU / 32 GiB / hundreds of GB disk —
-# more than a GitHub-hosted runner provides. See .github/RELEASE_AUTOMATION.md
-# for runner registration and the secrets this workflow expects.
+# more than a GitHub-hosted runner provides.
 
 name: Release
 on:
@@ -55,17 +56,6 @@ jobs:
           git config user.name  'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
-      - name: Docker Hub login
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN:    ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
-            echo "::error::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets are not set."
-            exit 1
-          fi
-          echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-
       - name: Sanity-check tools
         run: |
           for t in gh jq curl docker git; do
@@ -90,3 +80,8 @@ jobs:
           path: bench/results/release-*
           if-no-files-found: warn
           retention-days: 60
+
+      - name: Next step (manual publish)
+        if: success()
+        run: |
+          echo "::notice::Tag pushed. On the workstation run: ./scripts/release-docker.sh   to tag + push Docker Hub images and create the GitHub release."
