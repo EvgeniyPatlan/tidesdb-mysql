@@ -1,10 +1,19 @@
 # Transaction-lifecycle refactor — design spec
 
+> **⚠️ SUPERSEDED — 2026-06-02.** This refactor targeted six findings (CF-1, C-2,
+> H-1, H-3, H-8, MF-4). Verification against current code before kickoff showed
+> **all six are already closed** — CF-1 in commit 37441d6 (2026-05-18), C-2 by
+> the `EngineContext` atomic pointer, H-1/H-3 by the `g_trx_lifecycle_lock`
+> rwlock pattern, H-8 by the sysvar callbacks no longer touching per-connection
+> trx state, and MF-4 by the documented lock-order invariant. See
+> `docs/code-review-followup-report.md` Revision 2 header for the verified
+> status table. This document is retained as design context only.
+
 | | |
 |---|---|
 | **Author**  | brainstorm session, 2026-06-02 |
-| **Status**  | Design — awaiting implementation plan |
-| **Target release** | v0.4.0 |
+| **Status**  | SUPERSEDED — target findings verified closed |
+| **Target release** | v0.4.0 (refactor scrapped) |
 | **Hotfix in parallel** | v0.3.2 cherry-pick (CF-1 only, minimal rdlock wrap) |
 
 ## 1. Summary

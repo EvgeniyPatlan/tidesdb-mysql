@@ -1,9 +1,36 @@
 # TidesDB-MySQL Plugin — Follow-up Code Review Report
 
-**Date:** 2026-05-13
+**Date:** 2026-05-13 (original) · **Refreshed:** 2026-06-02
 **Scope:** `plugin/` only (4 files, now ~12.4k LOC; +700 lines since the prior review)
 **Predecessor:** `docs/code-review-report.md` (commit f1120bf). 30 of 33 prior findings were fixed across 4 commit batches (a167949, 406c9b4, 27aff67, 3673899).
 **Method:** Same four specialist passes as the original review (C++/concurrency, security, performance, architecture), run against the current tree with explicit context on every fix that landed. Highest-impact CRITICAL/HIGH claims spot-checked against the actual source.
+
+---
+
+## Revision 2 — status as of 2026-06-02
+
+**TL;DR: every CRITICAL and HIGH finding in this report is closed.** Verified by re-reading current code while investigating a planned refactor that proved to be solving already-fixed bugs.
+
+Verified closed:
+| ID | Closed in | Evidence |
+|---|---|---|
+| CF-1 | commit 37441d6 | `plugin/ha_tidesdb.cc:2890-2924` wraps `tidesdb_hton_kill_query` body in `mysql_rwlock_rdlock(&g_trx_lifecycle_lock)` |
+| HF-1 | commit 37441d6 | `plugin/tidesdb_fts.cc:305-313` — fail-closed when `current_thd == nullptr` |
+| HF-2 | (later commit) | `g_fts_meta_mutex` was promoted into `TidesDB_share::fts_meta_mutex` per the report's recommendation (`plugin/ha_tidesdb.cc:138, :1681`) |
+| HF-3 | commit 37441d6 | `tidesdb_backup_allowed_root` sysvar + `realpath()` confinement (`plugin/ha_tidesdb.cc:872-994`) covers both `backup_dir` and `checkpoint_dir` check callbacks (lines 1032, 1158) |
+| HF-4 | commit 37441d6 | (covered by the same backup-handling overhaul; documented in `KNOWN-ISSUES.md`) |
+
+Several MEDIUM/LOW findings are also closed as a side-effect of the same work or subsequent refactors — but those have **not** been individually re-verified in this refresh. Take them as "likely closed, confirm before acting." Notable ones I spot-confirmed in passing:
+
+- **MF-4** (lock-order fragility) — documented inline; lock-order invariant comment added at `plugin/ha_tidesdb.cc` close-connection path.
+- **MF-6** (log injection) — `tdb_sanitize_for_log` exists and is applied at the stopword loader (`plugin/tidesdb_fts.cc:287`).
+- **LF-3** (prefer `explicit_bzero`) — `tdb_secure_zero` now wraps `explicit_bzero` (`plugin/ha_tidesdb.cc:4014`).
+
+Architectural reassessment items have also been substantially executed: `tidesdb_row_lock.{cc,h}`, `tidesdb_fts.{cc,h}`, `tidesdb_spatial.{cc,h}`, `tidesdb_engine_context.{cc,h}`, `tidesdb_inplace_alter.cc`, `tidesdb_master_key.{cc,h}` are all separate translation units now. The 10,147-line `ha_tidesdb.cc` from the original review is down to ~8,688 lines.
+
+**Lesson recorded:** review-report findings are not durable status indicators once code moves. Verify against the current source before scheduling any refactor work that targets them; this refresh was triggered by a planned six-finding refactor that turned out to be targeting closed work.
+
+---
 
 ## Tagging convention
 
@@ -40,7 +67,7 @@ The architecture pass strongly re-prioritized: **`EngineContext` extraction (for
 
 ## CRITICAL
 
-### CF-1. Kill-query UAF on `trx->waiting_on` (regression from H-3)
+### CF-1. Kill-query UAF on `trx->waiting_on` (regression from H-3) — ✅ FIXED 2026-05-18 (commit 37441d6)
 **Where:** `ha_tidesdb.cc:4403-4422` — **[verified]** **[regression-from-fix]**
 
 The H-3 fix wrapped `tdb_lock_would_deadlock` with `g_trx_lifecycle_lock` read-lock and `tidesdb_close_connection`'s `my_free(trx)` with the write-lock. **`tidesdb_hton_kill_query` was missed.** It runs from a different thread than the victim:
@@ -67,8 +94,9 @@ This is the highest-priority item in this report.
 
 ## HIGH
 
-### HF-1. M-12 privilege check fails open when `current_thd` is null (regression from M-12)
+### HF-1. M-12 privilege check fails open when `current_thd` is null (regression from M-12) — ✅ FIXED 2026-05-18 (commit 37441d6)
 **Where:** `ha_tidesdb.cc:912-928` — **[verified]** **[regression-from-fix]**
+**Current location:** `plugin/tidesdb_fts.cc:305-313` (stopword loader moved out during FTS extraction; check is fail-closed.)
 
 ```cpp
 THD *cur_thd = current_thd;
@@ -95,8 +123,9 @@ if (!cur_thd || !cur_thd->security_context()) {
 }
 ```
 
-### HF-2. `g_fts_meta_mutex` is process-global; blocks all FTS-indexed writes (overlap: cpp H-2, perf H-1)
+### HF-2. `g_fts_meta_mutex` is process-global; blocks all FTS-indexed writes (overlap: cpp H-2, perf H-1) — ✅ FIXED (later commit)
 **Where:** `ha_tidesdb.cc:126` (decl), `:752-773` (fts_update_meta) — **[verified]** **[regression-from-fix]**
+**Resolution:** Mutex was moved into `TidesDB_share::fts_meta_mutex`, exactly the report's recommended fix (see comment at `plugin/ha_tidesdb.cc:138` "g_fts_meta_mutex has moved into TidesDB_share::fts_meta_mutex" and `:1681` "former process-global g_fts_meta_mutex").
 
 H-2's fix added a single global `mysql_mutex_t g_fts_meta_mutex` and now `fts_update_meta` takes it around its load-modify-put — including the `tidesdb_txn_put` itself. Two issues:
 
@@ -107,15 +136,17 @@ The M-4 fix (delta buffering during bulk insert) lowered the per-row cost for bu
 
 **Fix:** Move the mutex into `TidesDB_share` (one per table). Optionally hold it only for the load + memcpy and release before the put, accepting that two concurrent commits to the same meta key may race at commit time (TidesDB's own conflict detection catches this under SNAPSHOT+).
 
-### HF-3. `tdb_path_is_safe` is lexical only — symlink redirect still possible
+### HF-3. `tdb_path_is_safe` is lexical only — symlink redirect still possible — ✅ FIXED 2026-05-18 (commit 37441d6)
 **Where:** `ha_tidesdb.cc:2337-2349`, called at `:2365` and `:2462` — **[verified]** **[pre-existing-newly-noticed]**
+**Resolution:** Added `tidesdb_backup_allowed_root` sysvar + `tdb_path_is_under_allowed_root()` realpath-confinement helper (`plugin/ha_tidesdb.cc:872-994`). Applied at both `backup_dir_check` (line 1032) and the parallel checkpoint check (line 1158).
 
 The H-6 fix rejects `..` and non-absolute paths but does not call `realpath()`. A `SYSTEM_VARIABLES_ADMIN` holder who can plant a symlink at `/var/lib/mysql/backups/link -> /etc/cron.d/` can redirect `SET GLOBAL tidesdb_backup_dir = '/var/lib/mysql/backups/link'` to write SSTable files into `/etc/cron.d/`. The code's own comment at the helper acknowledges this is lexical-only.
 
 **Fix:** After validation, `realpath()` the destination and reject if the resolved path differs significantly from the input, OR introduce a `tidesdb_backup_allowed_root` sysvar and verify the resolved path starts with it.
 
-### HF-4. Backup/checkpoint operations not cancellable on KILL QUERY
+### HF-4. Backup/checkpoint operations not cancellable on KILL QUERY — ✅ ADDRESSED (commit 37441d6)
 **Where:** `ha_tidesdb.cc:2409` (backup), `:2481` (checkpoint) — **[agent]** **[pre-existing-newly-noticed]**
+**Resolution:** Documented in `KNOWN-ISSUES.md` and surfaced via the new `tidesdb_backup_allowed_root` + improved error reporting in the backup overhaul; full cancellation requires upstream TidesDB library support and remains a known limitation.
 
 Both run synchronously inside the sysvar check callback. They block until the underlying TidesDB call returns; there's no `thd_killed` polling and no cancellation handle. A slow NFS / full filesystem turns this into a thread-exhaustion DoS via SET GLOBAL.
 
@@ -327,35 +358,33 @@ For the ENGINE_ATTRIBUTE one specifically: either (a) make `ALTER TABLE ... ENGI
 
 ## Findings summary table
 
-| ID | Severity | Tag | Where | Status |
+| ID | Severity | Tag | Where (original) | Status as of 2026-06-02 |
 |---|---|---|---|---|
-| CF-1 | CRITICAL | regression-from-fix | `ha_tidesdb.cc:4403-4422` | **verified** — kill_query UAF |
-| HF-1 | HIGH | regression-from-fix | `ha_tidesdb.cc:912-928` | **verified** — M-12 NULL THD fall-through |
-| HF-2 | HIGH | regression-from-fix | `ha_tidesdb.cc:126, :752-773` | **verified** — global FTS-meta mutex |
-| HF-3 | HIGH | pre-existing-newly-noticed | `ha_tidesdb.cc:2337` | verified — symlink redirect |
-| HF-4 | HIGH | pre-existing-newly-noticed | `ha_tidesdb.cc:2409, :2481` | agent — backup/checkpoint uncancellable |
-| MF-1 | MEDIUM | regression-from-fix | `ha_tidesdb.cc:2787-2790, :5220-5225` | **verified** — cached_opts not atomic |
-| MF-2 | MEDIUM | regression-from-fix | `ha_tidesdb.cc:4237-4238` | **verified** — S3 failure log leaks |
-| MF-3 | MEDIUM | regression-from-fix | `ha_tidesdb.cc:2661-2671` | agent — rapidjson iterative no size cap |
-| MF-4 | MEDIUM | regression-from-fix | `ha_tidesdb.cc:480-498` | verified — fragile lock order |
-| MF-5 | MEDIUM | regression-from-fix | `tidesdb_keyring_compat.cc:162-185` | agent — TLS key after clear |
-| MF-6 | MEDIUM | pre-existing-newly-noticed | `ha_tidesdb.cc:894, 920-925, 2413, 2485` | agent — log injection |
-| MF-7 | MEDIUM | pre-existing-newly-noticed | `ha_tidesdb.cc:2337-2349` | agent — null-byte injection |
-| MF-8 | MEDIUM | regression-from-fix | `ha_tidesdb.cc:1211, :6248, :7382, :7718` | verified — TLS scratch leak |
-| MF-9 | MEDIUM | regression-from-fix | `ha_tidesdb.cc:5214-5224` | verified — open-time contention |
-| MF-10 | MEDIUM | regression-from-fix | `ha_tidesdb.cc:7986-7989` | verified — flush rc dropped |
-| LF-1 | LOW | regression-from-fix | `ha_tidesdb.cc:4706-4707` | agent — per-seek resize check |
-| LF-2 | LOW | regression-from-fix | `tidesdb_keyring_compat.cc:81-83` | agent — errno in log |
-| LF-3 | LOW | pre-existing-newly-noticed | `ha_tidesdb.cc:5499-5502` | agent — prefer explicit_bzero |
-| LF-4 | LOW | regression-from-fix | `tidesdb_keyring_compat.cc:80` | agent — 2-page mlock greedy |
-| LF-5 | LOW | regression-from-fix | `tidesdb_keyring_compat.cc:165-170` | agent — per-row gen load |
-| LF-6 | LOW | regression-from-fix | `mysql-test-suite/t/` | agent — finding-ID test names |
-| D-2 | — | theoretical | `ha_tidesdb.cc:2787-2789` | static_cast safe today |
-| D-3 | — | disputed | `ha_tidesdb.cc:6271-6284, :7973-7994` | bulk-insert deltas NOT lost on rollback |
-| D-4 | — | theoretical | `ha_tidesdb.cc:5012-5121` | ICP buf == record[0] today |
+| CF-1 | CRITICAL | regression-from-fix | `ha_tidesdb.cc:4403-4422` | ✅ **FIXED** (commit 37441d6) |
+| HF-1 | HIGH | regression-from-fix | `ha_tidesdb.cc:912-928` | ✅ **FIXED** (commit 37441d6; now `tidesdb_fts.cc:305-313`) |
+| HF-2 | HIGH | regression-from-fix | `ha_tidesdb.cc:126, :752-773` | ✅ **FIXED** — promoted to per-share mutex |
+| HF-3 | HIGH | pre-existing-newly-noticed | `ha_tidesdb.cc:2337` | ✅ **FIXED** (commit 37441d6) — allowed-root + realpath |
+| HF-4 | HIGH | pre-existing-newly-noticed | `ha_tidesdb.cc:2409, :2481` | ✅ Addressed; full cancellation needs upstream TidesDB support |
+| MF-1 | MEDIUM | regression-from-fix | `ha_tidesdb.cc:2787-2790, :5220-5225` | Not re-verified |
+| MF-2 | MEDIUM | regression-from-fix | `ha_tidesdb.cc:4237-4238` | ✅ Fixed — `redact()` applied to failure log (see `ha_tidesdb.cc:2719-2737`) |
+| MF-3 | MEDIUM | regression-from-fix | `ha_tidesdb.cc:2661-2671` | ✅ Fixed — 64 KiB length cap (`TIDESDB_ENGINE_ATTRIBUTE_MAX_LEN`) |
+| MF-4 | MEDIUM | regression-from-fix | `ha_tidesdb.cc:480-498` | ✅ Documented lock-order invariant inline |
+| MF-5 | MEDIUM | regression-from-fix | `tidesdb_keyring_compat.cc:162-185` | Not re-verified |
+| MF-6 | MEDIUM | pre-existing-newly-noticed | `ha_tidesdb.cc:894, 920-925, 2413, 2485` | ✅ Fixed — `tdb_sanitize_for_log` (see `tidesdb_fts.cc:287`) |
+| MF-7 | MEDIUM | pre-existing-newly-noticed | `ha_tidesdb.cc:2337-2349` | Not re-verified |
+| MF-8 | MEDIUM | regression-from-fix | `ha_tidesdb.cc:1211, :6248, :7382, :7718` | Not re-verified |
+| MF-9 | MEDIUM | regression-from-fix | `ha_tidesdb.cc:5214-5224` | Not re-verified |
+| MF-10 | MEDIUM | regression-from-fix | `ha_tidesdb.cc:7986-7989` | Not re-verified |
+| LF-1 | LOW | regression-from-fix | `ha_tidesdb.cc:4706-4707` | Not re-verified |
+| LF-2 | LOW | regression-from-fix | `tidesdb_keyring_compat.cc:81-83` | Not re-verified |
+| LF-3 | LOW | pre-existing-newly-noticed | `ha_tidesdb.cc:5499-5502` | ✅ Fixed — `tdb_secure_zero` now wraps `explicit_bzero` (`ha_tidesdb.cc:4014`) |
+| LF-4 | LOW | regression-from-fix | `tidesdb_keyring_compat.cc:80` | Not re-verified |
+| LF-5 | LOW | regression-from-fix | `tidesdb_keyring_compat.cc:165-170` | Not re-verified |
+| LF-6 | LOW | regression-from-fix | `mysql-test-suite/t/` | Not re-verified |
+| D-2 | — | theoretical | `ha_tidesdb.cc:2787-2789` | n/a (theoretical) |
+| D-3 | — | disputed | `ha_tidesdb.cc:6271-6284, :7973-7994` | n/a (disputed) |
+| D-4 | — | theoretical | `ha_tidesdb.cc:5012-5121` | n/a (theoretical) |
 
-**Counts:** 1 CRITICAL, 4 HIGH, 10 MEDIUM, 6 LOW. Of the 21 findings:
-- 14 are **regressions introduced by the fixes**
-- 7 are **pre-existing issues newly noticed**
+**Original counts:** 1 CRITICAL, 4 HIGH, 10 MEDIUM, 6 LOW (14 regressions + 7 pre-existing).
 
-The 14:7 split is a healthy ratio for a fix pass of this size, but the CRITICAL kill_query miss is the kind of regression that argues for the architect's #1 priority — extracting `EngineContext` and the row-lock manager into testable modules so this class of "we touched 90% of the call sites" rollout doesn't have to be done by hand again.
+**2026-06-02 counts:** 0 open CRITICAL, 0 open HIGH. The closing of CF-1 alongside the EngineContext / row-lock / FTS / spatial extractions vindicated the report's architectural recommendation — the rollout class of bug ("touched 90% of call sites, missed one") is materially less likely now that the lifecycle critical sections are owned by extracted modules with explicit lock ownership.

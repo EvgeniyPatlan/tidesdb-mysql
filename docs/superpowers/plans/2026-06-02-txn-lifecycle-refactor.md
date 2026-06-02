@@ -1,5 +1,12 @@
 # Transaction-Lifecycle Refactor Implementation Plan
 
+> **⚠️ SUPERSEDED — 2026-06-02.** Do not execute. All six target findings
+> (CF-1, C-2, H-1, H-3, H-8, MF-4) verified closed in current code before
+> execution began. The first dispatched implementer subagent flagged the
+> mismatch on Task 0 and the work was scrapped. See
+> `docs/code-review-followup-report.md` Revision 2 header for verified
+> status and the companion design spec for context.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Close six open CRITICAL/HIGH/MEDIUM transaction-lifecycle and deadlock-detector findings (CF-1, C-2, H-1, H-3, H-8, MF-4) by replacing `g_trx_lifecycle_lock` with an intrusive refcount on `tidesdb_trx_t`, a structured `KillState` flag, and a `tdb_global` shutdown drain barrier — shipping as v0.4.0.
