@@ -3,24 +3,46 @@
 This document tracks defects we've confirmed in the bundled TidesDB engine
 that affect `tidesdb-mysql` users.
 
-## Current: bundled on TidesDB v9.3.0 — shipped unpatched
+## Current: bundled on TidesDB v9.3.2 — shipped unpatched
 
-As of release **v0.3.0** the engine is pinned to **TidesDB v9.3.0** and we
-ship it **with zero patches**. Both fixes we used to carry are now upstream:
+As of release **v0.3.1** the engine is pinned to **TidesDB v9.3.2** and we
+continue to ship it **with zero patches**. Both fixes we used to carry are
+upstream:
 
 - `0001-walfix.patch` (four durability bugs) — fixed in **v9.2.5**, retired then.
 - `0001-bloomfix.patch` (the `bloom_filter_new` UAF, TidesDB **PR #626**) —
-  landed upstream **verbatim in v9.3.0**, retired now.
+  landed upstream **verbatim in v9.3.0**, retired with that bump.
 
-The `docker/patches/` directory is gone; no Dockerfile or script applies a
-patch. The per-bug write-ups below are kept as a record and as a regression
-checklist for future upgrades.
+The `docker/patches/` directory has no engine patches; no Dockerfile or script
+applies one. The per-bug write-ups below are kept as a record and as a
+regression checklist for future upgrades.
 
-Two behavioural items came in with v9.3.0 and are handled plugin-side
+What's new since v9.3.0 (v9.3.1 + v9.3.2, no plugin change needed):
+
+- **Concurrency / memory-safety hardening (v9.3.1).** Clock-cache reader-pin
+  wraparound at 128 readers (would corrupt zero-copy buffers), flush-cleanup
+  use-after-free over the sixteen-immutable threshold, transaction-reset
+  dangling pointer (repeatable-read / snapshot), duplicate column-family
+  registration race, 32-bit MSVC atomics.
+- **Reader FD starvation fix (v9.3.1).** Engine-side counterpart to the
+  fd-pressure behaviour the v0.3.0 100 GiB stress run documented: a flush-path
+  descriptor leak (a bare `close` skipping the counted-open decrement) is fixed,
+  and reader/reaper budgets are unified so the reserve always stays available.
+- **Backpressure simplification (v9.3.1).** L1 hard-stop removed; admission is
+  governed by L0 stall + the active-memtable ceiling.
+- **Parallel compaction within a round (v9.3.1).** Per-CF rounds borrow
+  ephemeral helper threads with work-stealing and shard merge output across
+  key-range subcompactions; ~25 % higher ingest throughput in upstream's tests.
+- **Large bloom filters / block indexes (v9.3.2).** Auxiliary klog blocks are
+  chunked when they exceed the 4 GB block-manager size; **backwards-compatible**.
+- **`_tidesdb_cancel_background_work_` (v9.3.2).** Quick-shutdown helper for
+  large flush/compaction queues.
+
+Carried over from v9.3.0 and still handled plugin-side
 (see [CHANGELOG.md](CHANGELOG.md)):
 
-- **`TDB_ERR_BUSY` (-14)** is now returned from backpressure-stall timeouts
-  that previously surfaced as `TDB_ERR_IO`. `tdb_rc_to_ha` maps it to
+- **`TDB_ERR_BUSY` (-14)** is returned from backpressure-stall timeouts that
+  previously surfaced as `TDB_ERR_IO`. `tdb_rc_to_ha` maps it to
   `HA_ERR_LOCK_WAIT_TIMEOUT` (retriable), so a transient stall no longer looks
   like `HA_ERR_CRASHED` (corruption).
 - The new **active-memtable backpressure ceiling** (2× `write_buffer_size`)

@@ -156,3 +156,17 @@ Plugin-side changes that come with the bump:
 Engine improvements inherited from v9.3.0 (no plugin change needed): a hard active-memtable backpressure ceiling at 2× `write_buffer_size` (directly addresses the unbounded memtable growth behind the WARE=100 OOM seen during v0.2.5 validation), four additional use-after-free/race fixes (`tidesdb_memtable_try_ref`, level reclamation, `tidesdb_checkpoint`, deferred-free reaper), compaction-trigger correctness fixes, and `max_concurrent_flushes` now pinned 1:1 to `num_flush_threads` (we never set it, so no warning). See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
 Gated on the full validation suite: MTR, the HammerDB SIGKILL recovery gate, the mwbench engine-integrity gate (0 mismatches / 0 misses), and a full HammerDB WARE=100 throughput run. See [docs/v9.3.0-validation-report.md](docs/v9.3.0-validation-report.md).
+
+### Bundled engine bumped to TidesDB v9.3.2 (release v0.3.1)
+
+The vendored engine moved from v9.3.0 to **v9.3.2** across the Docker images (`mysql`, `mtr`, `mwbench`), the RPM packaging, and `setup-workspace.sh`. The engine continues to ship **with zero patches**. No plugin code changes — the upstream releases are patch-level and do not introduce new error codes or other public-API surface for `tdb_rc_to_ha` to map.
+
+Upstream highlights inherited from v9.3.1 + v9.3.2:
+
+- **v9.3.1 — concurrency and durability hardening.** Five distinct memory-safety / race fixes: the clock-cache reader-pin wraparound at 128 concurrent readers (would corrupt zero-copy buffers under load), a flush-cleanup use-after-free when more than sixteen immutable memtables accumulated in a single pass, a dangling pointer left by transaction reset on repeatable-read / snapshot, a duplicate column-family registration race, and 32-bit MSVC atomic fallbacks.
+- **Reader FD starvation fixed.** v9.3.1 fixes a descriptor-accounting leak in the flush path (a bare `close` that never decremented the counted-open counter), and the reader / reaper budgets are now a single shared value so the reserve always stays available. This is the engine-side counterpart to the fd-pressure behaviour we documented in the v9.3.0 100 GiB stress run.
+- **L1 hard-stop removed.** Write admission is now governed by the L0 queue stall and the active-memtable ceiling; L1 contributes only graduated delays. Removes a backpressure stall that normally settled on its own.
+- **Parallel compaction within a round.** Per-CF compaction borrows ephemeral helper threads (work-stealing, including the calling thread) and shards merge output across key-range subcompactions. Validated under sanitizers; ~25 % higher ingest throughput in upstream's tests, clean recovery from mid-round kill.
+- **v9.3.2 — small additions.** A `_tidesdb_cancel_background_work_` helper for quick shutdown under large flush/compaction queues, support for bloom filters and block indexes that exceed the 4 GB block-manager size (auxiliary klog blocks are now chunked; **backwards-compatible**), and flaky-test hardening.
+
+Gated on a re-run of the v0.3.0 validation suite — MTR, the mwbench integrity gate, the HammerDB SIGKILL recovery gate, and HammerDB WARE=100 throughput. See [docs/v9.3.2-validation-report.md](docs/v9.3.2-validation-report.md).
