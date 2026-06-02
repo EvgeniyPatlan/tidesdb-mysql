@@ -1,0 +1,92 @@
+# Manual one-click release of a new tidesdb-mysql version, executing the
+# scripts/release-upstream-bump.sh workflow on a self-hosted runner.
+#
+# Triggered by hand from Actions → Release (or via gh workflow run release).
+# Inputs let you pin the engine and plugin versions explicitly, or leave them
+# empty for "latest upstream + auto-patch-bump." The whole publish chain
+# (commits, tag, Docker Hub push, GitHub release) runs at the end of the job;
+# any validation gate failing inside the script will fail the job before any
+# of that happens.
+#
+# Self-hosted runner is required because the validation gates (image builds +
+# WARE=100 HammerDB throughput) need ~12 CPU / 32 GiB / hundreds of GB disk —
+# more than a GitHub-hosted runner provides. See .github/RELEASE_AUTOMATION.md
+# for runner registration and the secrets this workflow expects.
+
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      tidesdb_version:
+        description: 'Engine tag (e.g. v9.4.0). Empty = latest upstream.'
+        required: false
+        type: string
+      plugin_version:
+        description: 'Plugin version (e.g. 0.3.2). Empty = auto-patch-bump.'
+        required: false
+        type: string
+      skip_throughput:
+        description: 'Skip the WARE=100 throughput gate (~30–40 min). Don''t skip for a real release.'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Label your self-hosted runner with at least these labels (see docs).
+    runs-on: [self-hosted, linux, x64, tidesdb-release]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # full history for tag operations
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Docker Hub login
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN:    ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::error::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets are not set."
+            exit 1
+          fi
+          echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+      - name: Sanity-check tools
+        run: |
+          for t in gh jq curl docker git; do
+            command -v "$t" >/dev/null 2>&1 || { echo "::error::$t not on PATH on the runner"; exit 1; }
+          done
+          docker info >/dev/null
+
+      - name: Run release-upstream-bump.sh
+        env:
+          GH_TOKEN:          ${{ secrets.GITHUB_TOKEN }}
+          TIDESDB_VERSION:   ${{ github.event.inputs.tidesdb_version }}
+          PLUGIN_VERSION:    ${{ github.event.inputs.plugin_version }}
+          SKIP_THROUGHPUT:   ${{ github.event.inputs.skip_throughput == 'true' && '1' || '0' }}
+          YES:               '1'
+        run: ./scripts/release-upstream-bump.sh
+
+      - name: Upload release artifacts (logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-logs-${{ github.run_id }}
+          path: bench/results/release-*
+          if-no-files-found: warn
+          retention-days: 60

@@ -1,0 +1,148 @@
+# Daily detection of new upstream TidesDB releases.
+#
+# Runs every day at 04:00 UTC (and on demand). Compares the latest upstream
+# release tag against the engine version currently pinned in
+# docker/Dockerfile.mysql; opens (or updates) a GitHub Issue if there's a new
+# release to bump, with a header-diff sanity check noted in the body so you
+# know whether scripts/release-upstream-bump.sh will run clean or whether the
+# plugin needs manual work first.
+#
+# This workflow is cheap (GitHub-hosted runner, no docker, no builds) and is
+# the only piece of release automation that runs unattended. The actual
+# release happens via .github/workflows/release.yml on a self-hosted runner,
+# behind a manual workflow_dispatch.
+
+name: Check upstream TidesDB
+on:
+  schedule:
+    - cron: '0 4 * * *'   # daily at 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: check-upstream-tidesdb
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve current + upstream versions
+        id: vers
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          UPSTREAM=$(gh api repos/tidesdb/tidesdb/releases/latest --jq .tag_name)
+          CURRENT=$(grep -oE '^ARG TIDESDB_TAG=v[0-9]+\.[0-9]+\.[0-9]+' docker/Dockerfile.mysql | head -1 | sed 's/.*=//')
+          echo "upstream=$UPSTREAM" >> "$GITHUB_OUTPUT"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "  current:  $CURRENT"
+          echo "  upstream: $UPSTREAM"
+
+      - name: Up to date — exit
+        if: steps.vers.outputs.upstream == steps.vers.outputs.current
+        run: echo "On ${{ steps.vers.outputs.current }} — nothing to do."
+
+      - name: Header-diff sanity check (new error codes / enums?)
+        id: diff
+        if: steps.vers.outputs.upstream != steps.vers.outputs.current
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          OLD='${{ steps.vers.outputs.current }}'
+          NEW='${{ steps.vers.outputs.upstream }}'
+          PATCH=$(gh api "repos/tidesdb/tidesdb/compare/$OLD...$NEW" \
+              --jq '.files[] | select(.filename=="src/tidesdb.h") | .patch' 2>/dev/null || true)
+          RISKY=$(printf '%s\n' "$PATCH" | grep -E '^\+#define[[:space:]]+TDB_ERR_|^\+[[:space:]]*TDB_[A-Z0-9_]+[[:space:]]*=' || true)
+          if [ -n "$RISKY" ]; then
+            {
+              echo 'risky<<EOF'
+              echo "$RISKY"
+              echo EOF
+            } >> "$GITHUB_OUTPUT"
+            echo "is_risky=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_risky=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open issue (safe to bump)
+        if: steps.vers.outputs.upstream != steps.vers.outputs.current && steps.diff.outputs.is_risky == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          UPSTREAM='${{ steps.vers.outputs.upstream }}'
+          CURRENT='${{ steps.vers.outputs.current }}'
+          # skip if an open issue for this exact upstream version already exists
+          existing=$(gh issue list --label upstream-bump --search "$UPSTREAM in:title state:open" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "issue already open: #$existing"
+            exit 0
+          fi
+          BODY=$(cat <<EOF
+          New upstream TidesDB release detected and the public-API surface is unchanged.
+
+          - **current bundled:** $CURRENT
+          - **upstream latest:** $UPSTREAM
+          - **header-diff check:** PASS (no new \`TDB_ERR_*\` or enum values in \`tidesdb.h\`)
+
+          Upstream release notes: https://github.com/tidesdb/tidesdb/releases/tag/$UPSTREAM
+
+          ## How to ship
+
+          Go to **Actions → Release**, click **Run workflow**, and fill in:
+
+          - \`tidesdb_version\`: \`$UPSTREAM\` (or leave empty for auto-latest)
+          - \`plugin_version\`: leave empty for auto-patch-bump, or specify
+          - \`skip_throughput\`: leave unchecked for the full validation
+
+          The release workflow runs on the self-hosted runner; it will: bump every version ref, rebuild the three images, run all four validation gates, write the validation report, commit and tag, push Docker Hub images, and create the GitHub release. If any gate fails it bails before publish.
+          EOF
+          )
+          gh issue create \
+              --title "Upstream TidesDB $UPSTREAM available — ready to bump" \
+              --label upstream-bump \
+              --body "$BODY"
+
+      - name: Open issue (unsafe — plugin update needed first)
+        if: steps.diff.outputs.is_risky == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          UPSTREAM='${{ steps.vers.outputs.upstream }}'
+          CURRENT='${{ steps.vers.outputs.current }}'
+          existing=$(gh issue list --label needs-plugin-update --search "$UPSTREAM in:title state:open" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "issue already open: #$existing"
+            exit 0
+          fi
+          BODY=$(cat <<EOF
+          New upstream TidesDB release detected, **but it adds new public enums or error codes** to \`tidesdb.h\`. The release script will refuse to run until the plugin is updated by hand.
+
+          - **current bundled:** $CURRENT
+          - **upstream latest:** $UPSTREAM
+          - Upstream release notes: https://github.com/tidesdb/tidesdb/releases/tag/$UPSTREAM
+
+          ## Risky additions in tidesdb.h
+
+          \`\`\`
+          ${{ steps.diff.outputs.risky }}
+          \`\`\`
+
+          ## What to do
+
+          Update \`plugin/ha_tidesdb.cc\` — specifically \`tdb_rc_to_ha\` (the error-code → MySQL handler-error mapping) plus the transient-error lists in the prepare/commit/bulk-commit retry paths — and merge that PR. Then run **Actions → Release** as usual.
+          EOF
+          )
+          gh issue create \
+              --title "Upstream TidesDB $UPSTREAM requires plugin update before release" \
+              --label upstream-bump --label needs-plugin-update \
+              --body "$BODY"
