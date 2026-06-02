@@ -5,18 +5,17 @@
   docs/superpowers/specs/2026-06-02-atomic-ddl-participation-design.md
   for the design rationale.
 */
-#ifndef TIDESDB_ATOMIC_DDL_H
-#define TIDESDB_ATOMIC_DDL_H
+#pragma once
 
-#include <atomic>
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <vector>
 
 #include "sql/handler.h" /* sdi_key_t, sdi_vector_t (top-level structs) */
 
+extern "C" {
 #include <tidesdb/db.h> /* tidesdb_t, tidesdb_column_family_t */
+}
 
 class THD;
 struct handlerton;
@@ -112,5 +111,3 @@ extern OrphanAction g_orphan_action;
 extern bool g_atomic_ddl_strict;
 
 }  // namespace tidesdb_mysql
-
-#endif /* TIDESDB_ATOMIC_DDL_H */
