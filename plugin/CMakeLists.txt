@@ -228,3 +228,12 @@ IF(TIDESDB_SANITIZER_COMPILE_FLAGS)
     MESSAGE(STATUS "TidesDB: Sanitizer link flags: ${TIDESDB_SANITIZER_LINK_FLAGS}")
   ENDIF()
 ENDIF()
+
+############# Atomic-DDL unit tests (pure helpers, no MySQL harness) #############
+# Tests live in plugin/tests/ and use find_package(GTest). They are skipped
+# silently when gtest is not installed, so this is safe on minimal build images.
+IF(NOT DISABLE_TIDESDB_TESTS)
+  IF(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt)
+    ADD_SUBDIRECTORY(tests)
+  ENDIF()
+ENDIF()
