@@ -20,12 +20,14 @@
 
 #include "tidesdb_atomic_ddl.h"
 
+#include <atomic>
 #include <cstring>
 #include <ctime>
 
-#include "sql/handler.h"
-#include "sql/log.h" /* sql_print_error */
-#include "sql/plugin_table.h"
+#include "mysql_version.h"    /* MYSQL_VERSION_ID */
+#include "sql/handler.h"      /* handlerton, sdi_*_t, dict_init_mode_t */
+#include "sql/log.h"          /* sql_print_error / sql_print_information */
+#include "sql/plugin_table.h" /* Plugin_table, Plugin_tablespace */
 
 namespace tidesdb_mysql {
 
@@ -298,7 +300,90 @@ bool TidesdbAtomicDdlBridge::prepare_drop(THD *, const dd::Table *) { return tru
 
 /* -------------------- DdseStubs -------------------- */
 
-void DdseStubs::register_into(handlerton *) {}
+/*
+  Eight no-op DDSE callbacks. None of these will ever fire in production --
+  TidesDB is not the active Data-Dictionary Storage Engine (InnoDB is). The
+  slot exists so that a future "TidesDB hosts the data dictionary" project
+  finds the contract surface already wired and only has to fill in real
+  bodies. Returning false from every callback means "success".
+
+  Each named stub logs its first invocation via log_ddse_stub_once. The
+  bitmask is a single atomic uint32_t (8 bits used, 24 reserved). On a
+  controlled debug-build force-invoke (see DBUG_EXECUTE_IF in
+  tidesdb_show_status), all 8 INFO lines appear exactly once per server
+  lifetime; subsequent invocations log nothing. This matches the
+  tidesdb_ddl_ddse_stubs_inert MTR test's expectations.
+*/
+namespace {
+
+std::atomic<uint32_t> g_ddse_logged_bitmask{0};
+
+void log_ddse_stub_once(const char *name, int bit) {
+    const uint32_t mask = 1u << bit;
+    uint32_t prev = g_ddse_logged_bitmask.fetch_or(mask, std::memory_order_relaxed);
+    if (!(prev & mask)) {
+        sql_print_information(
+            "[TIDESDB] DDSE stub %s called; TidesDB is not the active DDSE "
+            "(forward-capability slot)",
+            name);
+    }
+}
+
+bool tidesdb_ddse_dict_init(dict_init_mode_t, uint, List<const dd::Object_table> *,
+                            List<const Plugin_tablespace> *) {
+    log_ddse_stub_once("ddse_dict_init", 0);
+    return false; /* false = success */
+}
+
+bool tidesdb_dict_init(dict_init_mode_t, uint, List<const Plugin_table> *,
+                       List<const Plugin_tablespace> *) {
+    log_ddse_stub_once("dict_init", 1);
+    return false;
+}
+
+bool tidesdb_dict_recover(dict_recovery_mode_t, uint) {
+    log_ddse_stub_once("dict_recover", 2);
+    return false;
+}
+
+void tidesdb_dict_cache_reset(const char *, const char *) {
+    log_ddse_stub_once("dict_cache_reset", 3);
+}
+
+void tidesdb_dict_cache_reset_tables_and_tablespaces() {
+    log_ddse_stub_once("dict_cache_reset_tables_and_tablespaces", 4);
+}
+
+bool tidesdb_dict_get_server_version(uint *version) {
+    log_ddse_stub_once("dict_get_server_version", 5);
+    if (version) *version = MYSQL_VERSION_ID;
+    return false;
+}
+
+bool tidesdb_dict_set_server_version() {
+    log_ddse_stub_once("dict_set_server_version", 6);
+    return false;
+}
+
+bool tidesdb_is_dict_readonly() {
+    log_ddse_stub_once("is_dict_readonly", 7);
+    return false;
+}
+
+}  // anonymous namespace
+
+void DdseStubs::register_into(handlerton *hton) {
+    if (!hton) return;
+    hton->ddse_dict_init = tidesdb_ddse_dict_init;
+    hton->dict_init = tidesdb_dict_init;
+    hton->dict_recover = tidesdb_dict_recover;
+    hton->dict_cache_reset = tidesdb_dict_cache_reset;
+    hton->dict_cache_reset_tables_and_tablespaces =
+        tidesdb_dict_cache_reset_tables_and_tablespaces;
+    hton->dict_get_server_version = tidesdb_dict_get_server_version;
+    hton->dict_set_server_version = tidesdb_dict_set_server_version;
+    hton->is_dict_readonly = tidesdb_is_dict_readonly;
+}
 
 /* -------------------- SdiCallbacks -------------------- */
 

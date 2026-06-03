@@ -23,6 +23,7 @@ class Plugin_tablespace;
 namespace dd {
 class Table;
 class Tablespace;
+class Object_table;
 namespace cache {
 class Dictionary_client;
 }

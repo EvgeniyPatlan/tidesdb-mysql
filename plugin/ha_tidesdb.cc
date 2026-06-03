@@ -2152,6 +2152,28 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
     if (stat != HA_ENGINE_STATUS) return false;
     if (!tdb_get_engine()) return false;
 
+    /* Atomic-DDL (A-5): debug-only force-invoke for the 8 inert DDSE stubs.
+       Production code-path: production never invokes these because TidesDB
+       is not the active DDSE. The MTR test tidesdb_ddl_ddse_stubs_inert sets
+       the DBUG keyword 'tidesdb_force_ddse_stubs' immediately before calling
+       SHOW ENGINE TIDESDB STATUS so each stub fires exactly once, allowing
+       the test to count the resulting INFO log lines and verify the wiring.
+       SHOW ENGINE STATUS was picked over tidesdb_init_func because it runs
+       at SQL-statement time, after the user has had a chance to set the
+       DBUG keyword. Compiled out under NDEBUG (Release builds). */
+    DBUG_EXECUTE_IF("tidesdb_force_ddse_stubs", {
+        uint v = 0;
+        if (hton->ddse_dict_init) hton->ddse_dict_init(DICT_INIT_CREATE_FILES, 0, nullptr, nullptr);
+        if (hton->dict_init) hton->dict_init(DICT_INIT_CREATE_FILES, 0, nullptr, nullptr);
+        if (hton->dict_recover) hton->dict_recover(DICT_RECOVERY_INITIALIZE_TABLESPACES, 0);
+        if (hton->dict_cache_reset) hton->dict_cache_reset("test", "test");
+        if (hton->dict_cache_reset_tables_and_tablespaces)
+            hton->dict_cache_reset_tables_and_tablespaces();
+        if (hton->dict_get_server_version) hton->dict_get_server_version(&v);
+        if (hton->dict_set_server_version) hton->dict_set_server_version();
+        if (hton->is_dict_readonly) hton->is_dict_readonly();
+    });
+
     /* We refresh SHOW GLOBAL STATUS variables alongside the human-readable output */
     tidesdb_refresh_status_vars();
 
@@ -2639,6 +2661,13 @@ static int tidesdb_init_func(void *p)
      * during plugin unload which serves the same purpose. */
     /* tidesdb_hton->kill_query = tidesdb_hton_kill_query;  -- MariaDB-only.
      * MySQL signals query abort via THD::killed which the engine should poll. */
+
+    /* Atomic-DDL (A-5): wire 8 inert DDSE stub callbacks on the handlerton.
+       None of these will ever fire in production -- TidesDB is not the active
+       DDSE (InnoDB is). The slot exists so that a future "TidesDB hosts the
+       data dictionary" project finds the contract surface pre-wired. See
+       docs/superpowers/specs/2026-06-02-atomic-ddl-participation-design.md. */
+    tidesdb_mysql::DdseStubs::register_into(tidesdb_hton);
 
     /* Initialize the engine context (last_conflict_mutex). schema_cf,
        engine, path are populated later by the open / config code. */
