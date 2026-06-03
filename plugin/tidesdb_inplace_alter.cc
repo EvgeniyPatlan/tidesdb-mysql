@@ -160,7 +160,7 @@ enum_alter_inplace_result ha_tidesdb::check_if_supported_inplace_alter(
 bool ha_tidesdb::prepare_inplace_alter_table(
     TABLE *altered_table,
     Alter_inplace_info *ha_alter_info,
-    const dd::Table *old_table_def [[maybe_unused]],
+    const dd::Table *old_table_def,
     dd::Table *new_table_def)
 {
     DBUG_ENTER("ha_tidesdb::prepare_inplace_alter_table");
@@ -254,7 +254,7 @@ bool ha_tidesdb::prepare_inplace_alter_table(
     if (new_table_def)
     {
         if (!tidesdb_mysql::TidesdbAtomicDdlBridge::recompute_se_private_data(
-                *new_table_def, ctx->new_se_private_serialized))
+                old_table_def, *new_table_def, ctx->new_se_private_serialized))
         {
             sql_print_error(
                 "[TIDESDB] inplace ALTER prepare: failed to compute "

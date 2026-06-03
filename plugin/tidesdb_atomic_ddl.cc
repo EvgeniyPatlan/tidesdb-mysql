@@ -60,15 +60,15 @@
 namespace tidesdb_mysql {
 
 OrphanAction g_orphan_action = OrphanAction::Quarantine;
-/* DEFAULT IS FALSE UNTIL TASK 13.
- * Reason: without HTON_SUPPORTS_ATOMIC_DDL set, ha_tidesdb::create runs AFTER
- * the DD transaction has already committed, so prepare_create's mutations to
- * dd::Table::se_private_data are lost. validate_open then sees empty
- * se_private_data and rejects every TIDESDB table on open. Task 13 flips the
- * HTON flag (engine create runs inside the open DD txn so mutations persist)
- * AND must flip this default to true to honor the spec's "strict=ON default".
+/* Active default since Task 13: HTON_SUPPORTS_ATOMIC_DDL is now set, so
+ * ha_tidesdb::create / ha_tidesdb::delete_table execute inside the DD
+ * transaction. prepare_create writes the cf_name binding into
+ * dd::Table::se_private_data and prepare_drop's drop marker survives a
+ * server-side rollback. validate_open therefore enforces the binding by
+ * default; an operator can SET GLOBAL tidesdb_atomic_ddl_strict=OFF during
+ * a one-time upgrade window if a pre-v0.4.0 datadir is still in use.
  */
-bool g_atomic_ddl_strict = false;
+bool g_atomic_ddl_strict = true;
 
 /*
   TIDESDB_TTL_NONE is defined as (time_t)-1 in ha_tidesdb.h; we duplicate the
@@ -748,12 +748,12 @@ bool TidesdbAtomicDdlBridge::validate_open(THD *thd, const dd::Table *table_def,
                                             const char *path_inferred_cf) {
     if (!table_def || !path_inferred_cf) return true;
 
-    /* Short-circuit when strict mode is off. Until Task 13 flips
-       HTON_SUPPORTS_ATOMIC_DDL, prepare_create's writes don't persist
-       (DD txn has already committed), so EVERY existing TIDESDB table opens
-       with empty se_private_data. Pushing a WARNING in that case pollutes
-       every test's .result. With strict=false (Task 13 default for now)
-       we just trust the path-inferred CF name and return. */
+    /* Short-circuit when strict mode is off. The default is ON since
+       Task 13 -- operators only flip this OFF during a one-time upgrade
+       window for pre-v0.4.0 datadirs whose tables never had se_private_data
+       written. In that legacy path we trust the path-inferred CF name; no
+       WARNING is pushed because the legacy state is operator-acknowledged
+       by the sysvar flip. */
     if (!g_atomic_ddl_strict) return true;
 
     const dd::Properties &p = table_def->se_private_data();
@@ -900,20 +900,34 @@ bool TidesdbAtomicDdlBridge::debug_dump_last_se_private_data() {
   construction fails (defensive -- the default ctor never throws in
   practice, but we keep the contract symmetric with prepare_create).
 */
-bool TidesdbAtomicDdlBridge::recompute_se_private_data(const dd::Table &new_def,
+bool TidesdbAtomicDdlBridge::recompute_se_private_data(const dd::Table *old_def,
+                                                       const dd::Table &new_def,
                                                        std::string &out_serialized) {
     dd::Properties_impl tmp;
 
-    /* cf_name: preserve. If for some reason it isn't set (e.g. legacy
-       row that predates prepare_create -- shouldn't happen in practice
-       because validate_open under strict=ON rejects such tables -- we
-       still emit an empty value rather than crashing.) */
-    dd::String_type old_cf;
-    if (new_def.se_private_data().exists("cf_name")) {
-        if (new_def.se_private_data().get("cf_name", &old_cf)) {
-            old_cf.clear();
+    /* Helper: read a key from new_def first, then old_def as a fall-back.
+       MySQL's prepare_inplace_alter_table hands us a schema-overlap clone
+       of new_table_def whose se_private_data is sometimes empty (the
+       allocator wires it up but the SE bookkeeping written by
+       prepare_create lives on the ORIGINAL row, which is what old_def
+       points at). Read from new_def first so a Task 11-class server-side
+       carry-over still wins; fall back to old_def for anything missing. */
+    auto read_key = [&](const char *k, dd::String_type &out) -> bool {
+        if (new_def.se_private_data().exists(k)) {
+            if (!new_def.se_private_data().get(k, &out)) return true;
         }
-    }
+        if (old_def && old_def->se_private_data().exists(k)) {
+            if (!old_def->se_private_data().get(k, &out)) return true;
+        }
+        return false;
+    };
+
+    /* cf_name: preserve. The CF is not renamed by an inplace ALTER, so
+       we read whatever the open row had. If both new_def and old_def
+       are empty we emit "" -- validate_open will reject the row, which
+       is the right outcome since we lost the binding. */
+    dd::String_type old_cf;
+    (void)read_key("cf_name", old_cf);
     tmp.set("cf_name", old_cf);
 
     /* Recompute schema fingerprint + options checksum from the new
@@ -930,11 +944,7 @@ bool TidesdbAtomicDdlBridge::recompute_se_private_data(const dd::Table &new_def,
     /* Preserve created_at, default to "now" if missing. Pre-Task-9
        prepare_create rows had created_at; legacy rows do not. */
     dd::String_type created;
-    if (new_def.se_private_data().exists("created_at")) {
-        if (new_def.se_private_data().get("created_at", &created)) {
-            created.clear();
-        }
-    }
+    (void)read_key("created_at", created);
     if (created.empty()) {
         created = dd::String_type(
             std::to_string(static_cast<long long>(time(nullptr))).c_str());
@@ -945,11 +955,9 @@ bool TidesdbAtomicDdlBridge::recompute_se_private_data(const dd::Table &new_def,
        them at 1 (the *next* version after the implicit v0 they were
        created at). */
     uint64_t schema_version = 0;
-    if (new_def.se_private_data().exists("schema_version")) {
-        dd::String_type sv;
-        if (!new_def.se_private_data().get("schema_version", &sv)) {
-            schema_version = strtoull(sv.c_str(), nullptr, 10);
-        }
+    dd::String_type sv;
+    if (read_key("schema_version", sv)) {
+        schema_version = strtoull(sv.c_str(), nullptr, 10);
     }
     tmp.set("schema_version",
             dd::String_type(std::to_string(schema_version + 1).c_str()));

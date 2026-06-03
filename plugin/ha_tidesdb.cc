@@ -593,13 +593,14 @@ static MYSQL_SYSVAR_BOOL(atomic_ddl_strict, tidesdb_mysql::g_atomic_ddl_strict,
                          "tolerate legacy (pre-v0.4.0) tables on a one-time "
                          "upgrade; the binding is then inferred from the path "
                          "and a WARNING is pushed.",
-                         /* DEFAULT IS FALSE UNTIL TASK 13: without
-                            HTON_SUPPORTS_ATOMIC_DDL set, prepare_create's
-                            mutations to se_private_data are dropped (DD txn
-                            has already committed), so a strict=ON default
-                            would reject every TIDESDB open. Task 13 flips
-                            both this default and the HTON flag. */
-                         /*check=*/NULL, /*update=*/NULL, /*default=*/false);
+                         /* Task 13 flipped this back to true now that
+                            HTON_SUPPORTS_ATOMIC_DDL is active: prepare_create
+                            and prepare_drop now run inside the DD txn so
+                            se_private_data carries the binding on every
+                            normally-created table. Operators can SET GLOBAL
+                            tidesdb_atomic_ddl_strict=OFF for a one-time
+                            legacy-table upgrade window. */
+                         /*check=*/NULL, /*update=*/NULL, /*default=*/true);
 
 /* Atomic-DDL (A-5) Task 11: action the startup reconciliation sweep takes
    when it finds an orphan CF (no matching dd::Table). Drop is destructive
@@ -2802,7 +2803,12 @@ static int tidesdb_init_func(void *p)
 
     tidesdb_hton = (handlerton *)p;
     tidesdb_hton->create = tidesdb_create_handler;
-    tidesdb_hton->flags = HTON_SUPPORTS_ENGINE_ATTRIBUTE;
+    /* Task 13: HTON_SUPPORTS_ATOMIC_DDL activates the spec'd contract --
+       ha_tidesdb::create now runs INSIDE the open DD transaction, so
+       prepare_create's mutations to dd::Table::se_private_data persist,
+       prepare_drop's marker survives a rollback, and validate_open can
+       trust the binding cell on every open. */
+    tidesdb_hton->flags = HTON_SUPPORTS_ENGINE_ATTRIBUTE | HTON_SUPPORTS_ATOMIC_DDL;
     tidesdb_hton->savepoint_offset = sizeof(tidesdb_savepoint_t);
     tidesdb_hton->file_extensions = ha_tidesdb_exts;  /* MariaDB: tablefile_extensions */
     /* MariaDB-only handlerton members (table_options/field_options/index_options)
@@ -8635,12 +8641,39 @@ THR_LOCK_DATA **ha_tidesdb::store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lo
 
 /* ******************** rename_table (ALTER TABLE / RENAME) ******************** */
 
-int ha_tidesdb::rename_table(const char *from, const char *to, const dd::Table *, dd::Table *)
+int ha_tidesdb::rename_table(const char *from, const char *to,
+                             const dd::Table * /*from_table_def*/,
+                             dd::Table *to_table_def)
 {
     DBUG_ENTER("ha_tidesdb::rename_table");
 
     std::string old_cf = path_to_cf_name(from);
     std::string new_cf = path_to_cf_name(to);
+
+    /* Atomic-DDL (A-5) Task 13: when HTON_SUPPORTS_ATOMIC_DDL is active,
+       validate_open enforces that se_private_data["cf_name"] matches the
+       path-inferred CF name on every open. RENAME must update the binding
+       so the post-rename open succeeds; otherwise validate_open rejects
+       with "CF-name mismatch" because the persisted cf_name still points
+       at the old name.
+
+       Always update to_table_def's cf_name to match `to`. This covers
+       both user-issued RENAME TABLE and the COPY-algorithm ALTER's two
+       internal renames (orig -> #sql-backup, then #sql-new -> orig);
+       the post-ALTER OPEN of the user's table name then validates
+       cleanly. We unconditionally call set() rather than gating on
+       exists() because legacy tables that came in without a binding
+       should ALSO have one written on rename (consistent with the
+       Task 13 "fill the binding wherever we touch the DD" stance). */
+    if (to_table_def != nullptr)
+    {
+        dd::Properties &p = to_table_def->se_private_data();
+        p.set("cf_name", dd::String_type(new_cf.c_str()));
+        if (!p.exists("atomic_ddl")) {
+            /* Legacy table just acquired a binding; mark it. */
+            p.set("atomic_ddl", "1");
+        }
+    }
 
     /* If the destination CF already exists (stale from a previous ALTER),
        drop it first so the rename can proceed. */

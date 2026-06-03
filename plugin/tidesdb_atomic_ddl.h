@@ -126,7 +126,12 @@ class TidesdbAtomicDdlBridge {
        Returns true on success; out_serialized then contains a raw_string()
        suitable for dd::Table::set_se_private_data. Returns false only if
        the Properties_impl could not be constructed (should not happen). */
-    static bool recompute_se_private_data(const dd::Table &new_def,
+    /* old_def supplies fall-back values for keys that don't survive the
+       schema-overlap clone MySQL hands to prepare_inplace_alter_table
+       (cf_name, created_at, schema_version). May be nullptr for the
+       legacy code paths that don't have a pre-ALTER definition. */
+    static bool recompute_se_private_data(const dd::Table *old_def,
+                                          const dd::Table &new_def,
                                           std::string &out_serialized);
 
 #ifndef NDEBUG
