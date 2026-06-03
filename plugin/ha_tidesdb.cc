@@ -8686,9 +8686,22 @@ static void tidesdb_hton_drop_database(handlerton *, char *path)
                           to_drop.size(), to_drop.size() == 1 ? "y" : "ies", db.c_str());
 }
 
-int ha_tidesdb::delete_table(const char *name, const dd::Table *)
+int ha_tidesdb::delete_table(const char *name, const dd::Table *table_def)
 {
     DBUG_ENTER("ha_tidesdb::delete_table");
+
+    /* atomic-DDL: erase the table's SDI blob BEFORE the CF goes away.
+       prepare_drop is idempotent and tolerates a missing dd::Table*
+       (temp tables / pre-9.7 fast paths). On failure (only reachable
+       via the tidesdb_fail_after_sdi_del DBUG keyword in v0.4.0) we
+       abort the drop with HA_ERR_GENERIC so the rollback test can
+       observe the error-propagation path. Real engine-txn rollback for
+       the CF drop arrives with HTON_SUPPORTS_ATOMIC_DDL in Task 13. */
+    if (!tidesdb_mysql::TidesdbAtomicDdlBridge::prepare_drop(ha_thd(), table_def)) {
+        sql_print_error("[TIDESDB] atomic-ddl prepare_drop failed for '%s'", name);
+        DBUG_RETURN(HA_ERR_GENERIC);
+    }
+
     DBUG_RETURN(tidesdb_drop_table_impl(name));
 }
 

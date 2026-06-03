@@ -450,11 +450,27 @@ bool TidesdbAtomicDdlBridge::prepare_create(THD * /*thd*/, dd::Table *new_table_
     if (!new_table_def || !cf_name) return false;
 
     dd::Properties &p = new_table_def->se_private_data();
-    p.set("cf_name", std::string(cf_name));
-    p.set("fingerprint", compute_schema_fingerprint(*new_table_def));
-    p.set("options_csum", std::to_string(compute_options_checksum(*new_table_def)));
-    p.set("atomic_ddl", std::string("1"));
-    p.set("created_at", std::to_string(static_cast<long long>(time(nullptr))));
+    /* CRITICAL: pass values as dd::String_type (uses Stateless_allocator) so
+       Properties::set hits the non-template virtual overload
+       set(const String_type&, const String_type&) -- NOT the templated
+       set<Value_type>(...) which would instantiate to_str<std::string>.
+       to_str<> is explicitly instantiated in sql/dd/properties.cc only for
+       integral types, char const*, and a fixed set of enums; std::string is
+       not on that list, so a templated path produces an undefined symbol
+       (mysqld dlopen fails with "undefined symbol: dd::Properties::to_str
+       <std::string>"). Use the c_str() route: const char* dispatches to the
+       same virtual overload after the char-const-star explicit template
+       instantiation in properties.cc. Mixed strategy here:
+         - For literal / cf_name (char-array) we pass const char* directly.
+         - For computed std::strings we explicitly construct a dd::String_type
+           from the .c_str() so the allocator-mismatch issue disappears. */
+    p.set("cf_name", cf_name);
+    p.set("fingerprint", dd::String_type(compute_schema_fingerprint(*new_table_def).c_str()));
+    p.set("options_csum",
+          dd::String_type(std::to_string(compute_options_checksum(*new_table_def)).c_str()));
+    p.set("atomic_ddl", "1");
+    p.set("created_at",
+          dd::String_type(std::to_string(static_cast<long long>(time(nullptr))).c_str()));
 
     /* DBUG_EXECUTE_IF must fire AFTER the Properties have been written so the
        rollback test exercises the same code path operators would hit on a
@@ -469,7 +485,61 @@ bool TidesdbAtomicDdlBridge::prepare_create(THD * /*thd*/, dd::Table *new_table_
     return true;
 }
 
-bool TidesdbAtomicDdlBridge::prepare_drop(THD *, const dd::Table *) { return true; }
+/*
+  Companion to prepare_create: clean up the SDI blob the engine stashed
+  under dd::Table::id() before the CF drop runs. Called from
+  ha_tidesdb::delete_table() while the SQL-layer DDL txn is still open,
+  so a "false" return aborts the drop with HA_ERR_GENERIC and the DD
+  row stays intact.
+
+  Two no-op paths that are NOT failures:
+    * table_def == nullptr     The server occasionally invokes
+                                delete_table without a DD object (e.g.
+                                temp-table cleanup, pre-9.7 fast paths).
+                                Nothing to remove from the SDI CF, so
+                                report success.
+    * g_engine_ctx.sdi unset    SdiStore::init() logged an error at
+                                plugin load. Letting the CF drop still
+                                proceed is the lesser evil; the SDI
+                                residue is harmless and the operator
+                                already has a startup ERROR to act on.
+
+  Failure path (rare): if SdiStore::del() returns false for an
+  unexpected reason (e.g. a transient TidesDB txn error), we LOG a
+  WARNING and STILL return true. The contract from SdiStore::del is
+  "idempotent", and a missing key is already treated as success there;
+  any other failure is best-effort cleanup that should not block the
+  user-visible DROP. The rollback test path uses the DBUG keyword to
+  exercise the negative branch; production-engine txn integration
+  arrives in Task 13.
+
+  The DBUG_EXECUTE_IF runs AFTER the real del() attempt so the rollback
+  test mirrors a real failure-after-partial-work scenario the way Task
+  6's prepare_create does. SDI_TYPE_TABLE is the named constant from
+  sql/handler.h:128.
+*/
+bool TidesdbAtomicDdlBridge::prepare_drop(THD *, const dd::Table *table_def) {
+    if (!table_def) return true; /* nothing to clean up */
+
+    if (g_engine_ctx.sdi) {
+        sdi_key_t k{};
+        k.type = SDI_TYPE_TABLE;
+        k.id   = static_cast<uint64>(table_def->id());
+        if (!g_engine_ctx.sdi->del(k)) {
+            sql_print_warning("[TIDESDB] SDI delete failed for dd::Table id=%llu; "
+                              "proceeding with CF drop",
+                              static_cast<unsigned long long>(k.id));
+            /* Not fatal in the prod path; SDI residue is harmless. */
+        }
+    }
+
+    /* Test-only hook: force a failure AFTER the SDI delete attempt so
+       the rollback test asserts the error-propagation path through
+       delete_table. */
+    DBUG_EXECUTE_IF("tidesdb_fail_after_sdi_del", { return false; });
+
+    return true;
+}
 
 /*
   Consumer side of the bookkeeping written by prepare_create. Called from
