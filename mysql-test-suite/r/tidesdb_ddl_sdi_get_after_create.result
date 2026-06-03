@@ -1,0 +1,8 @@
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY, v VARCHAR(64)) ENGINE=TIDESDB;
+SELECT COUNT(*) > 0 AS has_table
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA='test' AND TABLE_NAME='tdb_ddl_t' AND ENGINE='TIDESDB';
+has_table
+1
+DROP TABLE tdb_ddl_t;
+# Done.

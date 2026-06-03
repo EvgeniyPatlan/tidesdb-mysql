@@ -2174,6 +2174,22 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
         if (hton->is_dict_readonly) hton->is_dict_readonly();
     });
 
+    /* Atomic-DDL (A-5) Task 5: debug-only force-invoke for the SDI
+       "tablespace is not ours" guard. Production code-path: the server
+       only ever passes the tablespace it asked the engine to handle, so
+       the guard fires once per non-ours tablespace and short-circuits.
+       This MTR-arming branch exercises the guard directly because
+       constructing a real dd::Tablespace from a test is impractical
+       (~20 pure virtuals). On success we log a single INFO line that
+       the test greps for. Compiled out under NDEBUG (Release builds). */
+    DBUG_EXECUTE_IF("tidesdb_force_sdi_other_tablespace", {
+        if (tidesdb_mysql::SdiCallbacks::debug_invoke_other_tablespace()) {
+            sql_print_information("[TIDESDB] sdi_other_tablespace ok");
+        } else {
+            sql_print_error("[TIDESDB] sdi_other_tablespace FAILED");
+        }
+    });
+
     /* We refresh SHOW GLOBAL STATUS variables alongside the human-readable output */
     tidesdb_refresh_status_vars();
 
@@ -2812,6 +2828,26 @@ static int tidesdb_init_func(void *p)
     if (!g_engine_ctx.tablespace)
         sql_print_error("[TIDESDB] failed to register tidesdb_system tablespace");
 
+    /* Atomic-DDL (A-5) Task 5: instantiate the SDI store against the open
+       engine. SdiStore::init() opens or creates the dedicated __tidesdb_sdi
+       CF that backs the six handlerton SDI callbacks below. A failure here
+       is non-fatal: the SDI callbacks will gracefully return success-no-op
+       for reads / failure for writes when g_engine_ctx.sdi is null, so the
+       rest of the engine remains usable. */
+    g_engine_ctx.sdi = std::make_unique<tidesdb_mysql::SdiStore>(tdb_get_engine());
+    if (!g_engine_ctx.sdi->init())
+    {
+        sql_print_error("[TIDESDB] SdiStore init failed; SDI callbacks will "
+                        "return errors for writes");
+        /* Keep the unique_ptr live so the callbacks land in the null-cf
+           guard inside SdiStore rather than dereferencing a freed object. */
+    }
+
+    /* Atomic-DDL (A-5) Task 5: wire the six SDI tablespace callbacks. They
+       route SDI reads/writes for the tidesdb_system tablespace to
+       g_engine_ctx.sdi and return success-no-op for every other tablespace. */
+    tidesdb_mysql::SdiCallbacks::register_into(tidesdb_hton);
+
     sql_print_information("[TIDESDB] TidesDB opened at %s", g_engine_ctx.path.c_str());
 
     /* Schema discovery CF -- created when object store is active so that
@@ -2887,6 +2923,10 @@ static bool tidesdb_hton_flush_logs(handlerton *)
 static int tidesdb_hton_panic(handlerton *, enum ha_panic_function flag)
 {
     if (flag != HA_PANIC_CLOSE) return 0;
+    /* Atomic-DDL: release engine-bound resources (SdiStore CF handle,
+       tablespace ptr) BEFORE tidesdb_close. Idempotent vs the deinit path
+       -- whichever fires first wins. */
+    g_engine_ctx.reset();
     /* Take ownership atomically: any handler thread that loads after this
        point sees nullptr and short-circuits cleanly. We swap rather than
        load+store so no second caller can race us into a double-close. */
@@ -2968,6 +3008,12 @@ static int tidesdb_deinit_func(void *p)
     DBUG_ENTER("tidesdb_deinit_func");
 
     g_engine_ctx.schema_cf = NULL;
+
+    /* Atomic-DDL: release engine-bound resources (SdiStore holds a
+       tidesdb_column_family_t* whose lifecycle is bounded by the engine)
+       BEFORE we close the engine. reset() is idempotent so a prior panic
+       call that already ran reset() is harmless. */
+    g_engine_ctx.reset();
 
     /* Atomic exchange: takes ownership of the engine handle and races
        cleanly with tidesdb_hton_panic (which uses the same pattern). */

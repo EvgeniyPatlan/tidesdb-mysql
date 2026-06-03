@@ -55,3 +55,20 @@ void EngineContext::destroy()
        don't clear() it here because some error-log paths in the deinit
        sequence still want the path for diagnostics. */
 }
+
+void EngineContext::reset()
+{
+    /* Drop the engine-bound atomic-DDL state. Order matters: SdiStore
+       holds a tidesdb_column_family_t* whose lifecycle is bounded by the
+       engine, so this MUST run while the engine is still open (i.e.
+       BEFORE tidesdb_close in tidesdb_deinit_func / tidesdb_hton_panic).
+
+       `tablespace` is a non-owning pointer to a function-local static
+       owned by tidesdb_mysql::register_tablespace(); we just clear our
+       reference. The static itself lives on until process exit.
+
+       Idempotent: sdi.reset() on an already-null unique_ptr is a no-op;
+       tablespace = nullptr on an already-null pointer is a no-op. */
+    sdi.reset();
+    tablespace = nullptr;
+}

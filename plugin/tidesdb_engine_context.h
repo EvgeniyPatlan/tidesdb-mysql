@@ -118,6 +118,13 @@ struct EngineContext
        fire on a clean shutdown path; whichever runs first wins. */
     void init();
     void destroy();
+
+    /* Atomic-DDL teardown: release per-engine resources whose lifetime is
+       bounded by the open TidesDB handle. MUST be called BEFORE
+       tidesdb_close(engine), otherwise the SdiStore destructor would
+       drop a column-family handle owned by an already-freed engine.
+       Idempotent: a second call is a no-op (unique_ptr / nullptr). */
+    void reset();
 };
 
 /* The one and only instance.  Defined in tidesdb_engine_context.cc. */

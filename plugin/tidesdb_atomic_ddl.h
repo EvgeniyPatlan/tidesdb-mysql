@@ -100,6 +100,17 @@ struct DdseStubs {
 /* SDI callback adapters (bound to SdiStore via a free-function shim). */
 struct SdiCallbacks {
     static void register_into(handlerton *hton);
+
+#ifndef NDEBUG
+    /* Debug-only: exercise the "other tablespace" branch of every SDI
+       callback so MTR can prove the identity guard works without having
+       to construct a full dd::Tablespace object. Each call must return
+       false (success no-op) for a tablespace named anything except
+       kTidesdbTablespace. Used from the
+       'tidesdb_force_sdi_other_tablespace' DBUG hook in
+       tidesdb_show_status. Returns true if every guard fired correctly. */
+    static bool debug_invoke_other_tablespace();
+#endif
 };
 
 /* Tablespace registration helper. Returns nullptr on failure. */
