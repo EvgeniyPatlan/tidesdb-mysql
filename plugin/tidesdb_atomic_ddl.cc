@@ -306,6 +306,32 @@ void SdiCallbacks::register_into(handlerton *) {}
 
 /* -------------------- Tablespace -------------------- */
 
-const Plugin_tablespace *register_tablespace() { return nullptr; }
+/*
+  Plugin_tablespace's 5-arg ctor (sql/plugin_table.h:154) is:
+      (name, options, se_private_data, comment, engine).
+  Engine name "TidesDB" matches mysql_declare_plugin(tidesdb)'s name field
+  so SHOW TABLESPACES (when MySQL surfaces it) attributes the row to us.
+
+  v0.4.0 scope deviation:
+    A storage engine surfaces a Plugin_tablespace to the server only
+    through the handlerton->ddse_dict_init callback (used exclusively by
+    the DDSE -- InnoDB in MySQL 9.7). Non-DDSE engines have no API for
+    pushing a Plugin_tablespace into information_schema.FILES /
+    INNODB_TABLESPACES. The function-local static keeps the descriptor
+    alive for the lifetime of the process; EngineContext::tablespace
+    holds a reference so the SDI callbacks landing in Task 5 can quote
+    it as identity for the engine-wide logical tablespace. Surfacing in
+    introspection views is intentionally out of scope for v0.4.0; the
+    MTR smoke test below verifies the observable side-effect we DO have:
+    the plugin loads cleanly and the engine row is present.
+*/
+const Plugin_tablespace *register_tablespace() {
+    static Plugin_tablespace ts(kTidesdbTablespace,
+                                 /*options=*/"",
+                                 /*se_private_data=*/"",
+                                 /*comment=*/"TidesDB engine-wide logical tablespace",
+                                 /*engine=*/"TidesDB");
+    return &ts;
+}
 
 }  // namespace tidesdb_mysql

@@ -53,9 +53,17 @@
 
 #include <atomic>
 #include <cstddef>
+#include <memory>
 #include <string>
 
 #include "mysql/psi/mysql_mutex.h"
+
+/* Forward declaration: the engine-wide logical tablespace pointer is
+   stashed here at plugin init so the atomic-DDL SDI callbacks can refer
+   to it by identity. The class itself lives in sql/plugin_table.h; we
+   forward-declare to avoid pulling a server header from every TU that
+   only touches engine state. */
+class Plugin_tablespace;
 
 /* TidesDB C types are typedef'd through opaque structs whose tag names
    are not stable; rather than fragile forward declarations, pull the
@@ -63,6 +71,11 @@
 extern "C" {
 #include <tidesdb/db.h>
 }
+
+/* Atomic-DDL participation surface. Pulling the header in here keeps
+   std::unique_ptr<SdiStore>'s destructor instantiable without a
+   header-bloat dance (no explicit out-of-line ~EngineContext required). */
+#include "tidesdb_atomic_ddl.h"
 
 struct EngineContext
 {
@@ -86,6 +99,18 @@ struct EngineContext
     mysql_mutex_t last_conflict_mutex;
     static constexpr std::size_t LAST_CONFLICT_INFO_LEN = 1024;
     char last_conflict_info[LAST_CONFLICT_INFO_LEN]{};
+
+    /* Atomic-DDL: SDI store (the dedicated __tidesdb_sdi CF wrapper) is
+       allocated lazily by Task 5's wiring; nullptr until then. unique_ptr
+       so the destructor releases it on plugin unload. */
+    std::unique_ptr<tidesdb_mysql::SdiStore> sdi;
+
+    /* Atomic-DDL: pointer to the engine-wide logical tablespace
+       descriptor. Populated in tidesdb_init_func by register_tablespace().
+       Used by the (future) SDI callbacks as identity for the
+       tidesdb_system tablespace. The object is a function-local static
+       owned by register_tablespace(); EngineContext does NOT own it. */
+    const Plugin_tablespace *tablespace{nullptr};
 
     /* Lifecycle. init() is called from tidesdb_init_func once at plugin
        load; destroy() from tidesdb_deinit_func / tidesdb_hton_panic.

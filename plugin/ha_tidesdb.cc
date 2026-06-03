@@ -51,6 +51,7 @@ extern "C"
 #include "sql/sql_class.h"
 
 #include "tidesdb_engine_context.h"  /* g_engine_ctx, tdb_get_engine/set_engine */
+#include "tidesdb_atomic_ddl.h"      /* register_tablespace (A-5 atomic-DDL) */
 #include "tidesdb_fts.h"             /* FTS subsystem (A-2 extraction) */
 #include "tidesdb_spatial.h"         /* Spatial subsystem (A-2 extraction) */
 
@@ -2773,6 +2774,14 @@ static int tidesdb_init_func(void *p)
     /* Publish atomically -- handler threads must observe a fully-constructed
        engine handle, not a torn write. */
     tdb_set_engine(opened);
+
+    /* Atomic-DDL (A-5): register the engine-wide logical tablespace
+       descriptor. Non-fatal at this point -- atomic-DDL fully activates
+       in a later commit (handlerton SDI/DDSE callback wiring lands in
+       Task 5). See docs/superpowers/specs/2026-06-02-atomic-ddl-participation-design.md. */
+    g_engine_ctx.tablespace = tidesdb_mysql::register_tablespace();
+    if (!g_engine_ctx.tablespace)
+        sql_print_error("[TIDESDB] failed to register tidesdb_system tablespace");
 
     sql_print_information("[TIDESDB] TidesDB opened at %s", g_engine_ctx.path.c_str());
 
