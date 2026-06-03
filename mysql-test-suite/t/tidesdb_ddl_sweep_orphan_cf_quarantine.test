@@ -1,0 +1,55 @@
+--source suite/tidesdb/include/tidesdb_ddl_helpers.inc
+--source include/have_debug.inc
+#
+# A-5 atomic-DDL Task 11: orphan-CF quarantine path.
+#
+# Inject a CF directly via tidesdb_create_column_family (bypassing the DD)
+# so the next reconciliation sweep sees it as an orphan. With
+# tidesdb_orphan_action='quarantine' (default) the sweep renames the CF
+# to "__orphan_<epoch>_<name>"; the '__' prefix means compute_delta_pure
+# filters it on subsequent sweeps so it doesn't keep getting flagged.
+#
+# Note on timing: the init-time sweep runs without a DD client (see the
+# tidesdb_init_func comment about current_thd being nullptr on the
+# bootstrap thread). We therefore drive the sweep manually via the
+# tidesdb_run_reconcile DBUG hook from a regular SQL session after
+# restart, which has a real Dictionary_client. The DBUG keyword arms
+# inside tidesdb_show_status (SHOW ENGINE TIDESDB STATUS).
+#
+
+SET @save_log_error_verbosity = @@global.log_error_verbosity;
+SET GLOBAL log_error_verbosity = 3;
+SET GLOBAL tidesdb_orphan_action = 'quarantine';
+
+# Inject the orphan CF, then restart so we exercise the cross-restart
+# persistence we care about (the CF lives on disk and survives).
+SET @@global.DEBUG = '+d,tidesdb_inject_orphan_cf';
+--disable_result_log
+SHOW ENGINE TIDESDB STATUS;
+--enable_result_log
+SET @@global.DEBUG = '';
+
+--source include/restart_mysqld.inc
+
+SET GLOBAL log_error_verbosity = 3;
+SET GLOBAL tidesdb_orphan_action = 'quarantine';
+
+# Clear the post-restart error log slice from the last test run, then
+# trigger the sweep manually via the DBUG hook.
+--exec : > $MYSQLTEST_VARDIR/log/mysqld.1.err
+
+SET @@global.DEBUG = '+d,tidesdb_run_reconcile';
+--disable_result_log
+SHOW ENGINE TIDESDB STATUS;
+--enable_result_log
+SET @@global.DEBUG = '';
+
+# At least one "quarantined orphan CF" line proves apply_delta took the
+# rename path. Suppression on [TIDESDB] is already installed via
+# have_tidesdb.inc so the line landing as WARNING doesn't fail the suite.
+let $log_file = $MYSQLTEST_VARDIR/log/mysqld.1.err;
+--exec grep -c "quarantined orphan CF 'test_orphan_cf_inj'" $log_file
+
+SET GLOBAL log_error_verbosity = @save_log_error_verbosity;
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

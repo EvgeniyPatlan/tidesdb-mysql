@@ -1,0 +1,15 @@
+SET @save_log_error_verbosity = @@global.log_error_verbosity;
+SET GLOBAL log_error_verbosity = 3;
+SET GLOBAL tidesdb_orphan_action = 'drop';
+SET @@global.DEBUG = '+d,tidesdb_inject_orphan_cf';
+SHOW ENGINE TIDESDB STATUS;
+SET @@global.DEBUG = '';
+# restart
+SET GLOBAL log_error_verbosity = 3;
+SET GLOBAL tidesdb_orphan_action = 'drop';
+SET @@global.DEBUG = '+d,tidesdb_run_reconcile';
+SHOW ENGINE TIDESDB STATUS;
+SET @@global.DEBUG = '';
+1
+SET GLOBAL log_error_verbosity = @save_log_error_verbosity;
+# Done.

@@ -1,0 +1,16 @@
+SET @save_log_error_verbosity = @@global.log_error_verbosity;
+SET GLOBAL log_error_verbosity = 3;
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY) ENGINE=TIDESDB;
+INSERT INTO tdb_ddl_t VALUES (1);
+SET @@global.DEBUG = '+d,tidesdb_drop_cf_skip_dd';
+SHOW ENGINE TIDESDB STATUS;
+SET @@global.DEBUG = '';
+# restart
+SET GLOBAL log_error_verbosity = 3;
+SET @@global.DEBUG = '+d,tidesdb_run_reconcile';
+SHOW ENGINE TIDESDB STATUS;
+SET @@global.DEBUG = '';
+1
+DROP TABLE IF EXISTS tdb_ddl_t;
+SET GLOBAL log_error_verbosity = @save_log_error_verbosity;
+# Done.

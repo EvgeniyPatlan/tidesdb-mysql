@@ -601,6 +601,43 @@ static MYSQL_SYSVAR_BOOL(atomic_ddl_strict, tidesdb_mysql::g_atomic_ddl_strict,
                             both this default and the HTON flag. */
                          /*check=*/NULL, /*update=*/NULL, /*default=*/false);
 
+/* Atomic-DDL (A-5) Task 11: action the startup reconciliation sweep takes
+   when it finds an orphan CF (no matching dd::Table). Drop is destructive
+   and intended for scripted recovery; quarantine renames to
+   "__orphan_<epoch>_<cf>" (default, preserves data and is ignored by the
+   next sweep because the '__' prefix is filtered by compute_delta_pure);
+   log_only just emits a WARNING. The storage cell is a plain enum index
+   (matches the MYSQL_SYSVAR_ENUM ABI); the update hook fans it out to the
+   typed g_orphan_action defined in tidesdb_atomic_ddl.cc. */
+static const char *tidesdb_orphan_action_names[] = {
+    "drop", "quarantine", "log_only", NullS};
+static TYPELIB tidesdb_orphan_action_typelib = {
+    array_elements(tidesdb_orphan_action_names) - 1, "tidesdb_orphan_action_typelib",
+    tidesdb_orphan_action_names, NULL};
+static ulong srv_orphan_action = 1; /* quarantine */
+
+static void tidesdb_orphan_action_update(THD *, SYS_VAR *, void *var_ptr,
+                                         const void *save)
+{
+    const ulong v = *static_cast<const ulong *>(save);
+    *static_cast<ulong *>(var_ptr) = v;
+    tidesdb_mysql::g_orphan_action = static_cast<tidesdb_mysql::OrphanAction>(v);
+}
+
+static MYSQL_SYSVAR_ENUM(orphan_action, srv_orphan_action,
+                         PLUGIN_VAR_RQCMDARG,
+                         "Action the startup reconciliation sweep takes for "
+                         "TidesDB column families that have no matching "
+                         "dd::Table (orphan CFs). 'drop' = destroy the CF "
+                         "and its data; 'quarantine' (default) = rename to "
+                         "__orphan_<epoch>_<cf> so data is preserved and "
+                         "subsequent sweeps ignore it; 'log_only' = emit a "
+                         "WARNING and leave the CF in place. Orphan dd::Table "
+                         "rows (DD entry present, CF missing) are always "
+                         "logged -- the reconciler never modifies the DD.",
+                         /*check=*/NULL, tidesdb_orphan_action_update,
+                         /*default=*/1, &tidesdb_orphan_action_typelib);
+
 static MYSQL_SYSVAR_BOOL(pessimistic_locking, srv_pessimistic_locking, PLUGIN_VAR_RQCMDARG,
                          "Enable plugin-level row locks for SELECT ... FOR UPDATE, "
                          "UPDATE, DELETE, and INSERT on user-defined primary keys. "
@@ -1309,6 +1346,7 @@ static SYS_VAR *tidesdb_system_variables[] = {
     MYSQL_SYSVAR(default_tombstone_density_trigger),
     MYSQL_SYSVAR(default_tombstone_density_min_entries),
     MYSQL_SYSVAR(atomic_ddl_strict),
+    MYSQL_SYSVAR(orphan_action),
     NULL};
 
 /* ******************** Table options (per-table CF config) ******************** */
@@ -2226,6 +2264,86 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
     DBUG_EXECUTE_IF("tidesdb_dump_se_private_data", {
         (void)tidesdb_mysql::TidesdbAtomicDdlBridge::debug_dump_last_se_private_data();
     });
+
+    /* Atomic-DDL (A-5) Task 11: inject an orphan CF directly via
+       tidesdb_create_column_family, bypassing the DD layer. On the next
+       server restart the reconciliation sweep will see a CF with no
+       matching dd::Table and apply tidesdb_orphan_action (drop /
+       quarantine / log_only). Idempotent: TDB_ERR_EXISTS is fine. The
+       fixed name "__test_orphan_cf_inj" intentionally does NOT start
+       with the '__orphan_' quarantine prefix (compute_delta_pure would
+       filter it) but DOES start with '__' -- wait, that means
+       compute_delta_pure would also filter it. So we use a name that
+       does NOT start with '__': "test_orphan_cf_inj". */
+    DBUG_EXECUTE_IF("tidesdb_inject_orphan_cf", {
+        if (tdb_get_engine()) {
+            tidesdb_column_family_config_t cfg =
+                tidesdb_default_column_family_config();
+            const char *kName = "test_orphan_cf_inj";
+            strncpy(cfg.name, kName, sizeof(cfg.name) - 1);
+            cfg.name[sizeof(cfg.name) - 1] = '\0';
+            int rc = tidesdb_create_column_family(tdb_get_engine(), kName, &cfg);
+            if (rc == TDB_SUCCESS || rc == TDB_ERR_EXISTS) {
+                sql_print_information("[TIDESDB] test injected orphan CF '%s'",
+                                      kName);
+            } else {
+                sql_print_warning(
+                    "[TIDESDB] test inject_orphan_cf: create rc=%d", rc);
+            }
+        }
+    });
+
+    /* Atomic-DDL (A-5) Task 11: drop the underlying CF for an already-
+       created TIDESDB table, leaving the DD row in place. Simulates the
+       "DD txn committed but engine drop crashed before completing" crash
+       scenario. After the next restart the reconciliation sweep should
+       see a dd::Table that has no backing CF (orphan dd::Table) and log
+       the operator-action message. The test creates a table named
+       'tdb_ddl_t' first, so the CF name follows path_to_cf_name's
+       "<db>__<table>" form -- here it's "test__tdb_ddl_t". */
+    DBUG_EXECUTE_IF("tidesdb_drop_cf_skip_dd", {
+        if (tdb_get_engine()) {
+            const char *kName = "test__tdb_ddl_t";
+            int rc = tidesdb_drop_column_family(tdb_get_engine(), kName);
+            if (rc == TDB_SUCCESS) {
+                sql_print_information(
+                    "[TIDESDB] test dropped CF '%s' (DD row left intact)",
+                    kName);
+            } else {
+                sql_print_warning(
+                    "[TIDESDB] test drop_cf_skip_dd: rc=%d", rc);
+            }
+        }
+    });
+
+    /* Atomic-DDL (A-5) Task 11: SQL-reachable trigger for the
+       reconciliation sweep. tidesdb_init_func runs on the bootstrap
+       thread where current_thd is typically nullptr (no DD client
+       available), so the sweep stays a no-op at init time. The MTR
+       sweep tests use this hook to drive the sweep from a regular SQL
+       session AFTER restart -- the THD passed to tidesdb_show_status
+       has a Dictionary_client wired up, so compute_delta sees the real
+       DD state. apply_delta then runs against whatever orphans the
+       previous test phase injected (via tidesdb_inject_orphan_cf or
+       tidesdb_drop_cf_skip_dd, persisted across the restart). */
+    DBUG_EXECUTE_IF("tidesdb_run_reconcile", {
+        if (thd && thd->dd_client() && tdb_get_engine()) {
+            tidesdb_mysql::DdSyncReconciler rec(tdb_get_engine(), thd->dd_client());
+            auto delta = rec.compute_delta();
+            sql_print_information(
+                "[TIDESDB] reconciler (manual): %zu orphan CFs, "
+                "%zu orphan dd::Tables",
+                delta.orphan_cfs.size(), delta.orphan_dd_tables.size());
+            (void)rec.apply_delta(delta);
+        } else {
+            sql_print_information(
+                "[TIDESDB] reconciler (manual): preconditions unmet "
+                "(thd=%p dd_client=%p engine=%p)",
+                (void *)thd,
+                thd ? (void *)thd->dd_client() : nullptr,
+                (void *)tdb_get_engine());
+        }
+    });
 #endif
 
     /* We refresh SHOW GLOBAL STATUS variables alongside the human-readable output */
@@ -2911,6 +3029,37 @@ static int tidesdb_init_func(void *p)
             schema_cf_ensure_databases();
 
             sql_print_information("[TIDESDB] Schema discovery enabled (object store mode)");
+        }
+    }
+
+    /* Atomic-DDL (A-5) Task 11: reconciliation sweep wiring.
+
+       SAFETY FIRST: We do NOT apply_delta from plugin init. Even when
+       current_thd is non-null on the bootstrap thread, the DD's table
+       cache may not yet have the user's TIDESDB tables visible to
+       fetch_schema_components<Table> (their dd::Table rows live in
+       mysql.tables on InnoDB, which can be in mid-recovery). Empirical
+       testing in this very task showed init-time apply_delta will
+       mis-classify legitimate user tables as orphan CFs and quarantine
+       them. To avoid catastrophic data loss, the sweep at init does
+       NOTHING destructive: it only logs which path it would have taken
+       and leaves apply_delta to the SQL-reachable manual-trigger DBUG
+       hook (tidesdb_run_reconcile) and to v0.5.0's on-first-connection
+       schedule.
+
+       The MTR sweep tests therefore drive apply_delta from a regular
+       SQL session post-restart (which has a fully-warm DD client), and
+       this init-time block is best-effort observability. */
+    {
+        THD *thd = current_thd;
+        if (thd && thd->dd_client()) {
+            sql_print_information(
+                "[TIDESDB] reconciler: init-time sweep skipped (apply_delta "
+                "is gated to manual / first-connection triggers to avoid "
+                "false orphans during DD warm-up); DD client present");
+        } else {
+            sql_print_information(
+                "[TIDESDB] reconciler: no DD client at plugin init; sweep deferred");
         }
     }
 

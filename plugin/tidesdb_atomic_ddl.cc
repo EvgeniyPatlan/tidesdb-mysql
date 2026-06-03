@@ -41,10 +41,12 @@
 #include "sha2.h"                      /* SHA_EVP256, SHA256_DIGEST_LENGTH */
 #include "sql/auth/sql_security_ctx.h" /* Security_context::priv_user/host_or_ip */
 #include "sql/current_thd.h"           /* unused but kept for parity */
+#include "sql/dd/cache/dictionary_client.h" /* dd::cache::Dictionary_client */
 #include "sql/dd/impl/properties_impl.h" /* dd::Properties_impl (concrete subclass) */
 #include "sql/dd/properties.h"         /* dd::Properties */
 #include "sql/dd/string_type.h"        /* dd::String_type */
 #include "sql/dd/types/column.h"       /* dd::Column */
+#include "sql/dd/types/schema.h"       /* dd::Schema (for reconciler enumeration) */
 #include "sql/dd/types/table.h"        /* dd::Table */
 #include "sql/dd/types/tablespace.h"   /* dd::Tablespace::name() */
 #include "sql/derror.h"                /* my_error */
@@ -308,14 +310,191 @@ bool SdiStore::list_keys(sdi_vector_t &out) {
 DdSyncReconciler::DdSyncReconciler(tidesdb_t *engine, dd::cache::Dictionary_client *dc)
     : engine_(engine), dc_(dc) {}
 
+/*
+  Enumerate the two sides of the synchronisation problem and delegate to
+  compute_delta_pure(), which is the side-effect-free helper covered by
+  gtest in plugin/tests/test_reconciler_delta.cc.
+
+  Expected (DD-derived):
+    Every dd::Table whose engine() == "TIDESDB", expressed as the same
+    CF name path_to_cf_name would produce: "<schema>__<table>". Matching
+    the CF-naming convention here is what lets the symmetric-difference
+    in compute_delta_pure compare apples to apples.
+
+  Actual (engine-derived):
+    Every CF name returned by tidesdb_list_column_families. The pure
+    helper filters out names starting with '__' (covers __tidesdb_sdi
+    and __orphan_<epoch>_* quarantined CFs), so we don't have to scrub
+    here.
+
+  Failure modes:
+    * dc_ == nullptr (current_thd had no DD client during plugin init):
+      expected stays empty; the sweep then reports every TIDESDB CF as an
+      orphan. Safe: the production path checks for current_thd before
+      calling compute_delta, so this branch is only reached if the
+      caller explicitly passed nullptr (tests).
+    * engine_ == nullptr: actual stays empty; the sweep reports every
+      DD-tracked TIDESDB table as orphan-DD (CF missing). Same safe
+      degradation.
+    * fetch_global_components / fetch_schema_components failure: log a
+      WARNING and return whatever we managed to enumerate so far. The
+      reconciler is best-effort -- partial enumeration is better than
+      aborting startup.
+
+  Memory ownership: tidesdb_list_column_families allocates an array of
+  char* via malloc(); we free both the strings and the outer array
+  before returning.
+*/
 ReconcileDelta DdSyncReconciler::compute_delta() {
-    /* Task 11 will populate `expected` (from dd::Catalog enumeration filtered
-       by ENGINE=TIDESDB) and `actual` (from the TidesDB CF list), then
-       delegate to compute_delta_pure(). The pure helper is fully
-       implemented and unit-tested in plugin/tests/test_reconciler_delta.cc. */
-    return {};
+    std::set<std::string> expected;
+    std::set<std::string> actual;
+
+    if (dc_) {
+        /* fetch_global_components<Schema> + fetch_schema_components<Table>
+           is the canonical idiom used elsewhere in 9.7 (e.g.
+           sql/events.cc:1170-1180 for cross-schema event enumeration). */
+        std::vector<const dd::Schema *> schemas;
+        if (dc_->fetch_global_components(&schemas)) {
+            sql_print_warning("[TIDESDB] reconciler: fetch_global_components"
+                              "<Schema> failed; expected set may be incomplete");
+        } else {
+            for (const dd::Schema *sch : schemas) {
+                if (!sch) continue;
+                std::vector<const dd::Table *> tables;
+                if (dc_->fetch_schema_components(sch, &tables)) {
+                    sql_print_warning(
+                        "[TIDESDB] reconciler: fetch_schema_components"
+                        "<Table> failed for schema '%s'; expected set may "
+                        "be incomplete",
+                        sch->name().c_str());
+                    continue;
+                }
+                for (const dd::Table *t : tables) {
+                    if (!t) continue;
+                    if (t->engine() == "TIDESDB") {
+                        /* Use the same "<db>__<table>" form path_to_cf_name
+                           produces so the symmetric-difference compares
+                           identical CF names. CF_DB_TABLE_SEP is "__"; we
+                           hard-code it here to avoid pulling ha_tidesdb.h
+                           (which would drag the whole handler class in). */
+                        std::string cf;
+                        cf.reserve(sch->name().length() + 2 + t->name().length());
+                        cf.append(sch->name().c_str(), sch->name().length());
+                        cf.append("__", 2);
+                        cf.append(t->name().c_str(), t->name().length());
+                        expected.insert(std::move(cf));
+                    }
+                }
+            }
+        }
+    }
+
+    if (engine_) {
+        char **names = nullptr;
+        int count = 0;
+        int rc = tidesdb_list_column_families(engine_, &names, &count);
+        if (rc != TDB_SUCCESS) {
+            sql_print_warning("[TIDESDB] reconciler: tidesdb_list_column_families "
+                              "rc=%d; actual set may be incomplete", rc);
+        } else if (names) {
+            for (int i = 0; i < count; i++) {
+                if (names[i]) {
+                    actual.insert(names[i]);
+                    free(names[i]);
+                }
+            }
+            free(names);
+        }
+    }
+
+    return compute_delta_pure(expected, actual);
 }
-bool DdSyncReconciler::apply_delta(const ReconcileDelta &) { return true; }
+
+/*
+  Walk the delta and act on each orphan according to the operator-set
+  sysvar tidesdb_orphan_action:
+
+    drop       -> tidesdb_drop_column_family. Destructive; intended for
+                  scripted recovery where the operator has already
+                  audited the orphan list and decided the data is
+                  expendable.
+    quarantine -> tidesdb_rename_column_family to "__orphan_<epoch>_<cf>"
+                  (default). Preserves data; the '__' prefix means the
+                  pure delta helper ignores it on the next sweep so the
+                  CF doesn't keep getting flagged.
+    log_only   -> just emit a WARNING. The CF stays as an orphan and
+                  will be flagged again on every restart until the
+                  operator intervenes.
+
+  For orphan dd::Table rows (CF missing, DD entry present) we ALWAYS
+  log_only -- the reconciler never touches the DD. The error log message
+  spells out the two operator paths (DROP TABLE or restore from backup)
+  so the on-call doesn't have to dig through this source file.
+
+  Per-orphan failures don't abort the whole sweep: we accumulate them in
+  `ok` and return at the end. A partially-successful sweep is logged so
+  the operator can re-run after fixing the root cause (e.g. permissions).
+*/
+bool DdSyncReconciler::apply_delta(const ReconcileDelta &d) {
+    bool ok = true;
+
+    for (const auto &cf : d.orphan_cfs) {
+        switch (g_orphan_action) {
+            case OrphanAction::Drop: {
+                int rc = engine_ ? tidesdb_drop_column_family(engine_, cf.c_str())
+                                 : TDB_ERR_INVALID_ARGS;
+                if (rc != TDB_SUCCESS) {
+                    sql_print_warning("[TIDESDB] reconciler: failed to drop orphan "
+                                      "CF '%s' rc=%d (continuing)", cf.c_str(), rc);
+                    ok = false;
+                } else {
+                    sql_print_warning("[TIDESDB] reconciler: dropped orphan CF '%s'",
+                                      cf.c_str());
+                }
+                break;
+            }
+            case OrphanAction::Quarantine: {
+                /* Target name uses two delimiters so it parses cleanly with
+                   awk/grep: "__orphan_<epoch>_<original>". Bound the length
+                   at 255 to fit TidesDB's name buffer with room for the
+                   prefix. */
+                char target[256];
+                snprintf(target, sizeof(target), "__orphan_%lld_%.200s",
+                         static_cast<long long>(time(nullptr)), cf.c_str());
+                int rc = engine_
+                             ? tidesdb_rename_column_family(engine_, cf.c_str(), target)
+                             : TDB_ERR_INVALID_ARGS;
+                if (rc != TDB_SUCCESS) {
+                    sql_print_warning("[TIDESDB] reconciler: failed to quarantine "
+                                      "'%s' to '%s' rc=%d (continuing)",
+                                      cf.c_str(), target, rc);
+                    ok = false;
+                } else {
+                    sql_print_warning("[TIDESDB] reconciler: quarantined orphan CF "
+                                      "'%s' -> '%s'", cf.c_str(), target);
+                }
+                break;
+            }
+            case OrphanAction::LogOnly:
+                sql_print_warning("[TIDESDB] reconciler: orphan CF '%s' (log_only)",
+                                  cf.c_str());
+                break;
+        }
+    }
+
+    /* Orphan DD tables (DD row exists, CF missing) -- never touch the DD.
+       Punt to the operator. The "db.table" form mirrors the format DROP
+       TABLE accepts so the suggested command in the log line is
+       copy-pasteable. */
+    for (const auto &t : d.orphan_dd_tables) {
+        sql_print_warning("[TIDESDB] reconciler: orphan dd::Table '%s' has no "
+                          "backing CF. Operator action required: "
+                          "DROP TABLE %s; or restore from backup.",
+                          t.c_str(), t.c_str());
+    }
+
+    return ok;
+}
 
 /* -------------------- TidesdbAtomicDdlBridge -------------------- */
 
