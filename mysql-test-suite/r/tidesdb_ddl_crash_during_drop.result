@@ -1,0 +1,18 @@
+# Expected output assumes Debug build; this test SKIPS on Release.
+SET @save_log_error_verbosity = @@global.log_error_verbosity;
+SET GLOBAL log_error_verbosity = 3;
+SET GLOBAL tidesdb_orphan_action = 'quarantine';
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY) ENGINE=TIDESDB;
+INSERT INTO tdb_ddl_t VALUES (1);
+SET SESSION DEBUG = '+d,tidesdb_crash_after_dd_commit_before_cf_drop';
+DROP TABLE tdb_ddl_t;
+ERROR HY000: Lost connection to MySQL server during query
+SET GLOBAL log_error_verbosity = 3;
+SET GLOBAL tidesdb_orphan_action = 'quarantine';
+SET @@global.DEBUG = '+d,tidesdb_run_reconcile';
+SHOW ENGINE TIDESDB STATUS;
+SET @@global.DEBUG = '';
+1
+DROP TABLE IF EXISTS tdb_ddl_t;
+SET GLOBAL log_error_verbosity = @save_log_error_verbosity;
+# Done.

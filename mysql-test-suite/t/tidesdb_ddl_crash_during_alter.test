@@ -1,0 +1,52 @@
+--source suite/tidesdb/include/tidesdb_ddl_helpers.inc
+--source include/have_debug.inc
+--source include/not_valgrind.inc
+#
+# A-5 atomic-DDL Task 12: crash during ALTER TABLE.
+#
+# Inject DBUG_SUICIDE into ha_tidesdb::inplace_alter_table() right after
+# prepare_inplace_alter_table created the new index CFs but BEFORE
+# commit_inplace_alter_table swaps anything. After restart the pre-ALTER
+# schema must be intact (no new index visible to SQL) and the original
+# data must be readable.
+#
+# Deviation from the spec text: the plan example used ADD COLUMN, but
+# pure column additions take MySQL's INSTANT path which short-circuits
+# inplace_alter_table entirely (the function returns false before the
+# hook is reached because ctx->add_cfs is empty). ADD INDEX is the
+# minimal SQL that routes through the full prepare -> inplace -> commit
+# inplace-alter pipeline our hook lives on, so we test that instead.
+# The post-restart invariant is the same: original schema + data
+# preserved, any partially-created index CFs become orphans that the
+# reconciler quarantines.
+#
+
+SET @save_log_error_verbosity = @@global.log_error_verbosity;
+SET GLOBAL log_error_verbosity = 3;
+SET GLOBAL tidesdb_orphan_action = 'quarantine';
+
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY, v VARCHAR(64)) ENGINE=TIDESDB;
+INSERT INTO tdb_ddl_t VALUES (1, 'one'), (2, 'two');
+
+SET SESSION DEBUG = '+d,tidesdb_crash_mid_inplace_alter';
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+
+--error 0,2013,CR_SERVER_LOST,CR_SERVER_GONE_ERROR
+ALTER TABLE tdb_ddl_t ADD INDEX idx_v (v);
+
+--enable_reconnect
+--exec echo "restart" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+# After restart: original two-column schema preserved, the new index
+# is NOT present (the ALTER DD txn rolled back). Data intact.
+SHOW CREATE TABLE tdb_ddl_t;
+SELECT * FROM tdb_ddl_t ORDER BY id;
+
+DROP TABLE tdb_ddl_t;
+
+SET GLOBAL log_error_verbosity = @save_log_error_verbosity;
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

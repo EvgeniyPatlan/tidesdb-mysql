@@ -1,0 +1,23 @@
+# Expected output assumes Debug build; this test SKIPS on Release.
+SET @save_log_error_verbosity = @@global.log_error_verbosity;
+SET GLOBAL log_error_verbosity = 3;
+SET GLOBAL tidesdb_orphan_action = 'quarantine';
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY, v VARCHAR(64)) ENGINE=TIDESDB;
+INSERT INTO tdb_ddl_t VALUES (1, 'one'), (2, 'two');
+SET SESSION DEBUG = '+d,tidesdb_crash_mid_inplace_alter';
+ALTER TABLE tdb_ddl_t ADD INDEX idx_v (v);
+ERROR HY000: Lost connection to MySQL server during query
+SHOW CREATE TABLE tdb_ddl_t;
+Table	Create Table
+tdb_ddl_t	CREATE TABLE `tdb_ddl_t` (
+  `id` int NOT NULL,
+  `v` varchar(64) DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+SELECT * FROM tdb_ddl_t ORDER BY id;
+id	v
+1	one
+2	two
+DROP TABLE tdb_ddl_t;
+SET GLOBAL log_error_verbosity = @save_log_error_verbosity;
+# Done.

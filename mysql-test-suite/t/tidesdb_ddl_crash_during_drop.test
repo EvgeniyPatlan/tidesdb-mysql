@@ -1,0 +1,59 @@
+--source suite/tidesdb/include/tidesdb_ddl_helpers.inc
+--source include/have_debug.inc
+--source include/not_valgrind.inc
+#
+# A-5 atomic-DDL Task 12: crash during DROP TABLE.
+#
+# Inject DBUG_SUICIDE into ha_tidesdb::delete_table() AFTER prepare_drop
+# signals the SDI side but BEFORE tidesdb_drop_table_impl removes the
+# actual CFs. After restart the reconciler should see one of two
+# discrepancies depending on whether the SQL-layer DD txn already
+# committed (orphan CFs, DD row gone) or rolled back (orphan dd::Table,
+# CFs still present). Either surfaces in the error log.
+#
+
+SET @save_log_error_verbosity = @@global.log_error_verbosity;
+SET GLOBAL log_error_verbosity = 3;
+SET GLOBAL tidesdb_orphan_action = 'quarantine';
+
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY) ENGINE=TIDESDB;
+INSERT INTO tdb_ddl_t VALUES (1);
+
+SET SESSION DEBUG = '+d,tidesdb_crash_after_dd_commit_before_cf_drop';
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+
+--error 0,2013,CR_SERVER_LOST,CR_SERVER_GONE_ERROR
+DROP TABLE tdb_ddl_t;
+
+--enable_reconnect
+--exec echo "restart" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SET GLOBAL log_error_verbosity = 3;
+SET GLOBAL tidesdb_orphan_action = 'quarantine';
+
+--exec : > $MYSQLTEST_VARDIR/log/mysqld.1.err
+
+SET @@global.DEBUG = '+d,tidesdb_run_reconcile';
+--disable_result_log
+SHOW ENGINE TIDESDB STATUS;
+--enable_result_log
+SET @@global.DEBUG = '';
+
+# Either "orphan dd::Table" or "quarantined orphan CF" should surface --
+# which one depends on which side of the crash boundary committed first.
+# On Release builds neither fires (no crash, DROP succeeded), so the count
+# may be 0; accept that via `|| true`.
+let $log_file = $MYSQLTEST_VARDIR/log/mysqld.1.err;
+--exec grep -cE "orphan dd::Table|quarantined orphan CF" $log_file || true
+
+# Cleanup leftover row regardless of which crash branch was taken.
+--disable_warnings
+DROP TABLE IF EXISTS tdb_ddl_t;
+--enable_warnings
+
+SET GLOBAL log_error_verbosity = @save_log_error_verbosity;
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

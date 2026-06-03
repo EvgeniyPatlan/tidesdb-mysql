@@ -285,6 +285,16 @@ bool ha_tidesdb::inplace_alter_table(
     if (!ctx || ctx->add_cfs.empty())
         DBUG_RETURN(false); /* Nothing to populate (drop-only or instant) */
 
+    /* Atomic-DDL Task 12: crash-injection point.
+       prepare_inplace_alter_table created the new index CFs and staged
+       the post-ALTER se_private_data into ctx, but commit_inplace_alter_table
+       has not run yet -- the dd::Table swap and CF drop-of-old-indexes are
+       still ahead. On crash here the pre-ALTER schema must remain intact
+       after restart, because the DD-side ALTER txn has not committed and
+       the engine-side CFs we created sit as orphans that the reconciler
+       will sweep. */
+    DBUG_EXECUTE_IF("tidesdb_crash_mid_inplace_alter", DBUG_SUICIDE(););
+
     /* We mark all columns readable on the altered table since we read
        fields via make_sort_key_part during index key construction. */
     my_bitmap_map *old_map = tmp_use_all_columns(altered_table, altered_table->read_set);

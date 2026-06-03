@@ -4295,6 +4295,15 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
      * DROP TABLE can locate the underlying CF. */
     schema_cf_store_frm(name);
 
+    /* Atomic-DDL Task 12: crash-injection point.
+       The TidesDB CFs (main + secondary indexes) have been created in the
+       engine, but neither the SQL-layer DD txn for dd::Table nor our
+       se_private_data Properties have been written yet. On crash here the
+       engine state has orphan CFs with no matching DD row -- which is
+       exactly the recovery scenario the reconciler's "orphan CF" path
+       handles after restart (apply_delta drops or quarantines them). */
+    DBUG_EXECUTE_IF("tidesdb_crash_after_cf_create", DBUG_SUICIDE(););
+
     /* Atomic-DDL (A-5) Task 6: persist bookkeeping (cf_name, schema
        fingerprint, options checksum, atomic_ddl marker, creation timestamp)
        into dd::Table::se_private_data so DROP, OPEN, and inplace-ALTER can
@@ -8856,6 +8865,18 @@ int ha_tidesdb::delete_table(const char *name, const dd::Table *table_def)
         sql_print_error("[TIDESDB] atomic-ddl prepare_drop failed for '%s'", name);
         DBUG_RETURN(HA_ERR_GENERIC);
     }
+
+    /* Atomic-DDL Task 12: crash-injection point.
+       prepare_drop has signalled the SDI / DD side that the row is going
+       away (in v0.4.0 this is observation-only on the engine txn until
+       HTON_SUPPORTS_ATOMIC_DDL flips), but tidesdb_drop_table_impl below
+       has NOT yet removed the actual CFs. On crash here the post-restart
+       state is "DD-side rolled back to pre-drop OR was committed mid-flight,
+       engine still has the CFs". The reconciler classifies whichever
+       discrepancy survives -- orphan dd::Table (DD kept the row, CFs gone)
+       or orphan CF (DD dropped the row, CFs still present) -- and surfaces
+       the matching log line. */
+    DBUG_EXECUTE_IF("tidesdb_crash_after_dd_commit_before_cf_drop", DBUG_SUICIDE(););
 
     DBUG_RETURN(tidesdb_drop_table_impl(name));
 }
