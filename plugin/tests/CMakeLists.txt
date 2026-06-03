@@ -1,15 +1,16 @@
 # Pure-function unit tests for the atomic-DDL surface. Linked against gtest
 # directly (no MySQL test harness) so they run in seconds outside the MTR loop.
 #
-# We re-compile tidesdb_atomic_ddl.cc here rather than linking ha_tidesdb.so
-# so the helper tests don't drag in the whole plugin. Because the TU includes
-# sql/handler.h transitively, we also inherit the include path, compile flags,
-# and compile definitions from the `tidesdb` plugin target (zlib, rapidjson,
-# etc.) via generator expressions.
+# We compile only tidesdb_atomic_ddl_pure.cc here — the server-free sibling
+# of tidesdb_atomic_ddl.cc that holds the genuinely pure helpers
+# (SdiStore::pack_key, compute_delta_pure). The production TU pulls in
+# sql/dd, sql/log, my_dbug, g_engine_ctx, and the rest of the server
+# surface, which a test binary cannot link without the full mysqld.
 #
-# We also link the TidesDB library so the SdiStore methods (which now call
-# tidesdb_txn_* / tidesdb_iter_*) resolve, plus a tiny test_server_stubs.cc
-# that provides a no-op log_message() in place of the mysqld symbol.
+# Because the test sources include sql/handler.h transitively, we inherit
+# the include path, compile flags, and compile definitions from the
+# `tidesdb` plugin target (zlib, rapidjson, gnu++23, etc.) via generator
+# expressions.
 
 find_package(GTest)
 if(NOT GTest_FOUND)
@@ -24,8 +25,9 @@ endif()
 
 add_executable(tidesdb_atomic_ddl_tests
     test_sdi_pack_key.cc
+    test_reconciler_delta.cc
     test_server_stubs.cc
-    ${CMAKE_SOURCE_DIR}/storage/tidesdb/tidesdb_atomic_ddl.cc
+    ${CMAKE_SOURCE_DIR}/storage/tidesdb/tidesdb_atomic_ddl_pure.cc
 )
 
 # Inherit the plugin target's include paths and compile definitions. This is
@@ -41,13 +43,10 @@ target_compile_definitions(tidesdb_atomic_ddl_tests PRIVATE
 # compiles the same way the production TU does.
 target_compile_options(tidesdb_atomic_ddl_tests PRIVATE -Wno-error -fpermissive)
 
-# Pull in the TidesDB library for tidesdb_txn_*/tidesdb_iter_* symbols. The
-# pack_key test does not need them, but the TU it lives in references them.
-# libtidesdb.a depends on zstd/lz4/snappy + pthread; link the same set of
-# libs as the plugin itself so the test binary resolves cleanly.
+# The pure TU has no TidesDB engine calls (no tidesdb_txn_*, no
+# tidesdb_iter_*) so we don't need ${TIDESDB_LIBS}. Just gtest + pthread.
 target_link_libraries(tidesdb_atomic_ddl_tests PRIVATE
     GTest::gtest GTest::gtest_main
-    ${TIDESDB_LIBS}
     pthread
 )
 

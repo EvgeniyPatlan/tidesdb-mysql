@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,15 @@ struct ReconcileDelta {
     std::vector<std::string> orphan_cfs;
     std::vector<std::string> orphan_dd_tables; /* qualified "db.table" */
 };
+
+/* Side-effect-free symmetric difference of expected (DD-derived) CFs
+   vs actual (engine-derived) CFs. CFs whose name starts with '__' are
+   ignored (covers the __tidesdb_sdi metadata CF and __orphan_<epoch>_*
+   quarantined CFs). Exposed for unit testing; the production
+   DdSyncReconciler::compute_delta() calls this after enumerating both
+   sides. */
+ReconcileDelta compute_delta_pure(const std::set<std::string> &expected_cfs,
+                                   const std::set<std::string> &actual_cfs);
 
 class DdSyncReconciler {
    public:

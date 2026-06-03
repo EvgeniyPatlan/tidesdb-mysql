@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <set>
 #include <string>
 
 /* my_rapidjson_size_t.h MUST precede any rapidjson header so the typedef of
@@ -294,36 +295,26 @@ bool SdiStore::list_keys(sdi_vector_t &out) {
     tidesdb_txn_free(txn);
     return true;
 }
-/*
-  Pack a (type, id) SDI key into a fixed-length big-endian byte string so the
-  metadata CF's natural lexicographic byte-order is also the logical
-  (type, id) sort order. That makes list_keys() a single forward scan with no
-  client-side sort.
-
-  Layout (12 bytes total):
-    bytes 0..3   uint32 type, big-endian
-    bytes 4..11  uint64 id,   big-endian
-*/
-std::string SdiStore::pack_key(const sdi_key_t &k) {
-    std::string out;
-    out.resize(kSdiPackedKeyLen);
-    uint8_t *p = reinterpret_cast<uint8_t *>(&out[0]);
-    p[0] = static_cast<uint8_t>(k.type >> 24);
-    p[1] = static_cast<uint8_t>(k.type >> 16);
-    p[2] = static_cast<uint8_t>(k.type >> 8);
-    p[3] = static_cast<uint8_t>(k.type);
-    for (int i = 0; i < 8; i++) {
-        p[4 + i] = static_cast<uint8_t>(k.id >> ((7 - i) * 8));
-    }
-    return out;
-}
+/* SdiStore::pack_key lives in tidesdb_atomic_ddl_pure.cc (it is a genuinely
+   side-effect-free byte-packer with no MySQL or TidesDB dependencies; the
+   pure TU is what the gtest target links against). */
 
 /* -------------------- DdSyncReconciler -------------------- */
+
+/* compute_delta_pure lives in tidesdb_atomic_ddl_pure.cc — a deliberately
+   server-free TU so the gtest target can link it without dragging in
+   sql/dd, sql/log, my_dbug, or g_engine_ctx. The header declares it. */
 
 DdSyncReconciler::DdSyncReconciler(tidesdb_t *engine, dd::cache::Dictionary_client *dc)
     : engine_(engine), dc_(dc) {}
 
-ReconcileDelta DdSyncReconciler::compute_delta() { return {}; }
+ReconcileDelta DdSyncReconciler::compute_delta() {
+    /* Task 11 will populate `expected` (from dd::Catalog enumeration filtered
+       by ENGINE=TIDESDB) and `actual` (from the TidesDB CF list), then
+       delegate to compute_delta_pure(). The pure helper is fully
+       implemented and unit-tested in plugin/tests/test_reconciler_delta.cc. */
+    return {};
+}
 bool DdSyncReconciler::apply_delta(const ReconcileDelta &) { return true; }
 
 /* -------------------- TidesdbAtomicDdlBridge -------------------- */
