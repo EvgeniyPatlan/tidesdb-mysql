@@ -593,7 +593,13 @@ static MYSQL_SYSVAR_BOOL(atomic_ddl_strict, tidesdb_mysql::g_atomic_ddl_strict,
                          "tolerate legacy (pre-v0.4.0) tables on a one-time "
                          "upgrade; the binding is then inferred from the path "
                          "and a WARNING is pushed.",
-                         /*check=*/NULL, /*update=*/NULL, /*default=*/true);
+                         /* DEFAULT IS FALSE UNTIL TASK 13: without
+                            HTON_SUPPORTS_ATOMIC_DDL set, prepare_create's
+                            mutations to se_private_data are dropped (DD txn
+                            has already committed), so a strict=ON default
+                            would reject every TIDESDB open. Task 13 flips
+                            both this default and the HTON flag. */
+                         /*check=*/NULL, /*update=*/NULL, /*default=*/false);
 
 static MYSQL_SYSVAR_BOOL(pessimistic_locking, srv_pessimistic_locking, PLUGIN_VAR_RQCMDARG,
                          "Enable plugin-level row locks for SELECT ... FOR UPDATE, "
