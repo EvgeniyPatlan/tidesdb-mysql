@@ -48,9 +48,15 @@
 #include "sql/sql_class.h"
 #include "sql/table.h"
 
-#include "tidesdb_engine_context.h"  /* tdb_get_engine */
+#include "tidesdb_atomic_ddl.h"      /* TidesdbAtomicDdlBridge, serialize_sdi */
+#include "tidesdb_engine_context.h"  /* tdb_get_engine, g_engine_ctx */
 #include "tidesdb_fts.h"             /* is_fts_index */
 #include "tidesdb_spatial.h"         /* is_spatial_index */
+
+#include "sql/dd/properties.h"       /* dd::Properties (for clear() call) */
+#include "sql/dd/string_type.h"      /* dd::String_type */
+#include "sql/dd/types/table.h"      /* dd::Table::set_se_private_data, id() */
+#include "sql/log.h"                 /* sql_print_error */
 
 /*
   Classify ALTER TABLE operations into INSTANT / INPLACE / COPY.
@@ -155,7 +161,7 @@ bool ha_tidesdb::prepare_inplace_alter_table(
     TABLE *altered_table,
     Alter_inplace_info *ha_alter_info,
     const dd::Table *old_table_def [[maybe_unused]],
-    dd::Table *new_table_def [[maybe_unused]])
+    dd::Table *new_table_def)
 {
     DBUG_ENTER("ha_tidesdb::prepare_inplace_alter_table");
 
@@ -234,6 +240,28 @@ bool ha_tidesdb::prepare_inplace_alter_table(
             {
                 ctx->drop_cf_names.push_back(share->idx_cf_names[old_key_num]);
             }
+        }
+    }
+
+    /* Atomic-DDL participation (Task 9): pre-stage the post-ALTER
+       se_private_data into the ctx so commit_inplace_alter_table can
+       stamp it onto new_table_def atomically with the CF swap. We
+       compute here -- in prepare -- so a failure surfaces before any CFs
+       have been created/dropped, keeping the rollback path simple.
+
+       new_table_def is NULL on temp-table / fast-path ALTERs that bypass
+       the DD; nothing to stage in that case. */
+    if (new_table_def)
+    {
+        if (!tidesdb_mysql::TidesdbAtomicDdlBridge::recompute_se_private_data(
+                *new_table_def, ctx->new_se_private_serialized))
+        {
+            sql_print_error(
+                "[TIDESDB] inplace ALTER prepare: failed to compute "
+                "new se_private_data");
+            my_error(ER_INTERNAL_ERROR, MYF(0),
+                     "[TIDESDB] failed to compute post-ALTER se_private_data");
+            DBUG_RETURN(true);
         }
     }
 
@@ -639,7 +667,7 @@ bool ha_tidesdb::commit_inplace_alter_table(
     Alter_inplace_info *ha_alter_info,
     bool commit,
     const dd::Table *old_table_def [[maybe_unused]],
-    dd::Table *new_table_def [[maybe_unused]])
+    dd::Table *new_table_def)
 {
     DBUG_ENTER("ha_tidesdb::commit_inplace_alter_table");
 
@@ -832,6 +860,68 @@ bool ha_tidesdb::commit_inplace_alter_table(
        bytes for MariaDB discover_table; under MySQL it just records the
        table name so DROP TABLE can find the CF.) */
     schema_cf_store_frm(table->s->path.str);
+
+    /* Atomic-DDL participation (Task 9): stamp the pre-staged
+       se_private_data onto new_table_def and emit updated SDI. We do
+       this on the commit==true path only -- rollback above already
+       returned without touching new_table_def, so a failed ALTER leaves
+       the DD's prior se_private_data intact.
+
+       Both operations are best-effort-failures-warn rather than
+       failures-abort: the data CF has already been swapped; failing the
+       ALTER at this stage would leave the engine and DD diverged. The
+       set_se_private_data path is the primary atomic-DDL contract --
+       on a failure here we log ERROR and return true so the SQL layer
+       rolls the DD txn back; that keeps the persisted DD aligned with
+       the engine's pre-ALTER state if HTON_SUPPORTS_ATOMIC_DDL flips
+       in Task 13.
+
+       The SDI write is downgraded to a WARNING because (a) the prior
+       SDI is still queryable and reflects the now-old schema (which
+       SHOW CREATE TABLE will overwrite when the server's own
+       sdi_set runs), and (b) Task 13 will wire the SDI emit through
+       the handlerton's sdi_set hook anyway, so this is a defensive
+       belt-and-suspenders write rather than the source of truth. */
+    if (new_table_def && !ctx->new_se_private_serialized.empty())
+    {
+        /* set_se_private_data delegates to insert_values, which asserts
+           the target Properties is empty (debug build). Under Task 13's
+           HTON_SUPPORTS_ATOMIC_DDL=ON, new_table_def carries over the
+           Properties prepare_create wrote (CREATE) or the prior commit
+           wrote (previous ALTER), so we must clear before re-populating.
+           Today (strict=OFF default, HTON flag still OFF) the DD txn
+           hasn't committed yet at commit_inplace_alter_table time, so
+           any earlier writes ARE on the same in-memory object; clearing
+           is still the right call. */
+        new_table_def->se_private_data().clear();
+        if (new_table_def->set_se_private_data(
+                dd::String_type(ctx->new_se_private_serialized.c_str())))
+        {
+            sql_print_error(
+                "[TIDESDB] inplace ALTER commit: set_se_private_data failed");
+            my_error(ER_INTERNAL_ERROR, MYF(0),
+                     "[TIDESDB] inplace ALTER commit: set_se_private_data failed");
+            DBUG_RETURN(true);
+        }
+
+        if (g_engine_ctx.sdi)
+        {
+            sdi_key_t k{};
+            k.type = SDI_TYPE_TABLE;
+            k.id   = static_cast<uint64>(new_table_def->id());
+            std::string sdi_json = tidesdb_mysql::serialize_sdi(new_table_def);
+            if (!g_engine_ctx.sdi->put(
+                    k, sdi_json.data(), sdi_json.size()))
+            {
+                sql_print_warning(
+                    "[TIDESDB] inplace ALTER commit: SDI put failed for "
+                    "dd::Table id=%llu (engine schema unchanged; the "
+                    "server's own sdi_set on commit will re-emit)",
+                    static_cast<unsigned long long>(k.id));
+                /* Not fatal: server sdi_set still fires; this is belt+suspenders. */
+            }
+        }
+    }
 
     DBUG_RETURN(false);
 }

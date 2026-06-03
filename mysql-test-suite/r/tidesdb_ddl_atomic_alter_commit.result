@@ -1,0 +1,17 @@
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY, v VARCHAR(64)) ENGINE=TIDESDB;
+INSERT INTO tdb_ddl_t VALUES (1, 'one'), (2, 'two');
+ALTER TABLE tdb_ddl_t ADD COLUMN extra INT;
+SELECT * FROM tdb_ddl_t ORDER BY id;
+id	v	extra
+1	one	NULL
+2	two	NULL
+SHOW CREATE TABLE tdb_ddl_t;
+Table	Create Table
+tdb_ddl_t	CREATE TABLE `tdb_ddl_t` (
+  `id` int NOT NULL,
+  `v` varchar(64) DEFAULT NULL,
+  `extra` int DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+DROP TABLE tdb_ddl_t;
+# Done.

@@ -104,6 +104,21 @@ class TidesdbAtomicDdlBridge {
     static bool validate_open(THD *thd, const dd::Table *table_def,
                               const char *path_inferred_cf);
 
+    /* Recompute the serialized se_private_data for the post-ALTER schema.
+       Called from prepare_inplace_alter_table to pre-stage the value that
+       commit_inplace_alter_table will stamp onto new_table_def when the
+       SQL layer signals commit=true.
+
+       Preserves cf_name and created_at from the old DD (CF identity does
+       not change for inplace ALTER); recomputes fingerprint and
+       options_csum from the new schema; bumps schema_version by 1.
+
+       Returns true on success; out_serialized then contains a raw_string()
+       suitable for dd::Table::set_se_private_data. Returns false only if
+       the Properties_impl could not be constructed (should not happen). */
+    static bool recompute_se_private_data(const dd::Table &new_def,
+                                          std::string &out_serialized);
+
 #ifndef NDEBUG
     /* Debug-only: dump the most-recently-written se_private_data Properties
        to the error log via sql_print_information. Each entry prints as a
@@ -143,6 +158,16 @@ struct SdiCallbacks {
 
 /* Tablespace registration helper. Returns nullptr on failure. */
 const Plugin_tablespace *register_tablespace();
+
+/* Minimal SDI serializer for inplace ALTER commit.
+
+   v0.4.0 scope: emits a compact rapidjson object with the engine name,
+   schema_id, table name, and a per-column array of (name, type, nullable).
+   The full dd::sdi::serialize integration (which also covers indexes,
+   foreign keys, partitions, and DD versioning) is deferred to v0.5.0.
+
+   Returns "{}" when t is NULL. */
+std::string serialize_sdi(const dd::Table *t);
 
 /* Sysvar enum values. */
 enum class OrphanAction { Drop, Quarantine, LogOnly };

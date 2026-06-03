@@ -40,6 +40,7 @@
 #include "sha2.h"                      /* SHA_EVP256, SHA256_DIGEST_LENGTH */
 #include "sql/auth/sql_security_ctx.h" /* Security_context::priv_user/host_or_ip */
 #include "sql/current_thd.h"           /* unused but kept for parity */
+#include "sql/dd/impl/properties_impl.h" /* dd::Properties_impl (concrete subclass) */
 #include "sql/dd/properties.h"         /* dd::Properties */
 #include "sql/dd/string_type.h"        /* dd::String_type */
 #include "sql/dd/types/column.h"       /* dd::Column */
@@ -688,6 +689,157 @@ bool TidesdbAtomicDdlBridge::debug_dump_last_se_private_data() {
     return emitted;
 }
 #endif
+
+/*
+  Recompute the serialized se_private_data for the post-ALTER schema.
+
+  Inplace ALTER pre-stages this in prepare_inplace_alter_table; the
+  commit phase then writes it onto new_table_def via set_se_private_data
+  inside the same DD transaction that swaps the table definition. The
+  rollback phase leaves new_table_def untouched, so a failed ALTER does
+  not leak partial Properties state into the DD.
+
+  Preservation rules:
+    * cf_name     -- CARRIED OVER unchanged. inplace ALTER (ADD/DROP
+                     INDEX, INSTANT column ops) keeps the same data CF;
+                     only schema-level metadata changes.
+    * created_at  -- CARRIED OVER. It's a creation timestamp, not an
+                     update timestamp. A future schema_history entry
+                     could be added separately if needed.
+    * fingerprint -- RECOMPUTED from new_def's column list. This is the
+                     whole point of bumping after ALTER -- a subsequent
+                     open() can detect "table is bound to this CF but
+                     the schema fingerprint matches what's stored", or
+                     "schema has drifted from what we created" in the
+                     SDI cross-check pass scheduled for v0.5.0.
+    * options_csum -- RECOMPUTED from new_def's engine_attribute JSON.
+    * schema_version -- BUMPED by 1 (starts at 0 if the persisted entry
+                     is missing; legacy prepare_create did not write it).
+    * atomic_ddl  -- always "1" (this row continues to participate in
+                     atomic DDL).
+
+  Same string-allocator discipline as prepare_create: pass const char*
+  for literals; wrap computed std::strings in dd::String_type(c_str())
+  so Properties::set hits the virtual overload that takes two
+  String_types, never the templated set<Value_type> path that would
+  instantiate to_str<std::string> (undefined symbol -- see the long
+  comment in prepare_create above for why).
+
+  Returns true on success; out_serialized then holds the raw_string()
+  the caller stores in the ctx. Returns false only if the Properties_impl
+  construction fails (defensive -- the default ctor never throws in
+  practice, but we keep the contract symmetric with prepare_create).
+*/
+bool TidesdbAtomicDdlBridge::recompute_se_private_data(const dd::Table &new_def,
+                                                       std::string &out_serialized) {
+    dd::Properties_impl tmp;
+
+    /* cf_name: preserve. If for some reason it isn't set (e.g. legacy
+       row that predates prepare_create -- shouldn't happen in practice
+       because validate_open under strict=ON rejects such tables -- we
+       still emit an empty value rather than crashing.) */
+    dd::String_type old_cf;
+    if (new_def.se_private_data().exists("cf_name")) {
+        if (new_def.se_private_data().get("cf_name", &old_cf)) {
+            old_cf.clear();
+        }
+    }
+    tmp.set("cf_name", old_cf);
+
+    /* Recompute schema fingerprint + options checksum from the new
+       schema. Same helpers prepare_create uses, so format stays in
+       lockstep. */
+    tmp.set("fingerprint",
+            dd::String_type(compute_schema_fingerprint(new_def).c_str()));
+    tmp.set("options_csum",
+            dd::String_type(std::to_string(compute_options_checksum(new_def)).c_str()));
+
+    /* atomic_ddl flag stays "1". */
+    tmp.set("atomic_ddl", "1");
+
+    /* Preserve created_at, default to "now" if missing. Pre-Task-9
+       prepare_create rows had created_at; legacy rows do not. */
+    dd::String_type created;
+    if (new_def.se_private_data().exists("created_at")) {
+        if (new_def.se_private_data().get("created_at", &created)) {
+            created.clear();
+        }
+    }
+    if (created.empty()) {
+        created = dd::String_type(
+            std::to_string(static_cast<long long>(time(nullptr))).c_str());
+    }
+    tmp.set("created_at", created);
+
+    /* schema_version: read-and-bump. Legacy rows lack this key -- start
+       them at 1 (the *next* version after the implicit v0 they were
+       created at). */
+    uint64_t schema_version = 0;
+    if (new_def.se_private_data().exists("schema_version")) {
+        dd::String_type sv;
+        if (!new_def.se_private_data().get("schema_version", &sv)) {
+            schema_version = strtoull(sv.c_str(), nullptr, 10);
+        }
+    }
+    tmp.set("schema_version",
+            dd::String_type(std::to_string(schema_version + 1).c_str()));
+
+    /* raw_string() returns dd::String_type (basic_string with the DD
+       allocator). Round-trip via c_str() so the caller stores a plain
+       std::string in the ctx without dragging allocator-template
+       definitions across TUs. */
+    const dd::String_type raw = tmp.raw_string();
+    out_serialized.assign(raw.c_str(), raw.length());
+    return true;
+}
+
+/*
+  Minimal SDI serializer used by inplace ALTER commit.
+
+  v0.4.0 scope: emit a compact rapidjson object with engine name,
+  schema_id, table name, and a per-column array of (name, type,
+  nullable). Full dd::sdi::serialize integration (which also covers
+  indexes, foreign keys, partitions, and DD version stamping) is
+  scheduled for v0.5.0 per the spec; this is the minimum shape an
+  external reader needs to confirm the SDI reflects the post-ALTER
+  schema.
+
+  Same rapidjson include alignment as the rest of this TU
+  (my_rapidjson_size_t.h is included near the top). t == nullptr is
+  treated defensively -- caller should never pass it, but returning
+  "{}" is safer than dereferencing.
+*/
+std::string serialize_sdi(const dd::Table *t) {
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    if (!t) {
+        w.EndObject();
+        return std::string(buf.GetString(), buf.GetSize());
+    }
+    w.Key("engine");
+    w.String("TIDESDB");
+    w.Key("schema_id");
+    w.Uint64(static_cast<uint64_t>(t->schema_id()));
+    w.Key("name");
+    w.String(t->name().c_str());
+    w.Key("columns");
+    w.StartArray();
+    for (const dd::Column *c : t->columns()) {
+        if (!c) continue;
+        w.StartObject();
+        w.Key("name");
+        w.String(c->name().c_str());
+        w.Key("type");
+        w.Int(static_cast<int>(c->type()));
+        w.Key("nullable");
+        w.Bool(c->is_nullable());
+        w.EndObject();
+    }
+    w.EndArray();
+    w.EndObject();
+    return std::string(buf.GetString(), buf.GetSize());
+}
 
 /* -------------------- DdseStubs -------------------- */
 
