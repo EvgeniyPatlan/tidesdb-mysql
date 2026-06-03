@@ -88,6 +88,19 @@ class TidesdbAtomicDdlBridge {
     static bool prepare_create(THD *thd, dd::Table *new_table_def, const char *cf_name);
     /* Called from ha_tidesdb::delete_table() before tidesdb_txn_column_family_drop. */
     static bool prepare_drop(THD *thd, const dd::Table *table_def);
+
+#ifndef NDEBUG
+    /* Debug-only: dump the most-recently-written se_private_data Properties
+       to the error log via sql_print_information. Each entry prints as a
+       single INFO line "[TIDESDB] se_private_data key=<k> val=<v>". Used
+       by the tidesdb_dump_se_private_data DBUG hook in tidesdb_show_status
+       so MTR can grep for the expected keys without needing to surface
+       the DD's se_private_data through information_schema. Returns true
+       if at least one line was emitted (i.e. prepare_create has been
+       called at least once); false if no table has been created yet
+       this server lifetime. */
+    static bool debug_dump_last_se_private_data();
+#endif
 };
 
 struct DdseStubs {

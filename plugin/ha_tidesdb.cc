@@ -2190,6 +2190,19 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
         }
     });
 
+    /* Atomic-DDL (A-5) Task 6: debug-only readback of the last-created
+       table's dd::Table::se_private_data. MySQL 9.7 hides this column
+       from information_schema for non-InnoDB engines, so the MTR test
+       arms this keyword right after CREATE TABLE and SHOW ENGINE STATUS
+       then logs one INFO line per (key, value) entry. The test greps the
+       error log for the five expected keys (cf_name, fingerprint,
+       options_csum, atomic_ddl, created_at). Compiled out under NDEBUG. */
+#ifndef NDEBUG
+    DBUG_EXECUTE_IF("tidesdb_dump_se_private_data", {
+        (void)tidesdb_mysql::TidesdbAtomicDdlBridge::debug_dump_last_se_private_data();
+    });
+#endif
+
     /* We refresh SHOW GLOBAL STATUS variables alongside the human-readable output */
     tidesdb_refresh_status_vars();
 
@@ -4008,7 +4021,8 @@ int ha_tidesdb::close(void)
     DBUG_RETURN(0);
 }
 
-int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *create_info, dd::Table *)
+int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *create_info,
+                       dd::Table *table_def)
 {
     DBUG_ENTER("ha_tidesdb::create");
 
@@ -4078,6 +4092,25 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
      * object-store replica recovery. For now just record the table name so
      * DROP TABLE can locate the underlying CF. */
     schema_cf_store_frm(name);
+
+    /* Atomic-DDL (A-5) Task 6: persist bookkeeping (cf_name, schema
+       fingerprint, options checksum, atomic_ddl marker, creation timestamp)
+       into dd::Table::se_private_data so DROP, OPEN, and inplace-ALTER can
+       cross-check the CF binding and schema shape against what we created.
+       The DBUG keyword tidesdb_fail_after_se_private_data forces this to
+       return false so the rollback path can be tested without provoking a
+       real engine failure. On failure we propagate HA_ERR_GENERIC; the
+       existing CF and any index CFs we created above are not explicitly
+       removed here -- those become orphans that the Task 7+
+       DdSyncReconciler will sweep on next plugin load. */
+    if (table_def) {
+        if (!tidesdb_mysql::TidesdbAtomicDdlBridge::prepare_create(
+                ha_thd(), table_def, cf_name.c_str())) {
+            sql_print_error("[TIDESDB] atomic-ddl prepare_create failed for '%s'",
+                            cf_name.c_str());
+            DBUG_RETURN(HA_ERR_GENERIC);
+        }
+    }
 
     DBUG_RETURN(0);
 }

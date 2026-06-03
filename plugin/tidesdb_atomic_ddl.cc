@@ -21,10 +21,25 @@
 #include "tidesdb_atomic_ddl.h"
 
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <string>
 
+/* my_rapidjson_size_t.h MUST precede any rapidjson header so the typedef of
+   rapidjson::SizeType matches what the rest of MySQL is built with. See the
+   long comment in ha_tidesdb.cc explaining the ABI alignment requirement. */
+#include "my_rapidjson_size_t.h"
+#include <rapidjson/document.h>
+#include <rapidjson/stringbuffer.h>
+#include <rapidjson/writer.h>
+
+#include "my_checksum.h"               /* my_checksum (CRC32) */
 #include "mysql_version.h"             /* MYSQL_VERSION_ID */
+#include "sha2.h"                      /* SHA_EVP256, SHA256_DIGEST_LENGTH */
+#include "sql/dd/properties.h"         /* dd::Properties */
+#include "sql/dd/types/column.h"       /* dd::Column */
+#include "sql/dd/types/table.h"        /* dd::Table */
 #include "sql/dd/types/tablespace.h"   /* dd::Tablespace::name() */
 #include "sql/handler.h"               /* handlerton, sdi_*_t, dict_init_mode_t */
 #include "sql/log.h"                   /* sql_print_error / sql_print_information */
@@ -297,8 +312,184 @@ bool DdSyncReconciler::apply_delta(const ReconcileDelta &) { return true; }
 
 /* -------------------- TidesdbAtomicDdlBridge -------------------- */
 
-bool TidesdbAtomicDdlBridge::prepare_create(THD *, dd::Table *, const char *) { return true; }
+namespace {
+
+/*
+  SHA-256 over a canonical serialisation of the column list:
+    for each column in declaration order, write
+      <name>|<type byte>|<char_length 8 bytes LE>|<is_nullable byte>|<collation_id 8 bytes LE>
+  Then hex-encode the 32-byte digest.
+
+  We deliberately omit character_set_id: dd::Column exposes only
+  collation_id() in MySQL 9.7, and the collation already uniquely identifies
+  the charset. We also omit comment, default values, and auto-increment
+  state -- those don't change the on-disk row layout that TidesDB's CF
+  speaks, so they shouldn't invalidate the fingerprint.
+
+  SHA_EVP256 is defined in include/sha2.h and bridges to OpenSSL EVP. The
+  plugin is a module loaded into mysqld; mysqld already links OpenSSL
+  crypto, so the symbol resolves at runtime without any extra dependency
+  on the plugin's CMakeLists. (Same pattern as sql/sql_digest.cc:246.)
+*/
+std::string compute_schema_fingerprint(const dd::Table &t) {
+    std::string buf;
+    /* Reserve a modest amount so most schemas avoid reallocations. */
+    buf.reserve(256);
+    for (const dd::Column *col : t.columns()) {
+        if (!col) continue;
+        buf.append(col->name().c_str(), col->name().length());
+        buf.push_back('|');
+        const uint8_t type_byte = static_cast<uint8_t>(col->type());
+        buf.push_back(static_cast<char>(type_byte));
+        buf.push_back('|');
+        uint64_t len = static_cast<uint64_t>(col->char_length());
+        for (int i = 0; i < 8; i++) {
+            buf.push_back(static_cast<char>((len >> (i * 8)) & 0xFF));
+        }
+        buf.push_back('|');
+        buf.push_back(col->is_nullable() ? 1 : 0);
+        buf.push_back('|');
+        uint64_t cid = static_cast<uint64_t>(col->collation_id());
+        for (int i = 0; i < 8; i++) {
+            buf.push_back(static_cast<char>((cid >> (i * 8)) & 0xFF));
+        }
+        buf.push_back('\n');
+    }
+
+    unsigned char digest[32];
+    SHA_EVP256(reinterpret_cast<const unsigned char *>(buf.data()), buf.size(), digest);
+
+    static const char hex[] = "0123456789abcdef";
+    std::string out;
+    out.resize(64);
+    for (int i = 0; i < 32; i++) {
+        out[i * 2]     = hex[(digest[i] >> 4) & 0xF];
+        out[i * 2 + 1] = hex[digest[i] & 0xF];
+    }
+    return out;
+}
+
+/*
+  CRC32 over a canonicalised form of the engine_attribute JSON. We round-
+  trip through rapidjson::Writer so equivalent-but-not-identical JSON
+  (whitespace differences, key reordering by rapidjson's Document) hashes
+  the same. Empty or malformed JSON checksums to 0; callers treat that as
+  "no options configured", which is the safe default.
+
+  Note: rapidjson::Document does NOT sort keys; two physically-different
+  orderings of an object will still produce different checksums. That's
+  acceptable here -- a CREATE TABLE statement with a reordered
+  ENGINE_ATTRIBUTE has been edited by the user, and we want a different
+  checksum to signal that. The point of canonicalisation is normalising
+  whitespace and number representation, not full semantic equivalence.
+*/
+uint32_t compute_options_checksum(const dd::Table &t) {
+    LEX_CSTRING attr = t.engine_attribute();
+    if (!attr.str || attr.length == 0) return 0;
+
+    rapidjson::Document doc;
+    doc.Parse<rapidjson::kParseIterativeFlag>(attr.str, attr.length);
+    if (doc.HasParseError()) return 0;
+
+    rapidjson::StringBuffer sbuf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(sbuf);
+    doc.Accept(w);
+    return my_checksum(0, reinterpret_cast<const unsigned char *>(sbuf.GetString()),
+                       sbuf.GetSize());
+}
+
+#ifndef NDEBUG
+/*
+  Debug-only handle to the most-recently-written dd::Table* so the
+  tidesdb_dump_se_private_data DBUG hook can read back what
+  prepare_create wrote. Not thread-safe: tests that exercise the dump
+  must not run CREATE TABLE concurrently from another session. Production
+  code paths never touch this pointer (it's only read inside the DBUG
+  hook in tidesdb_show_status).
+
+  The DD object the server passes into ha_tidesdb::create lives for the
+  duration of the DDL transaction, so this pointer is only safe to read
+  inside the same SQL statement (or the very next SHOW ENGINE STATUS in
+  the same connection). The MTR test follows that ordering: arm keyword,
+  then SHOW ENGINE STATUS in the same session right after CREATE.
+*/
+const dd::Table *g_last_created_table = nullptr;
+#endif
+
+}  /* anonymous namespace */
+
+/*
+  Persist atomic-DDL bookkeeping into dd::Table::se_private_data so that:
+    - DROP / inplace-ALTER can verify the table was created by us with a
+      matching schema (fingerprint),
+    - subsequent OPEN TABLE can sanity-check the CF binding (cf_name),
+    - operators can grep mysql.tables for atomic_ddl=1 to enumerate
+      TidesDB tables that participate in atomic DDL.
+
+  Keys written:
+    cf_name      -- the TidesDB column family name (path_to_cf_name(name))
+    fingerprint  -- compute_schema_fingerprint (hex)
+    options_csum -- compute_options_checksum (decimal)
+    atomic_ddl   -- "1" (literal)
+    created_at   -- decimal seconds since epoch
+
+  Returns false on any failure so ha_tidesdb::create can short-circuit
+  with HA_ERR_GENERIC and the DD/engine txns roll back together. The
+  tidesdb_fail_after_se_private_data DBUG keyword forces failure for
+  testing the rollback path.
+*/
+bool TidesdbAtomicDdlBridge::prepare_create(THD * /*thd*/, dd::Table *new_table_def,
+                                              const char *cf_name) {
+    if (!new_table_def || !cf_name) return false;
+
+    dd::Properties &p = new_table_def->se_private_data();
+    p.set("cf_name", std::string(cf_name));
+    p.set("fingerprint", compute_schema_fingerprint(*new_table_def));
+    p.set("options_csum", std::to_string(compute_options_checksum(*new_table_def)));
+    p.set("atomic_ddl", std::string("1"));
+    p.set("created_at", std::to_string(static_cast<long long>(time(nullptr))));
+
+    /* DBUG_EXECUTE_IF must fire AFTER the Properties have been written so the
+       rollback test exercises the same code path operators would hit on a
+       real engine failure: prepare_create returns false after partial work.
+       (The DD txn will discard the partial Properties write when create()
+       returns HA_ERR_GENERIC.) */
+    DBUG_EXECUTE_IF("tidesdb_fail_after_se_private_data", { return false; });
+
+#ifndef NDEBUG
+    g_last_created_table = new_table_def;
+#endif
+    return true;
+}
+
 bool TidesdbAtomicDdlBridge::prepare_drop(THD *, const dd::Table *) { return true; }
+
+#ifndef NDEBUG
+/*
+  Walk the last_created table's se_private_data Properties and emit one
+  INFO log line per entry. Returns false if no CREATE TABLE has run this
+  server lifetime (the test should fail loudly in that case so an empty
+  log isn't mistaken for "wiring works but Properties were empty").
+*/
+bool TidesdbAtomicDdlBridge::debug_dump_last_se_private_data() {
+    if (!g_last_created_table) {
+        sql_print_information("[TIDESDB] se_private_data dump: no table created yet");
+        return false;
+    }
+    const dd::Properties &p = g_last_created_table->se_private_data();
+    bool emitted = false;
+    for (auto it = p.begin(); it != p.end(); ++it) {
+        /* dd::Properties iterators yield std::pair<const String_type, String_type>. */
+        sql_print_information("[TIDESDB] se_private_data key=%s val=%s",
+                              it->first.c_str(), it->second.c_str());
+        emitted = true;
+    }
+    if (!emitted) {
+        sql_print_information("[TIDESDB] se_private_data dump: Properties empty");
+    }
+    return emitted;
+}
+#endif
 
 /* -------------------- DdseStubs -------------------- */
 
