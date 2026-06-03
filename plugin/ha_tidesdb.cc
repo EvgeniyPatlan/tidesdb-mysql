@@ -46,6 +46,8 @@ extern "C"
 #include <cstdlib>     /* realpath() for HF-3 confinement check */
 #include "sql/auth/auth_acls.h"      /* SELECT_ACL for M-12 privilege check */
 #include "sql/auth/sql_security_ctx.h" /* Security_context::check_access */
+#include "sql/dd/properties.h"       /* dd::Properties (atomic-DDL Task 7) */
+#include "sql/dd/types/table.h"      /* dd::Table::se_private_data (Task 7) */
 #include "sql/item.h"  /* Item::val_bool() for ICP evaluation */
 #include "sql/key.h"
 #include "sql/sql_class.h"
@@ -576,6 +578,22 @@ static MYSQL_SYSVAR_BOOL(print_all_conflicts, srv_print_all_conflicts, PLUGIN_VA
                          "Log all TidesDB conflict errors to the error log "
                          "(similar to innodb_print_all_deadlocks)",
                          NULL, NULL, 0);
+
+/* Atomic-DDL (A-5) Task 7: hard-reject opens whose se_private_data was
+   not written by prepare_create. Default ON (strict); set OFF to tolerate
+   legacy pre-v0.4.0 tables during a one-time upgrade window -- the binding
+   is then inferred from the path and a WARNING is pushed. Storage cell
+   g_atomic_ddl_strict is extern bool in tidesdb_atomic_ddl.h (defined in
+   tidesdb_atomic_ddl.cc with default true). */
+static MYSQL_SYSVAR_BOOL(atomic_ddl_strict, tidesdb_mysql::g_atomic_ddl_strict,
+                         PLUGIN_VAR_OPCMDARG,
+                         "If ON (default), refuse to open a TIDESDB table whose "
+                         "se_private_data is missing or whose persisted cf_name "
+                         "does not match the path-inferred name. Set OFF to "
+                         "tolerate legacy (pre-v0.4.0) tables on a one-time "
+                         "upgrade; the binding is then inferred from the path "
+                         "and a WARNING is pushed.",
+                         /*check=*/NULL, /*update=*/NULL, /*default=*/true);
 
 static MYSQL_SYSVAR_BOOL(pessimistic_locking, srv_pessimistic_locking, PLUGIN_VAR_RQCMDARG,
                          "Enable plugin-level row locks for SELECT ... FOR UPDATE, "
@@ -1284,6 +1302,7 @@ static SYS_VAR *tidesdb_system_variables[] = {
     MYSQL_SYSVAR(default_object_prefetch_compaction),
     MYSQL_SYSVAR(default_tombstone_density_trigger),
     MYSQL_SYSVAR(default_tombstone_density_min_entries),
+    MYSQL_SYSVAR(atomic_ddl_strict),
     NULL};
 
 /* ******************** Table options (per-table CF config) ******************** */
@@ -3787,11 +3806,25 @@ void ha_tidesdb::recover_counters()
 
 /* ******************** open / close / create ******************** */
 
-int ha_tidesdb::open(const char *name, int mode, uint test_if_locked, const dd::Table *)
+int ha_tidesdb::open(const char *name, int mode, uint test_if_locked,
+                     const dd::Table *table_def)
 {
     DBUG_ENTER("ha_tidesdb::open");
 
     if (!(share = get_share())) DBUG_RETURN(1);
+
+    /* Atomic-DDL (A-5) Task 7: debug hook to simulate a missing
+       se_private_data so the strict=ON / strict=OFF legacy paths can be
+       exercised without a real pre-v0.4.0 table on disk. The keyword
+       'tidesdb_zero_se_private_data' wipes every entry from the DD's
+       se_private_data Properties; validate_open below then sees an empty
+       Properties and follows the "missing keys" branch. Compiled out
+       under NDEBUG (Release builds). */
+    DBUG_EXECUTE_IF("tidesdb_zero_se_private_data", {
+        if (table_def) {
+            const_cast<dd::Properties &>(table_def->se_private_data()).clear();
+        }
+    });
 
     /* MF-1 + MF-9 fix: populate the share's ENGINE_ATTRIBUTE option
        cache. The expensive compute (25+ THDVAR reads + rapidjson Parse)
@@ -3969,6 +4002,20 @@ int ha_tidesdb::open(const char *name, int mode, uint test_if_locked, const dd::
         }
     }
     unlock_shared_ha_data();
+
+    /* Atomic-DDL (A-5) Task 7: validate the persisted CF-name binding
+       against the path-inferred name. Under tidesdb_atomic_ddl_strict=ON
+       (default) a missing or mismatched se_private_data hard-rejects the
+       OPEN with HA_ERR_TABLE_DEF_CHANGED; OFF tolerates with a WARNING
+       (escape hatch for v0.3.x -> v0.4.0 upgrades, the only path where a
+       table can pre-exist without atomic-DDL bookkeeping). The DBUG hook
+       'tidesdb_zero_se_private_data' above wipes the Properties so the
+       legacy MTR tests can exercise both branches without an actual
+       pre-v0.4.0 table. */
+    if (!tidesdb_mysql::TidesdbAtomicDdlBridge::validate_open(
+            ha_thd(), table_def, share->cf_name.c_str())) {
+        DBUG_RETURN(HA_ERR_TABLE_DEF_CHANGED);
+    }
 
     /* We set ref_length for position()/rnd_pos() */
     ref_length = share->pk_key_len;

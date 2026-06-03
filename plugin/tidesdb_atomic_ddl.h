@@ -89,6 +89,21 @@ class TidesdbAtomicDdlBridge {
     /* Called from ha_tidesdb::delete_table() before tidesdb_txn_column_family_drop. */
     static bool prepare_drop(THD *thd, const dd::Table *table_def);
 
+    /* Called from ha_tidesdb::open() once the path-inferred CF name is
+       known. Reads se_private_data persisted by prepare_create and either:
+         - accepts (returns true) when cf_name matches path_inferred_cf,
+         - tolerates with a WARNING when strict=OFF (legacy / forward-compat),
+         - rejects with ER_TABLEACCESS_DENIED_ERROR when strict=ON and the
+           binding is missing or mismatched.
+
+       Returning false from validate_open causes ha_tidesdb::open() to
+       fail the OPEN with HA_ERR_TABLE_DEF_CHANGED so the server treats
+       the table as broken. A NULL table_def is treated as "skip
+       validation" -- the server passes NULL on temp-table / fast-path
+       opens that bypass the DD. */
+    static bool validate_open(THD *thd, const dd::Table *table_def,
+                              const char *path_inferred_cf);
+
 #ifndef NDEBUG
     /* Debug-only: dump the most-recently-written se_private_data Properties
        to the error log via sql_print_information. Each entry prints as a

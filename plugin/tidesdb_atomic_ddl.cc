@@ -36,14 +36,21 @@
 
 #include "my_checksum.h"               /* my_checksum (CRC32) */
 #include "mysql_version.h"             /* MYSQL_VERSION_ID */
+#include "mysqld_error.h"              /* ER_TABLEACCESS_DENIED_ERROR, ER_UNKNOWN_ERROR */
 #include "sha2.h"                      /* SHA_EVP256, SHA256_DIGEST_LENGTH */
+#include "sql/auth/sql_security_ctx.h" /* Security_context::priv_user/host_or_ip */
+#include "sql/current_thd.h"           /* unused but kept for parity */
 #include "sql/dd/properties.h"         /* dd::Properties */
+#include "sql/dd/string_type.h"        /* dd::String_type */
 #include "sql/dd/types/column.h"       /* dd::Column */
 #include "sql/dd/types/table.h"        /* dd::Table */
 #include "sql/dd/types/tablespace.h"   /* dd::Tablespace::name() */
+#include "sql/derror.h"                /* my_error */
 #include "sql/handler.h"               /* handlerton, sdi_*_t, dict_init_mode_t */
 #include "sql/log.h"                   /* sql_print_error / sql_print_information */
 #include "sql/plugin_table.h"          /* Plugin_table, Plugin_tablespace */
+#include "sql/sql_class.h"             /* THD::security_context */
+#include "sql/sql_error.h"             /* push_warning_printf, Sql_condition */
 #include "tidesdb_engine_context.h"    /* g_engine_ctx */
 
 namespace tidesdb_mysql {
@@ -463,6 +470,111 @@ bool TidesdbAtomicDdlBridge::prepare_create(THD * /*thd*/, dd::Table *new_table_
 }
 
 bool TidesdbAtomicDdlBridge::prepare_drop(THD *, const dd::Table *) { return true; }
+
+/*
+  Consumer side of the bookkeeping written by prepare_create. Called from
+  ha_tidesdb::open() once the path-inferred CF name is known.
+
+  Three outcomes:
+    1. NULL table_def              -> skip validation; the server uses NULL
+                                      on temp-table / fast-path opens that
+                                      bypass the DD.
+    2. Missing atomic-DDL keys     -> legacy (pre-v0.4.0) table:
+                                      * strict=ON  -> hard reject with
+                                                       ER_TABLEACCESS_DENIED_ERROR
+                                      * strict=OFF -> WARNING + accept
+                                                       (infer binding from path)
+    3. Persisted cf_name mismatch  -> binding corruption / engine swap:
+                                      * strict=ON  -> hard reject
+                                      * strict=OFF -> WARNING + accept
+
+  Returning false causes ha_tidesdb::open() to bail with
+  HA_ERR_TABLE_DEF_CHANGED so the server treats the table as broken.
+
+  Format-string note: dd::String_type is std::basic_string with a custom
+  allocator, so .c_str() returns const char* and formats with %s as
+  expected.
+*/
+bool TidesdbAtomicDdlBridge::validate_open(THD *thd, const dd::Table *table_def,
+                                            const char *path_inferred_cf) {
+    if (!table_def || !path_inferred_cf) return true;
+
+    const dd::Properties &p = table_def->se_private_data();
+
+    /* Cache the user/host strings once -- both error paths need them and
+       priv_user()/host_or_ip() each return an LEX_CSTRING by value. The
+       NULL guards mirror sql/auth/sql_authorization.cc:2744 usage. */
+    const char *user = "?";
+    const char *host = "?";
+    if (thd) {
+        Security_context *sctx = thd->security_context();
+        if (sctx) {
+            if (sctx->priv_user().str) user = sctx->priv_user().str;
+            if (sctx->host_or_ip().str) host = sctx->host_or_ip().str;
+        }
+    }
+
+    /* Case 2: missing atomic-DDL keys -- legacy table. */
+    if (!p.exists("cf_name") || !p.exists("atomic_ddl")) {
+        if (g_atomic_ddl_strict) {
+            my_error(ER_TABLEACCESS_DENIED_ERROR, MYF(0),
+                     "OPEN(atomic-ddl)", user, host, path_inferred_cf);
+            sql_print_error("[TIDESDB] OPEN '%s' rejected: strict=ON and "
+                            "se_private_data is missing atomic-DDL keys "
+                            "(legacy / pre-v0.4.0 table?). Set "
+                            "tidesdb_atomic_ddl_strict=OFF to tolerate.",
+                            path_inferred_cf);
+            return false;
+        }
+        push_warning_printf(thd, Sql_condition::SL_WARNING, ER_UNKNOWN_ERROR,
+                            "[TIDESDB] table '%s' has no atomic-DDL "
+                            "se_private_data; inferring CF name from path "
+                            "(legacy / forward-compat mode under strict=OFF)",
+                            path_inferred_cf);
+        return true;
+    }
+
+    /* Case 3: keys present -- validate the CF-name binding matches. */
+    dd::String_type persisted_cf;
+    /* get() returns true on failure; we already checked exists(), so this
+       should always succeed -- but guard anyway in case the impl ever
+       de-syncs exists() from get(). */
+    if (p.get("cf_name", &persisted_cf)) {
+        if (g_atomic_ddl_strict) {
+            my_error(ER_TABLEACCESS_DENIED_ERROR, MYF(0),
+                     "OPEN(atomic-ddl)", user, host, path_inferred_cf);
+            sql_print_error("[TIDESDB] OPEN '%s' rejected: cf_name exists() "
+                            "but get() failed -- se_private_data corrupt",
+                            path_inferred_cf);
+            return false;
+        }
+        push_warning_printf(thd, Sql_condition::SL_WARNING, ER_UNKNOWN_ERROR,
+                            "[TIDESDB] table '%s' se_private_data is "
+                            "internally inconsistent; tolerated under "
+                            "strict=OFF",
+                            path_inferred_cf);
+        return true;
+    }
+
+    if (strcmp(persisted_cf.c_str(), path_inferred_cf) != 0) {
+        if (g_atomic_ddl_strict) {
+            my_error(ER_TABLEACCESS_DENIED_ERROR, MYF(0),
+                     "OPEN(atomic-ddl)", user, host, path_inferred_cf);
+            sql_print_error("[TIDESDB] OPEN '%s' rejected: CF-name mismatch "
+                            "persisted='%s' path-inferred='%s'",
+                            path_inferred_cf, persisted_cf.c_str(),
+                            path_inferred_cf);
+            return false;
+        }
+        push_warning_printf(thd, Sql_condition::SL_WARNING, ER_UNKNOWN_ERROR,
+                            "[TIDESDB] CF-name mismatch tolerated under "
+                            "strict=OFF: persisted='%s' path-inferred='%s'",
+                            persisted_cf.c_str(), path_inferred_cf);
+        return true;
+    }
+
+    return true;
+}
 
 #ifndef NDEBUG
 /*
