@@ -1,0 +1,13 @@
+SET @save_log_error_verbosity = @@global.log_error_verbosity;
+SET GLOBAL log_error_verbosity = 3;
+SET @@global.DEBUG = '+d,tidesdb_force_ddse_stubs';
+SELECT @@global.DEBUG LIKE '%tidesdb_force_ddse_stubs%' AS forced;
+forced
+1
+SHOW ENGINE TIDESDB STATUS;
+8
+SHOW ENGINE TIDESDB STATUS;
+8
+SET @@global.DEBUG = '';
+SET GLOBAL log_error_verbosity = @save_log_error_verbosity;
+# Done.

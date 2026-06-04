@@ -1,0 +1,17 @@
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY) ENGINE=TIDESDB;
+SET @@global.DEBUG = '+d,tidesdb_fail_after_sdi_del';
+SELECT @@global.DEBUG LIKE '%tidesdb_fail_after_sdi_del%' AS armed;
+armed
+1
+DROP TABLE tdb_ddl_t;
+ERROR HY000: Got error 168 - 'Unknown (generic) error from engine' from storage engine
+SET @@global.DEBUG = '';
+SELECT COUNT(*) AS dd_rows FROM information_schema.TABLES
+WHERE TABLE_SCHEMA='test' AND TABLE_NAME='tdb_ddl_t';
+dd_rows
+1
+SELECT COUNT(*) AS row_count FROM tdb_ddl_t;
+row_count
+0
+DROP TABLE tdb_ddl_t;
+# Done.

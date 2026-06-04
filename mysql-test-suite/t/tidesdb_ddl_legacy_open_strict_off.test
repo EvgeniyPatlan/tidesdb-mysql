@@ -1,0 +1,42 @@
+--source suite/tidesdb/include/tidesdb_ddl_helpers.inc
+--source include/have_debug.inc
+#
+# A-5 atomic-DDL Task 7: validate_open tolerates missing se_private_data
+# when tidesdb_atomic_ddl_strict=OFF.
+#
+# Production path covered: a legacy (pre-v0.4.0) table whose dd::Table
+# row predates the atomic-DDL bookkeeping. On open, validate_open finds
+# no cf_name/atomic_ddl keys; under strict=OFF it pushes a WARNING and
+# accepts the open, inferring the CF binding from the on-disk path.
+#
+# Setup uses the DBUG keyword 'tidesdb_zero_se_private_data' (Task 7) to
+# simulate that condition: the next open() clears the Properties before
+# validate_open runs. This avoids needing an actual pre-v0.4.0 fixture
+# table on disk.
+#
+
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY) ENGINE=TIDESDB;
+
+# Save and lower strict, then arm the wipe-keyword and force a re-open
+# via FLUSH TABLES so the next SELECT goes through ha_tidesdb::open().
+SET @save_strict = @@global.tidesdb_atomic_ddl_strict;
+SET GLOBAL tidesdb_atomic_ddl_strict = OFF;
+SET @@global.DEBUG = '+d,tidesdb_zero_se_private_data';
+FLUSH TABLES tdb_ddl_t;
+
+# Open succeeds; the SELECT returns 0 rows because the table is empty.
+# The WARNING text embeds the path-inferred CF name which depends on
+# CF_DB_TABLE_SEP and would change if that constant ever moves, so we
+# hide the SHOW WARNINGS output. The fact that the SELECT itself
+# succeeds proves validate_open returned true under strict=OFF.
+SELECT COUNT(*) AS rows_ok FROM tdb_ddl_t;
+--disable_result_log
+SHOW WARNINGS;
+--enable_result_log
+
+SET @@global.DEBUG = '';
+SET GLOBAL tidesdb_atomic_ddl_strict = @save_strict;
+
+DROP TABLE tdb_ddl_t;
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

@@ -1,0 +1,17 @@
+SET @save_log_error_verbosity = @@global.log_error_verbosity;
+SET GLOBAL log_error_verbosity = 3;
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY, v VARCHAR(64)) ENGINE=TIDESDB;
+SET @@global.DEBUG = '+d,tidesdb_dump_se_private_data';
+SELECT @@global.DEBUG LIKE '%tidesdb_dump_se_private_data%' AS armed;
+armed
+1
+SHOW ENGINE TIDESDB STATUS;
+1
+1
+1
+1
+1
+SET @@global.DEBUG = '';
+SET GLOBAL log_error_verbosity = @save_log_error_verbosity;
+DROP TABLE tdb_ddl_t;
+# Done.

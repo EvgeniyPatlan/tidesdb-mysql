@@ -1,0 +1,27 @@
+--source suite/tidesdb/include/tidesdb_ddl_helpers.inc
+#
+# A-5 atomic-DDL Task 11: reconciliation sweep no-op smoke test.
+#
+# Plain CREATE TABLE ... ENGINE=TIDESDB, restart the server, then verify
+# the table still reads and the new tidesdb_orphan_action sysvar is
+# visible. The sweep at init runs without a Dictionary_client (current_thd
+# is nullptr on the bootstrap thread, see the long comment in
+# tidesdb_init_func) so the error log shows "sweep deferred" rather than
+# "no orphans found"; the test asserts the bookkeeping path is wired by
+# checking the sysvar surface and table readback.
+#
+
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY, v VARCHAR(64)) ENGINE=TIDESDB;
+INSERT INTO tdb_ddl_t VALUES (1, 'a'), (2, 'b');
+
+--source include/restart_mysqld.inc
+
+SELECT * FROM tdb_ddl_t ORDER BY id;
+
+# Sysvar surface check -- confirms Task 11's tidesdb_orphan_action lands
+# in SHOW VARIABLES with the documented default 'quarantine'.
+SHOW VARIABLES LIKE 'tidesdb_orphan_action';
+
+DROP TABLE tdb_ddl_t;
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

@@ -1,0 +1,9 @@
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY) ENGINE=TIDESDB;
+DROP TABLE tdb_ddl_t;
+SELECT COUNT(*) AS dd_rows FROM information_schema.TABLES
+WHERE TABLE_SCHEMA='test' AND TABLE_NAME='tdb_ddl_t';
+dd_rows
+0
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY, v INT) ENGINE=TIDESDB;
+DROP TABLE tdb_ddl_t;
+# Done.

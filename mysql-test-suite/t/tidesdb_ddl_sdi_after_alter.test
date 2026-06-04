@@ -1,0 +1,18 @@
+--source suite/tidesdb/include/tidesdb_ddl_helpers.inc
+#
+# A-5 atomic-DDL Task 5: SDI reflects schema after ALTER TABLE.
+#
+# ALTER TABLE rewrites the SDI: the new schema must be persisted via
+# sdi_set so SHOW CREATE TABLE returns the post-ALTER definition. If
+# our sdi_set adapter dropped writes for the tidesdb_system tablespace,
+# SHOW CREATE TABLE would still show the old column list.
+#
+
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY, v VARCHAR(64)) ENGINE=TIDESDB;
+ALTER TABLE tdb_ddl_t ADD COLUMN extra INT;
+SHOW CREATE TABLE tdb_ddl_t;
+
+DROP TABLE tdb_ddl_t;
+
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

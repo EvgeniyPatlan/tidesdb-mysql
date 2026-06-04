@@ -1,0 +1,22 @@
+--source suite/tidesdb/include/tidesdb_ddl_helpers.inc
+#
+# A-5 atomic-DDL Task 5: SDI survives a FLUSH + re-open cycle.
+#
+# After CREATE + INSERT, FLUSH TABLES forces MySQL to close the table
+# handle. The subsequent SELECT re-opens it, which means the server has
+# to look up the table's SDI again. If our sdi_get adapter is wired
+# correctly the SELECT returns the inserted rows; if SDI is missing or
+# the get callback returns failure for tidesdb_system, the SELECT would
+# fail to re-open the table.
+#
+
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY, v VARCHAR(64)) ENGINE=TIDESDB;
+INSERT INTO tdb_ddl_t VALUES (1, 'one'), (2, 'two');
+
+FLUSH TABLES tdb_ddl_t;
+SELECT * FROM tdb_ddl_t ORDER BY id;
+
+DROP TABLE tdb_ddl_t;
+
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

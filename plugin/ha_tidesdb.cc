@@ -46,11 +46,14 @@ extern "C"
 #include <cstdlib>     /* realpath() for HF-3 confinement check */
 #include "sql/auth/auth_acls.h"      /* SELECT_ACL for M-12 privilege check */
 #include "sql/auth/sql_security_ctx.h" /* Security_context::check_access */
+#include "sql/dd/properties.h"       /* dd::Properties (atomic-DDL Task 7) */
+#include "sql/dd/types/table.h"      /* dd::Table::se_private_data (Task 7) */
 #include "sql/item.h"  /* Item::val_bool() for ICP evaluation */
 #include "sql/key.h"
 #include "sql/sql_class.h"
 
 #include "tidesdb_engine_context.h"  /* g_engine_ctx, tdb_get_engine/set_engine */
+#include "tidesdb_atomic_ddl.h"      /* register_tablespace (A-5 atomic-DDL) */
 #include "tidesdb_fts.h"             /* FTS subsystem (A-2 extraction) */
 #include "tidesdb_spatial.h"         /* Spatial subsystem (A-2 extraction) */
 
@@ -575,6 +578,66 @@ static MYSQL_SYSVAR_BOOL(print_all_conflicts, srv_print_all_conflicts, PLUGIN_VA
                          "Log all TidesDB conflict errors to the error log "
                          "(similar to innodb_print_all_deadlocks)",
                          NULL, NULL, 0);
+
+/* Atomic-DDL (A-5) Task 7: hard-reject opens whose se_private_data was
+   not written by prepare_create. Default ON (strict); set OFF to tolerate
+   legacy pre-v0.4.0 tables during a one-time upgrade window -- the binding
+   is then inferred from the path and a WARNING is pushed. Storage cell
+   g_atomic_ddl_strict is extern bool in tidesdb_atomic_ddl.h (defined in
+   tidesdb_atomic_ddl.cc with default true). */
+static MYSQL_SYSVAR_BOOL(atomic_ddl_strict, tidesdb_mysql::g_atomic_ddl_strict,
+                         PLUGIN_VAR_OPCMDARG,
+                         "If ON (default), refuse to open a TIDESDB table whose "
+                         "se_private_data is missing or whose persisted cf_name "
+                         "does not match the path-inferred name. Set OFF to "
+                         "tolerate legacy (pre-v0.4.0) tables on a one-time "
+                         "upgrade; the binding is then inferred from the path "
+                         "and a WARNING is pushed.",
+                         /* Task 13 flipped this back to true now that
+                            HTON_SUPPORTS_ATOMIC_DDL is active: prepare_create
+                            and prepare_drop now run inside the DD txn so
+                            se_private_data carries the binding on every
+                            normally-created table. Operators can SET GLOBAL
+                            tidesdb_atomic_ddl_strict=OFF for a one-time
+                            legacy-table upgrade window. */
+                         /*check=*/NULL, /*update=*/NULL, /*default=*/true);
+
+/* Atomic-DDL (A-5) Task 11: action the startup reconciliation sweep takes
+   when it finds an orphan CF (no matching dd::Table). Drop is destructive
+   and intended for scripted recovery; quarantine renames to
+   "__orphan_<epoch>_<cf>" (default, preserves data and is ignored by the
+   next sweep because the '__' prefix is filtered by compute_delta_pure);
+   log_only just emits a WARNING. The storage cell is a plain enum index
+   (matches the MYSQL_SYSVAR_ENUM ABI); the update hook fans it out to the
+   typed g_orphan_action defined in tidesdb_atomic_ddl.cc. */
+static const char *tidesdb_orphan_action_names[] = {
+    "drop", "quarantine", "log_only", NullS};
+static TYPELIB tidesdb_orphan_action_typelib = {
+    array_elements(tidesdb_orphan_action_names) - 1, "tidesdb_orphan_action_typelib",
+    tidesdb_orphan_action_names, NULL};
+static ulong srv_orphan_action = 1; /* quarantine */
+
+static void tidesdb_orphan_action_update(THD *, SYS_VAR *, void *var_ptr,
+                                         const void *save)
+{
+    const ulong v = *static_cast<const ulong *>(save);
+    *static_cast<ulong *>(var_ptr) = v;
+    tidesdb_mysql::g_orphan_action = static_cast<tidesdb_mysql::OrphanAction>(v);
+}
+
+static MYSQL_SYSVAR_ENUM(orphan_action, srv_orphan_action,
+                         PLUGIN_VAR_RQCMDARG,
+                         "Action the startup reconciliation sweep takes for "
+                         "TidesDB column families that have no matching "
+                         "dd::Table (orphan CFs). 'drop' = destroy the CF "
+                         "and its data; 'quarantine' (default) = rename to "
+                         "__orphan_<epoch>_<cf> so data is preserved and "
+                         "subsequent sweeps ignore it; 'log_only' = emit a "
+                         "WARNING and leave the CF in place. Orphan dd::Table "
+                         "rows (DD entry present, CF missing) are always "
+                         "logged -- the reconciler never modifies the DD.",
+                         /*check=*/NULL, tidesdb_orphan_action_update,
+                         /*default=*/1, &tidesdb_orphan_action_typelib);
 
 static MYSQL_SYSVAR_BOOL(pessimistic_locking, srv_pessimistic_locking, PLUGIN_VAR_RQCMDARG,
                          "Enable plugin-level row locks for SELECT ... FOR UPDATE, "
@@ -1283,6 +1346,8 @@ static SYS_VAR *tidesdb_system_variables[] = {
     MYSQL_SYSVAR(default_object_prefetch_compaction),
     MYSQL_SYSVAR(default_tombstone_density_trigger),
     MYSQL_SYSVAR(default_tombstone_density_min_entries),
+    MYSQL_SYSVAR(atomic_ddl_strict),
+    MYSQL_SYSVAR(orphan_action),
     NULL};
 
 /* ******************** Table options (per-table CF config) ******************** */
@@ -2151,6 +2216,137 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
     if (stat != HA_ENGINE_STATUS) return false;
     if (!tdb_get_engine()) return false;
 
+    /* Atomic-DDL (A-5): debug-only force-invoke for the 8 inert DDSE stubs.
+       Production code-path: production never invokes these because TidesDB
+       is not the active DDSE. The MTR test tidesdb_ddl_ddse_stubs_inert sets
+       the DBUG keyword 'tidesdb_force_ddse_stubs' immediately before calling
+       SHOW ENGINE TIDESDB STATUS so each stub fires exactly once, allowing
+       the test to count the resulting INFO log lines and verify the wiring.
+       SHOW ENGINE STATUS was picked over tidesdb_init_func because it runs
+       at SQL-statement time, after the user has had a chance to set the
+       DBUG keyword. Compiled out under NDEBUG (Release builds). */
+    DBUG_EXECUTE_IF("tidesdb_force_ddse_stubs", {
+        uint v = 0;
+        if (hton->ddse_dict_init) hton->ddse_dict_init(DICT_INIT_CREATE_FILES, 0, nullptr, nullptr);
+        if (hton->dict_init) hton->dict_init(DICT_INIT_CREATE_FILES, 0, nullptr, nullptr);
+        if (hton->dict_recover) hton->dict_recover(DICT_RECOVERY_INITIALIZE_TABLESPACES, 0);
+        if (hton->dict_cache_reset) hton->dict_cache_reset("test", "test");
+        if (hton->dict_cache_reset_tables_and_tablespaces)
+            hton->dict_cache_reset_tables_and_tablespaces();
+        if (hton->dict_get_server_version) hton->dict_get_server_version(&v);
+        if (hton->dict_set_server_version) hton->dict_set_server_version();
+        if (hton->is_dict_readonly) hton->is_dict_readonly();
+    });
+
+    /* Atomic-DDL (A-5) Task 5: debug-only force-invoke for the SDI
+       "tablespace is not ours" guard. Production code-path: the server
+       only ever passes the tablespace it asked the engine to handle, so
+       the guard fires once per non-ours tablespace and short-circuits.
+       This MTR-arming branch exercises the guard directly because
+       constructing a real dd::Tablespace from a test is impractical
+       (~20 pure virtuals). On success we log a single INFO line that
+       the test greps for. Compiled out under NDEBUG (Release builds). */
+    DBUG_EXECUTE_IF("tidesdb_force_sdi_other_tablespace", {
+        if (tidesdb_mysql::SdiCallbacks::debug_invoke_other_tablespace()) {
+            sql_print_information("[TIDESDB] sdi_other_tablespace ok");
+        } else {
+            sql_print_error("[TIDESDB] sdi_other_tablespace FAILED");
+        }
+    });
+
+    /* Atomic-DDL (A-5) Task 6: debug-only readback of the last-created
+       table's dd::Table::se_private_data. MySQL 9.7 hides this column
+       from information_schema for non-InnoDB engines, so the MTR test
+       arms this keyword right after CREATE TABLE and SHOW ENGINE STATUS
+       then logs one INFO line per (key, value) entry. The test greps the
+       error log for the five expected keys (cf_name, fingerprint,
+       options_csum, atomic_ddl, created_at). Compiled out under NDEBUG. */
+#ifndef NDEBUG
+    DBUG_EXECUTE_IF("tidesdb_dump_se_private_data", {
+        (void)tidesdb_mysql::TidesdbAtomicDdlBridge::debug_dump_last_se_private_data();
+    });
+
+    /* Atomic-DDL (A-5) Task 11: inject an orphan CF directly via
+       tidesdb_create_column_family, bypassing the DD layer. On the next
+       server restart the reconciliation sweep will see a CF with no
+       matching dd::Table and apply tidesdb_orphan_action (drop /
+       quarantine / log_only). Idempotent: TDB_ERR_EXISTS is fine. The
+       fixed name "__test_orphan_cf_inj" intentionally does NOT start
+       with the '__orphan_' quarantine prefix (compute_delta_pure would
+       filter it) but DOES start with '__' -- wait, that means
+       compute_delta_pure would also filter it. So we use a name that
+       does NOT start with '__': "test_orphan_cf_inj". */
+    DBUG_EXECUTE_IF("tidesdb_inject_orphan_cf", {
+        if (tdb_get_engine()) {
+            tidesdb_column_family_config_t cfg =
+                tidesdb_default_column_family_config();
+            const char *kName = "test_orphan_cf_inj";
+            strncpy(cfg.name, kName, sizeof(cfg.name) - 1);
+            cfg.name[sizeof(cfg.name) - 1] = '\0';
+            int rc = tidesdb_create_column_family(tdb_get_engine(), kName, &cfg);
+            if (rc == TDB_SUCCESS || rc == TDB_ERR_EXISTS) {
+                sql_print_information("[TIDESDB] test injected orphan CF '%s'",
+                                      kName);
+            } else {
+                sql_print_warning(
+                    "[TIDESDB] test inject_orphan_cf: create rc=%d", rc);
+            }
+        }
+    });
+
+    /* Atomic-DDL (A-5) Task 11: drop the underlying CF for an already-
+       created TIDESDB table, leaving the DD row in place. Simulates the
+       "DD txn committed but engine drop crashed before completing" crash
+       scenario. After the next restart the reconciliation sweep should
+       see a dd::Table that has no backing CF (orphan dd::Table) and log
+       the operator-action message. The test creates a table named
+       'tdb_ddl_t' first, so the CF name follows path_to_cf_name's
+       "<db>__<table>" form -- here it's "test__tdb_ddl_t". */
+    DBUG_EXECUTE_IF("tidesdb_drop_cf_skip_dd", {
+        if (tdb_get_engine()) {
+            const char *kName = "test__tdb_ddl_t";
+            int rc = tidesdb_drop_column_family(tdb_get_engine(), kName);
+            if (rc == TDB_SUCCESS) {
+                sql_print_information(
+                    "[TIDESDB] test dropped CF '%s' (DD row left intact)",
+                    kName);
+            } else {
+                sql_print_warning(
+                    "[TIDESDB] test drop_cf_skip_dd: rc=%d", rc);
+            }
+        }
+    });
+
+    /* Atomic-DDL (A-5) Task 11: SQL-reachable trigger for the
+       reconciliation sweep. tidesdb_init_func runs on the bootstrap
+       thread where current_thd is typically nullptr (no DD client
+       available), so the sweep stays a no-op at init time. The MTR
+       sweep tests use this hook to drive the sweep from a regular SQL
+       session AFTER restart -- the THD passed to tidesdb_show_status
+       has a Dictionary_client wired up, so compute_delta sees the real
+       DD state. apply_delta then runs against whatever orphans the
+       previous test phase injected (via tidesdb_inject_orphan_cf or
+       tidesdb_drop_cf_skip_dd, persisted across the restart). */
+    DBUG_EXECUTE_IF("tidesdb_run_reconcile", {
+        if (thd && thd->dd_client() && tdb_get_engine()) {
+            tidesdb_mysql::DdSyncReconciler rec(tdb_get_engine(), thd->dd_client());
+            auto delta = rec.compute_delta();
+            sql_print_information(
+                "[TIDESDB] reconciler (manual): %zu orphan CFs, "
+                "%zu orphan dd::Tables",
+                delta.orphan_cfs.size(), delta.orphan_dd_tables.size());
+            (void)rec.apply_delta(delta);
+        } else {
+            sql_print_information(
+                "[TIDESDB] reconciler (manual): preconditions unmet "
+                "(thd=%p dd_client=%p engine=%p)",
+                (void *)thd,
+                thd ? (void *)thd->dd_client() : nullptr,
+                (void *)tdb_get_engine());
+        }
+    });
+#endif
+
     /* We refresh SHOW GLOBAL STATUS variables alongside the human-readable output */
     tidesdb_refresh_status_vars();
 
@@ -2607,7 +2803,12 @@ static int tidesdb_init_func(void *p)
 
     tidesdb_hton = (handlerton *)p;
     tidesdb_hton->create = tidesdb_create_handler;
-    tidesdb_hton->flags = HTON_SUPPORTS_ENGINE_ATTRIBUTE;
+    /* Task 13: HTON_SUPPORTS_ATOMIC_DDL activates the spec'd contract --
+       ha_tidesdb::create now runs INSIDE the open DD transaction, so
+       prepare_create's mutations to dd::Table::se_private_data persist,
+       prepare_drop's marker survives a rollback, and validate_open can
+       trust the binding cell on every open. */
+    tidesdb_hton->flags = HTON_SUPPORTS_ENGINE_ATTRIBUTE | HTON_SUPPORTS_ATOMIC_DDL;
     tidesdb_hton->savepoint_offset = sizeof(tidesdb_savepoint_t);
     tidesdb_hton->file_extensions = ha_tidesdb_exts;  /* MariaDB: tablefile_extensions */
     /* MariaDB-only handlerton members (table_options/field_options/index_options)
@@ -2638,6 +2839,13 @@ static int tidesdb_init_func(void *p)
      * during plugin unload which serves the same purpose. */
     /* tidesdb_hton->kill_query = tidesdb_hton_kill_query;  -- MariaDB-only.
      * MySQL signals query abort via THD::killed which the engine should poll. */
+
+    /* Atomic-DDL (A-5): wire 8 inert DDSE stub callbacks on the handlerton.
+       None of these will ever fire in production -- TidesDB is not the active
+       DDSE (InnoDB is). The slot exists so that a future "TidesDB hosts the
+       data dictionary" project finds the contract surface pre-wired. See
+       docs/superpowers/specs/2026-06-02-atomic-ddl-participation-design.md. */
+    tidesdb_mysql::DdseStubs::register_into(tidesdb_hton);
 
     /* Initialize the engine context (last_conflict_mutex). schema_cf,
        engine, path are populated later by the open / config code. */
@@ -2774,6 +2982,34 @@ static int tidesdb_init_func(void *p)
        engine handle, not a torn write. */
     tdb_set_engine(opened);
 
+    /* Atomic-DDL (A-5): register the engine-wide logical tablespace
+       descriptor. Non-fatal at this point -- atomic-DDL fully activates
+       in a later commit (handlerton SDI/DDSE callback wiring lands in
+       Task 5). See docs/superpowers/specs/2026-06-02-atomic-ddl-participation-design.md. */
+    g_engine_ctx.tablespace = tidesdb_mysql::register_tablespace();
+    if (!g_engine_ctx.tablespace)
+        sql_print_error("[TIDESDB] failed to register tidesdb_system tablespace");
+
+    /* Atomic-DDL (A-5) Task 5: instantiate the SDI store against the open
+       engine. SdiStore::init() opens or creates the dedicated __tidesdb_sdi
+       CF that backs the six handlerton SDI callbacks below. A failure here
+       is non-fatal: the SDI callbacks will gracefully return success-no-op
+       for reads / failure for writes when g_engine_ctx.sdi is null, so the
+       rest of the engine remains usable. */
+    g_engine_ctx.sdi = std::make_unique<tidesdb_mysql::SdiStore>(tdb_get_engine());
+    if (!g_engine_ctx.sdi->init())
+    {
+        sql_print_error("[TIDESDB] SdiStore init failed; SDI callbacks will "
+                        "return errors for writes");
+        /* Keep the unique_ptr live so the callbacks land in the null-cf
+           guard inside SdiStore rather than dereferencing a freed object. */
+    }
+
+    /* Atomic-DDL (A-5) Task 5: wire the six SDI tablespace callbacks. They
+       route SDI reads/writes for the tidesdb_system tablespace to
+       g_engine_ctx.sdi and return success-no-op for every other tablespace. */
+    tidesdb_mysql::SdiCallbacks::register_into(tidesdb_hton);
+
     sql_print_information("[TIDESDB] TidesDB opened at %s", g_engine_ctx.path.c_str());
 
     /* Schema discovery CF -- created when object store is active so that
@@ -2799,6 +3035,37 @@ static int tidesdb_init_func(void *p)
             schema_cf_ensure_databases();
 
             sql_print_information("[TIDESDB] Schema discovery enabled (object store mode)");
+        }
+    }
+
+    /* Atomic-DDL (A-5) Task 11: reconciliation sweep wiring.
+
+       SAFETY FIRST: We do NOT apply_delta from plugin init. Even when
+       current_thd is non-null on the bootstrap thread, the DD's table
+       cache may not yet have the user's TIDESDB tables visible to
+       fetch_schema_components<Table> (their dd::Table rows live in
+       mysql.tables on InnoDB, which can be in mid-recovery). Empirical
+       testing in this very task showed init-time apply_delta will
+       mis-classify legitimate user tables as orphan CFs and quarantine
+       them. To avoid catastrophic data loss, the sweep at init does
+       NOTHING destructive: it only logs which path it would have taken
+       and leaves apply_delta to the SQL-reachable manual-trigger DBUG
+       hook (tidesdb_run_reconcile) and to v0.5.0's on-first-connection
+       schedule.
+
+       The MTR sweep tests therefore drive apply_delta from a regular
+       SQL session post-restart (which has a fully-warm DD client), and
+       this init-time block is best-effort observability. */
+    {
+        THD *thd = current_thd;
+        if (thd && thd->dd_client()) {
+            sql_print_information(
+                "[TIDESDB] reconciler: init-time sweep skipped (apply_delta "
+                "is gated to manual / first-connection triggers to avoid "
+                "false orphans during DD warm-up); DD client present");
+        } else {
+            sql_print_information(
+                "[TIDESDB] reconciler: no DD client at plugin init; sweep deferred");
         }
     }
 
@@ -2849,6 +3116,10 @@ static bool tidesdb_hton_flush_logs(handlerton *)
 static int tidesdb_hton_panic(handlerton *, enum ha_panic_function flag)
 {
     if (flag != HA_PANIC_CLOSE) return 0;
+    /* Atomic-DDL: release engine-bound resources (SdiStore CF handle,
+       tablespace ptr) BEFORE tidesdb_close. Idempotent vs the deinit path
+       -- whichever fires first wins. */
+    g_engine_ctx.reset();
     /* Take ownership atomically: any handler thread that loads after this
        point sees nullptr and short-circuits cleanly. We swap rather than
        load+store so no second caller can race us into a double-close. */
@@ -2930,6 +3201,12 @@ static int tidesdb_deinit_func(void *p)
     DBUG_ENTER("tidesdb_deinit_func");
 
     g_engine_ctx.schema_cf = NULL;
+
+    /* Atomic-DDL: release engine-bound resources (SdiStore holds a
+       tidesdb_column_family_t* whose lifecycle is bounded by the engine)
+       BEFORE we close the engine. reset() is idempotent so a prior panic
+       call that already ran reset() is harmless. */
+    g_engine_ctx.reset();
 
     /* Atomic exchange: takes ownership of the engine handle and races
        cleanly with tidesdb_hton_panic (which uses the same pattern). */
@@ -3690,11 +3967,25 @@ void ha_tidesdb::recover_counters()
 
 /* ******************** open / close / create ******************** */
 
-int ha_tidesdb::open(const char *name, int mode, uint test_if_locked, const dd::Table *)
+int ha_tidesdb::open(const char *name, int mode, uint test_if_locked,
+                     const dd::Table *table_def)
 {
     DBUG_ENTER("ha_tidesdb::open");
 
     if (!(share = get_share())) DBUG_RETURN(1);
+
+    /* Atomic-DDL (A-5) Task 7: debug hook to simulate a missing
+       se_private_data so the strict=ON / strict=OFF legacy paths can be
+       exercised without a real pre-v0.4.0 table on disk. The keyword
+       'tidesdb_zero_se_private_data' wipes every entry from the DD's
+       se_private_data Properties; validate_open below then sees an empty
+       Properties and follows the "missing keys" branch. Compiled out
+       under NDEBUG (Release builds). */
+    DBUG_EXECUTE_IF("tidesdb_zero_se_private_data", {
+        if (table_def) {
+            const_cast<dd::Properties &>(table_def->se_private_data()).clear();
+        }
+    });
 
     /* MF-1 + MF-9 fix: populate the share's ENGINE_ATTRIBUTE option
        cache. The expensive compute (25+ THDVAR reads + rapidjson Parse)
@@ -3873,6 +4164,20 @@ int ha_tidesdb::open(const char *name, int mode, uint test_if_locked, const dd::
     }
     unlock_shared_ha_data();
 
+    /* Atomic-DDL (A-5) Task 7: validate the persisted CF-name binding
+       against the path-inferred name. Under tidesdb_atomic_ddl_strict=ON
+       (default) a missing or mismatched se_private_data hard-rejects the
+       OPEN with HA_ERR_TABLE_DEF_CHANGED; OFF tolerates with a WARNING
+       (escape hatch for v0.3.x -> v0.4.0 upgrades, the only path where a
+       table can pre-exist without atomic-DDL bookkeeping). The DBUG hook
+       'tidesdb_zero_se_private_data' above wipes the Properties so the
+       legacy MTR tests can exercise both branches without an actual
+       pre-v0.4.0 table. */
+    if (!tidesdb_mysql::TidesdbAtomicDdlBridge::validate_open(
+            ha_thd(), table_def, share->cf_name.c_str())) {
+        DBUG_RETURN(HA_ERR_TABLE_DEF_CHANGED);
+    }
+
     /* We set ref_length for position()/rnd_pos() */
     ref_length = share->pk_key_len;
 
@@ -3924,7 +4229,8 @@ int ha_tidesdb::close(void)
     DBUG_RETURN(0);
 }
 
-int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *create_info, dd::Table *)
+int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *create_info,
+                       dd::Table *table_def)
 {
     DBUG_ENTER("ha_tidesdb::create");
 
@@ -3994,6 +4300,34 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
      * object-store replica recovery. For now just record the table name so
      * DROP TABLE can locate the underlying CF. */
     schema_cf_store_frm(name);
+
+    /* Atomic-DDL Task 12: crash-injection point.
+       The TidesDB CFs (main + secondary indexes) have been created in the
+       engine, but neither the SQL-layer DD txn for dd::Table nor our
+       se_private_data Properties have been written yet. On crash here the
+       engine state has orphan CFs with no matching DD row -- which is
+       exactly the recovery scenario the reconciler's "orphan CF" path
+       handles after restart (apply_delta drops or quarantines them). */
+    DBUG_EXECUTE_IF("tidesdb_crash_after_cf_create", DBUG_SUICIDE(););
+
+    /* Atomic-DDL (A-5) Task 6: persist bookkeeping (cf_name, schema
+       fingerprint, options checksum, atomic_ddl marker, creation timestamp)
+       into dd::Table::se_private_data so DROP, OPEN, and inplace-ALTER can
+       cross-check the CF binding and schema shape against what we created.
+       The DBUG keyword tidesdb_fail_after_se_private_data forces this to
+       return false so the rollback path can be tested without provoking a
+       real engine failure. On failure we propagate HA_ERR_GENERIC; the
+       existing CF and any index CFs we created above are not explicitly
+       removed here -- those become orphans that the Task 7+
+       DdSyncReconciler will sweep on next plugin load. */
+    if (table_def) {
+        if (!tidesdb_mysql::TidesdbAtomicDdlBridge::prepare_create(
+                ha_thd(), table_def, cf_name.c_str())) {
+            sql_print_error("[TIDESDB] atomic-ddl prepare_create failed for '%s'",
+                            cf_name.c_str());
+            DBUG_RETURN(HA_ERR_GENERIC);
+        }
+    }
 
     DBUG_RETURN(0);
 }
@@ -8305,14 +8639,117 @@ THR_LOCK_DATA **ha_tidesdb::store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lo
    definitions relocated; declarations (with `override`) stay in
    ha_tidesdb.h and all call paths are unchanged. */
 
+/* Atomic-DDL (A-5) Task 13 follow-up: flush any pending engine-txn writes
+   BEFORE we mutate the CF set (rename / drop). Required because:
+
+   * copy_data_between_tables runs INSIDE the user's session txn; it builds
+     up writes on the intermediate CF and may hold iterators referencing
+     the source CF (the one about to be renamed to '#sql-backup-*').
+   * mysql_rename_table swaps original<->intermediate, then quick_rm_table
+     drops the '#sql-backup-*'. Both reach our rename_table / delete_table.
+   * Without HTON_SUPPORTS_ATOMIC_DDL the server eagerly committed the
+     engine txn before these CF mutations (the non-atomic path at
+     sql_table.cc:14746 runs trans_commit_implicit BEFORE the rename block).
+     With the flag set, commit is deferred to the end (sql_table.cc:19191)
+     and runs AFTER rename + delete -- so the trx's pending writes and
+     cached iterators end up pointing at SST source blocks that
+     tidesdb_drop_column_family has just released. The deferred
+     tidesdb_txn_commit then crashes inside tidesdb_iter_release_sst_source_block
+     (UAF on the freed clock-cache block, observable as SIGSEGV @ 0x20).
+
+   The fix: at the entry of any handler-level CF-mutating callback, if the
+   current connection has a dirty engine txn, commit it now. This restores
+   the pre-Task-13 ordering (engine commit precedes CF mutations) without
+   removing the atomic-DDL contract at the server / DD level -- the
+   subsequent trans_commit_implicit still drives binlog + DD commit
+   atomically; the engine's portion of the 2PC just lands a no-op
+   (commit_done=true short-circuits the prepare hook).
+
+   We also clear any cached iterators on the handler so they don't leak
+   into the next statement on the same connection (the post-ALTER
+   reopen will rebuild them on demand). */
+static void tidesdb_flush_engine_txn_before_cf_mutation(THD *thd)
+{
+    if (!thd) return;
+    tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, tidesdb_hton);
+    if (!trx || !trx->txn) return;
+
+    /* Release any active stmt savepoint before commit (TidesDB requires this). */
+    if (trx->stmt_savepoint_active)
+    {
+        tidesdb_txn_release_savepoint(trx->txn, "stmt");
+        trx->stmt_savepoint_active = false;
+    }
+
+    /* Commit if dirty, otherwise rollback. Either way, the txn handle is
+       freed and a fresh one will be created on the next operation that
+       needs it (get_or_create_trx replays from thd_get_ha_data). */
+    int rc;
+    if (trx->dirty) {
+        rc = tidesdb_txn_commit(trx->txn);
+        if (rc != TDB_SUCCESS) {
+            sql_print_warning(
+                "[TIDESDB] pre-CF-mutation flush: tidesdb_txn_commit returned %d "
+                "(dirty=%d gen=%lu) -- rolling back",
+                rc, trx->dirty, (unsigned long)trx->txn_generation);
+            tidesdb_txn_rollback(trx->txn);
+        }
+    } else {
+        tidesdb_txn_rollback(trx->txn);
+    }
+
+    /* Free and clear; subsequent ops re-create via get_or_create_trx.
+       Mark commit_done=true so the eventual hton-prepare/commit hooks
+       become no-ops for this txn cycle. */
+    tidesdb_txn_free(trx->txn);
+    trx->txn = NULL;
+    trx->txn_generation++;
+    trx->dirty = false;
+    trx->stmt_savepoint_active = false;
+    trx->needs_reset = false;
+    trx->commit_done = true;
+    row_locks_release_all(trx);
+}
+
 /* ******************** rename_table (ALTER TABLE / RENAME) ******************** */
 
-int ha_tidesdb::rename_table(const char *from, const char *to, const dd::Table *, dd::Table *)
+int ha_tidesdb::rename_table(const char *from, const char *to,
+                             const dd::Table * /*from_table_def*/,
+                             dd::Table *to_table_def)
 {
     DBUG_ENTER("ha_tidesdb::rename_table");
 
+    /* Atomic-DDL Task 13 follow-up: flush pending engine writes before any
+       CF mutation. See tidesdb_flush_engine_txn_before_cf_mutation. */
+    tidesdb_flush_engine_txn_before_cf_mutation(ha_thd());
+
     std::string old_cf = path_to_cf_name(from);
     std::string new_cf = path_to_cf_name(to);
+
+    /* Atomic-DDL (A-5) Task 13: when HTON_SUPPORTS_ATOMIC_DDL is active,
+       validate_open enforces that se_private_data["cf_name"] matches the
+       path-inferred CF name on every open. RENAME must update the binding
+       so the post-rename open succeeds; otherwise validate_open rejects
+       with "CF-name mismatch" because the persisted cf_name still points
+       at the old name.
+
+       Always update to_table_def's cf_name to match `to`. This covers
+       both user-issued RENAME TABLE and the COPY-algorithm ALTER's two
+       internal renames (orig -> #sql-backup, then #sql-new -> orig);
+       the post-ALTER OPEN of the user's table name then validates
+       cleanly. We unconditionally call set() rather than gating on
+       exists() because legacy tables that came in without a binding
+       should ALSO have one written on rename (consistent with the
+       Task 13 "fill the binding wherever we touch the DD" stance). */
+    if (to_table_def != nullptr)
+    {
+        dd::Properties &p = to_table_def->se_private_data();
+        p.set("cf_name", dd::String_type(new_cf.c_str()));
+        if (!p.exists("atomic_ddl")) {
+            /* Legacy table just acquired a binding; mark it. */
+            p.set("atomic_ddl", "1");
+        }
+    }
 
     /* If the destination CF already exists (stale from a previous ALTER),
        drop it first so the rename can proceed. */
@@ -8522,9 +8959,38 @@ static void tidesdb_hton_drop_database(handlerton *, char *path)
                           to_drop.size(), to_drop.size() == 1 ? "y" : "ies", db.c_str());
 }
 
-int ha_tidesdb::delete_table(const char *name, const dd::Table *)
+int ha_tidesdb::delete_table(const char *name, const dd::Table *table_def)
 {
     DBUG_ENTER("ha_tidesdb::delete_table");
+
+    /* Atomic-DDL Task 13 follow-up: flush pending engine writes before any
+       CF mutation. See tidesdb_flush_engine_txn_before_cf_mutation. */
+    tidesdb_flush_engine_txn_before_cf_mutation(ha_thd());
+
+    /* atomic-DDL: erase the table's SDI blob BEFORE the CF goes away.
+       prepare_drop is idempotent and tolerates a missing dd::Table*
+       (temp tables / pre-9.7 fast paths). On failure (only reachable
+       via the tidesdb_fail_after_sdi_del DBUG keyword in v0.4.0) we
+       abort the drop with HA_ERR_GENERIC so the rollback test can
+       observe the error-propagation path. Real engine-txn rollback for
+       the CF drop arrives with HTON_SUPPORTS_ATOMIC_DDL in Task 13. */
+    if (!tidesdb_mysql::TidesdbAtomicDdlBridge::prepare_drop(ha_thd(), table_def)) {
+        sql_print_error("[TIDESDB] atomic-ddl prepare_drop failed for '%s'", name);
+        DBUG_RETURN(HA_ERR_GENERIC);
+    }
+
+    /* Atomic-DDL Task 12: crash-injection point.
+       prepare_drop has signalled the SDI / DD side that the row is going
+       away (in v0.4.0 this is observation-only on the engine txn until
+       HTON_SUPPORTS_ATOMIC_DDL flips), but tidesdb_drop_table_impl below
+       has NOT yet removed the actual CFs. On crash here the post-restart
+       state is "DD-side rolled back to pre-drop OR was committed mid-flight,
+       engine still has the CFs". The reconciler classifies whichever
+       discrepancy survives -- orphan dd::Table (DD kept the row, CFs gone)
+       or orphan CF (DD dropped the row, CFs still present) -- and surfaces
+       the matching log line. */
+    DBUG_EXECUTE_IF("tidesdb_crash_after_dd_commit_before_cf_drop", DBUG_SUICIDE(););
+
     DBUG_RETURN(tidesdb_drop_table_impl(name));
 }
 

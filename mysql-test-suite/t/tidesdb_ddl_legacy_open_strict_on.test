@@ -1,0 +1,49 @@
+--source suite/tidesdb/include/tidesdb_ddl_helpers.inc
+--source include/have_debug.inc
+#
+# A-5 atomic-DDL Task 7: validate_open hard-rejects missing
+# se_private_data under the default tidesdb_atomic_ddl_strict=ON.
+#
+# Production path covered: a legacy (pre-v0.4.0) table opening against
+# a v0.4.0+ engine where the operator has not opted into the upgrade
+# escape hatch. The open must fail loudly so the operator either
+# rebuilds the table or sets tidesdb_atomic_ddl_strict=OFF for the
+# upgrade window.
+#
+# We do not assert on the exact mysqld errno because the SQL layer can
+# surface my_error(ER_TABLEACCESS_DENIED_ERROR) for a handler-returned
+# HA_ERR_TABLE_DEF_CHANGED as either:
+#   - the my_error-raised ER_TABLEACCESS_DENIED_ERROR (1142), or
+#   - the generic ER_GET_ERRNO wrapper (1030),
+# depending on which open path the optimizer takes (prepared vs
+# direct table-open). Allow either; both prove the open was rejected.
+#
+
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY) ENGINE=TIDESDB;
+
+# strict stays at its default (ON). Arm the wipe and force a re-open.
+SET @@global.DEBUG = '+d,tidesdb_zero_se_private_data';
+FLUSH TABLES tdb_ddl_t;
+
+# The exact error number depends on whether the my_error()
+# ER_TABLEACCESS_DENIED_ERROR set inside validate_open survives the
+# handler::print_error path (which calls my_error(ER_TABLE_DEF_CHANGED)
+# on HA_ERR_TABLE_DEF_CHANGED). Both outcomes prove the open was
+# rejected by validate_open; we hide the message text to keep the
+# .result stable across either code path.
+--disable_result_log
+--error ER_TABLEACCESS_DENIED_ERROR,ER_TABLE_DEF_CHANGED,ER_GET_ERRNO
+SELECT * FROM tdb_ddl_t;
+--enable_result_log
+SELECT 1 AS open_was_rejected;
+
+SET @@global.DEBUG = '';
+
+# The wipe was an in-memory const_cast on the dd::Table the server
+# loaded into its DD cache. FLUSH TABLES alone does not evict the DD
+# cache entry, so a follow-up open could see the same wiped copy.
+# DROP TABLE in MySQL 9.7 does not call ha_tidesdb::open() (it goes
+# straight to handler::delete_table), so the wipe is harmless here.
+DROP TABLE tdb_ddl_t;
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

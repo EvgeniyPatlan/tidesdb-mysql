@@ -61,6 +61,13 @@ mkdir -p "$PLUGIN_DST"
 # were silently missed by the explicit list and broke the build.
 cp plugin/*.cc plugin/*.h plugin/CMakeLists.txt "$PLUGIN_DST/"
 
+# Also copy the atomic-DDL unit-test sources (pure helpers, no MySQL harness).
+# Skipped silently by their own CMakeLists when gtest is not installed.
+if [ -d plugin/tests ]; then
+    mkdir -p "$PLUGIN_DST/tests"
+    cp plugin/tests/*.cc plugin/tests/*.h plugin/tests/CMakeLists.txt "$PLUGIN_DST/tests/" 2>/dev/null || true
+fi
+
 # ---------- 5) Drop MTR suite into MySQL tree ----------
 SUITE_DST="vendor/mysql-server/mysql-test/suite/tidesdb"
 echo "[setup] Installing MTR suite -> $SUITE_DST"

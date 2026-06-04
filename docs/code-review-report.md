@@ -1,6 +1,6 @@
 # TidesDB-MySQL Plugin — Deep Code Review Report
 
-**Date:** 2026-05-12
+**Date:** 2026-05-12 (original) · **Refreshed:** 2026-06-02
 **Scope:** `plugin/` only (4 files, ~11.7k LOC)
   - `ha_tidesdb.cc` (10,147 lines)
   - `ha_tidesdb.h` (964 lines)
@@ -10,6 +10,20 @@
 **Method:** Four specialist review passes run in parallel (C++ correctness/concurrency,
 security, performance, architecture), then highest-impact claims spot-checked against
 the actual source.
+
+---
+
+## Revision 2 — status as of 2026-06-02
+
+**TL;DR: every CRITICAL and HIGH finding in this report is closed.** Verified by reading current code line-by-line for each finding (see Findings summary table at the bottom for per-finding status).
+
+The 10,147-line `ha_tidesdb.cc` has been broken up. As of 2026-06-02 the plugin directory holds eight translation units (`ha_tidesdb.cc` now 8,688 lines, plus `tidesdb_fts.cc` 736, `tidesdb_inplace_alter.cc` 850, `tidesdb_spatial.cc` 391, `tidesdb_row_lock.cc` 321, `tidesdb_master_key.cc` 288, `tidesdb_engine_context.cc` 57). The architect's "if you tackle nothing else, do these three" list (A-1 row-lock manager, A-2 FTS/spatial extraction, A-4 EngineContext) has been substantially executed.
+
+Several MEDIUM and LOW items have closed in passing during that refactor work — but **the medium/low rows in the summary table have not been individually re-verified in this refresh**. Treat them as "likely closed, confirm before acting." If a M-* or L-* finding influences a decision, re-verify against current code first.
+
+**Lesson recorded:** review-report findings drift quickly as code moves. Verify against current source before planning refactors against them; this refresh was triggered by discovering that a planned six-finding refactor was solving already-fixed bugs.
+
+---
 
 Findings marked **[verified]** were confirmed by direct read of the cited lines;
 **[agent]** means the claim is reported as the reviewer described it without
@@ -54,8 +68,9 @@ on the inplace ALTER virtuals are all `[[maybe_unused]]`.
 
 ## CRITICAL — block production
 
-### C-1. Encryption silently writes ciphertext under uninitialized key or IV
+### C-1. Encryption silently writes ciphertext under uninitialized key or IV — ✅ FIXED
 **Where:** `ha_tidesdb.cc:5134-5162` (encrypt), `ha_tidesdb.cc:5167-5196` (decrypt) — **[verified]**
+**Resolution (verified 2026-06-02):** `tidesdb_encrypt_row_into` and `tidesdb_decrypt_row` (now `plugin/ha_tidesdb.cc:4032,4101`) check the rc from `encryption_key_get` and `my_random_bytes` explicitly and bail with `sql_print_error` if either fails. `encryption_key_get` itself gates on `g_master_key_loaded` (`plugin/tidesdb_master_key.cc:234,272`). Local key buffers are zeroed with `tdb_secure_zero` on every exit path.
 
 `tidesdb_encrypt_row_into` declares `unsigned char key[TIDESDB_ENC_KEY_LEN]`
 and `unsigned char iv[TIDESDB_ENC_IV_LEN]` on the stack, then calls
@@ -84,8 +99,9 @@ if (my_random_bytes(iv, TIDESDB_ENC_IV_LEN) != 0) return false;
 …and zero `key[]` before return with `OPENSSL_cleanse(key, sizeof(key))` to
 limit key-disclosure window (see H-7).
 
-### C-2. `tdb_global` shutdown race causes null-deref crashes
+### C-2. `tdb_global` shutdown race causes null-deref crashes — ✅ FIXED
 **Where:** `ha_tidesdb.cc:194` (declaration), `ha_tidesdb.cc:~2786` (read in `get_or_create_trx`), `ha_tidesdb.cc:~4049` (clear in `tidesdb_hton_panic`) — **[agent]**
+**Resolution (verified 2026-06-02):** Promoted to `std::atomic<tidesdb_t *>` inside `tidesdb_engine_context.{cc,h}` (`g_engine_ctx.engine`). `tidesdb_deinit_func` uses `exchange(nullptr, acq_rel)` before `tidesdb_close`. All read sites go through the atomic.
 
 `static tidesdb_t *tdb_global = NULL;` is a plain pointer with no atomic
 qualification and no protecting mutex. Handler entry points dereference it
@@ -103,8 +119,9 @@ an `EngineContext` with explicit lifecycle (see R-3 in Refactor section).
 
 ## HIGH
 
-### H-1. Deadlock detector never re-runs after the condition-wait wakeup
+### H-1. Deadlock detector never re-runs after the condition-wait wakeup — ✅ FIXED
 **Where:** `ha_tidesdb.cc:397-412` — **[verified]**
+**Resolution (verified 2026-06-02):** `row_lock_acquire` re-runs `tdb_lock_would_deadlock` inside the wait loop. Lock-order with `g_trx_lifecycle_lock` (the rdlock acquired by the walker, wrlock acquired by close) is documented inline; see `plugin/tidesdb_row_lock.cc:95-127`.
 
 `row_lock_acquire` runs `tdb_lock_would_deadlock` once before the wait
 (line 373), but the `while (...) mysql_cond_wait(...)` loop only re-checks
@@ -117,8 +134,9 @@ than `ER_LOCK_DEADLOCK`.
 **Fix:** Re-run `tdb_lock_would_deadlock(trx, lock)` at the top of each
 loop iteration, return `HA_ERR_LOCK_DEADLOCK` on positive.
 
-### H-2. FTS doc/word counters lost-update under concurrent writes
+### H-2. FTS doc/word counters lost-update under concurrent writes — ✅ FIXED
 **Where:** `ha_tidesdb.cc:656-677` (`fts_update_meta`), called from write_row (5827), update_row (6967), delete_row (7207) — **[agent]**
+**Resolution (verified 2026-06-02):** Bulk-insert delta accumulator (M-4 fix) plus per-share `fts_meta_mutex` (the HF-2 follow-up moved the originally-global mutex into `TidesDB_share`). See `plugin/ha_tidesdb.cc:1681` ("former process-global g_fts_meta_mutex") and the delta arrays at `plugin/ha_tidesdb.cc:4797, 6580, 6607`.
 
 `fts_update_meta` does `fts_load_meta` → mutate in C++ → `tidesdb_txn_put`,
 all within the caller's transaction. Under `READ_COMMITTED` or `SNAPSHOT`
@@ -132,8 +150,9 @@ isolation, (b) store deltas rather than absolute counts and accumulate at
 commit, or (c) serialize FTS meta writes through a per-table mutex held
 across read-modify-write.
 
-### H-3. Suspected use-after-free in deadlock graph walk
+### H-3. Suspected use-after-free in deadlock graph walk — ✅ FIXED
 **Where:** `ha_tidesdb.cc:304-318` (walker), `:435-457` (release_all) — **[agent, partially verified]**
+**Resolution (verified 2026-06-02):** `g_trx_lifecycle_lock` rwlock added — walker takes rdlock; `tidesdb_close_connection` takes wrlock around `my_free(trx)`. Documented lock-order invariant comment at the close site. Also the kill_query path was patched in commit 37441d6 to take the same rdlock (closing the CF-1 regression that the original wrapper miss introduced).
 
 `tdb_lock_would_deadlock` atomically loads `target_lock->owner_trx`, then
 dereferences the loaded pointer (`cur->waiting_on.load(...)`) without
@@ -156,8 +175,9 @@ corruption from any concurrent DML.
 the duration of the walk), or (b) acquire the target partition mutex
 before each deref, accepting the contention.
 
-### H-4. Hilbert encoder corrupts spatial keys via operator-precedence bug
+### H-4. Hilbert encoder corrupts spatial keys via operator-precedence bug — ✅ FIXED
 **Where:** `ha_tidesdb.cc:1280-1291`, specifically line 1288 — **[verified]**
+**Resolution (verified 2026-06-02):** The report's preferred fix was applied — `hilbert_rot`'s `n` parameter widened to `uint64_t` (`plugin/tidesdb_spatial.cc:66`). `HILBERT_N` is now `(uint64_t)1 << HILBERT_ORDER` (line 39), so `s << 1` no longer truncates. Spatial code is also now its own translation unit (`plugin/tidesdb_spatial.{cc,h}`), executing the A-2 architectural recommendation.
 
 ```cpp
 hilbert_rot((uint32_t)s << 1, &x, &y, rx, ry);
@@ -182,8 +202,9 @@ matches. No error, no warning — just silently incorrect results.
 (preferred — eliminates the truncation entirely), or shift first then cast:
 `(uint32_t)(s << 1)`.
 
-### H-5. S3 secret key visible to anyone with SYSTEM_VARIABLES_ADMIN
+### H-5. S3 secret key visible to anyone with SYSTEM_VARIABLES_ADMIN — ✅ FIXED
 **Where:** `ha_tidesdb.cc:2033-2035`, also `:1997` (master key file path), `:2029` (access key) — **[verified]**
+**Resolution (verified 2026-06-02):** `srv_s3_secret_key` is now declared with `PLUGIN_VAR_NOSYSVAR` (`plugin/ha_tidesdb.cc:767-770`), so the value is loadable from `my.cnf` but invisible to `SHOW VARIABLES` and to plugin sysvar APIs.
 
 ```cpp
 static MYSQL_SYSVAR_STR(s3_secret_key, srv_s3_secret_key,
@@ -202,8 +223,9 @@ this enables S3 + key-file exfiltration through purely SQL-level access.
 register with a custom `SHOW_FUNC` returning `"***"`. Move the actual
 value into a non-sysvar storage location once read at startup.
 
-### H-6. Path traversal via `tidesdb_backup_dir` / `tidesdb_checkpoint_dir`
+### H-6. Path traversal via `tidesdb_backup_dir` / `tidesdb_checkpoint_dir` — ✅ FIXED (commit 37441d6)
 **Where:** `ha_tidesdb.cc:2133-2188` (backup check), `:2213-2249` (checkpoint check) — **[agent]**
+**Resolution (verified 2026-06-02):** Two-part fix in commit 37441d6: `tidesdb_backup_allowed_root` sysvar declares the operator-trusted root, and `tdb_path_is_under_allowed_root()` realpath-confines both the backup and checkpoint check callbacks (see `plugin/ha_tidesdb.cc:872-994, :1032, :1158`). Per-call `realpath()` resolution defeats symlink redirects (the HF-3 follow-up exposure).
 
 The sysvar update callbacks pass the user-supplied path string directly
 to `tidesdb_backup()` / `tidesdb_checkpoint()` with no canonicalization
@@ -224,8 +246,9 @@ paths containing `..` outright. For `force_remove_cf_dir`, audit
 `path_to_cf_name` to confirm `..` cannot survive the transformation; add
 a `realpath`-prefix check defensively.
 
-### H-7. Encryption key bytes never zeroed after use
+### H-7. Encryption key bytes never zeroed after use — ✅ FIXED
 **Where:** `ha_tidesdb.cc:5137-5161` (encrypt), `:5175-5196` (decrypt) — **[verified]**
+**Resolution (verified 2026-06-02):** Every local key buffer in the encrypt/decrypt paths is zeroed on every exit via `tdb_secure_zero` (`plugin/ha_tidesdb.cc:4039, :4050, :4066, :4083, :4113, :4130`). `tdb_secure_zero` itself uses `explicit_bzero` when available (the LF-3 follow-up; see `plugin/ha_tidesdb.cc:4014`). Master-key globals are also defensively `mlock`'d in the master-key subsystem.
 
 The 32-byte master key sits in a stack local until the function returns,
 then is left on the stack frame for the next caller to potentially overlay
@@ -242,8 +265,9 @@ contain the key.
 not linking OpenSSL directly, use `explicit_bzero` (glibc/BSD) or a
 volatile-pointer memset.
 
-### H-8. Sysvar update callback mutates a connection thread's transaction
+### H-8. Sysvar update callback mutates a connection thread's transaction — ✅ FIXED
 **Where:** `ha_tidesdb.cc:2133-2188` (`tidesdb_backup_dir_check`) — **[agent]**
+**Resolution (verified 2026-06-02):** The check callbacks no longer touch per-connection trx state. `tidesdb_backup_dir_check` runs validation + realpath-confinement only; `tidesdb_promote_primary_update` operates on the engine, not on any THD's `trx->txn`. Backup/checkpoint themselves run synchronously inside the calling THD without reaching into other connections' state.
 
 The update-check callback for `tidesdb_backup_dir` reaches into a target
 THD's `tidesdb_trx_t`, calls `tidesdb_txn_rollback(trx->txn)`, then sets
@@ -259,8 +283,9 @@ shouldn't touch per-connection transaction state at all.
 genuinely requires draining active transactions, set a flag the connection
 poll at its next safe point (e.g., next `external_lock` entry).
 
-### H-9. ENGINE_ATTRIBUTE JSON parser has no depth limit — stack overflow
+### H-9. ENGINE_ATTRIBUTE JSON parser has no depth limit — stack overflow — ✅ FIXED
 **Where:** `ha_tidesdb.cc:2416-2418` (`tidesdb_engine_attribute_to_options`) — **[agent]**
+**Resolution (verified 2026-06-02):** Two layers: a hard 64 KiB length cap (`TIDESDB_ENGINE_ATTRIBUTE_MAX_LEN`, `plugin/ha_tidesdb.cc:1340`) is enforced before parsing (line 1346); the parser itself uses `kParseIterativeFlag` (line 1365), eliminating stack-recursion depth as an attack vector entirely. Both the original H-9 (stack overflow) and the MF-3 followup (no size cap on the iterative parse) are closed.
 
 `doc.Parse(attr.str, attr.length)` uses default rapidjson flags: recursive
 descent, no depth cap (default 500). MySQL's DD persists ENGINE_ATTRIBUTE
@@ -273,8 +298,9 @@ unrecoverable without dropping it via raw FS access.
 **Fix:** Use `rapidjson::kParseIterativeFlag` to eliminate recursion, or
 `SetMaxNestingDepth(32)` on the Document.
 
-### H-10. ICP advertised but the check stub returns 0 unconditionally
+### H-10. ICP advertised but the check stub returns 0 unconditionally — ✅ FIXED
 **Where:** `tidesdb_compat.h:207`, called from `ha_tidesdb.cc:4667` (`icp_check_secondary`), advertised via `index_flags` — **[verified for stub, agent for advertise/consume]**
+**Resolution (verified 2026-06-02):** The MariaDB stub was deleted (see deletion note in `plugin/tidesdb_compat.h:202-209`). Real ICP evaluation is now inline in `ha_tidesdb::icp_check_secondary` (`plugin/ha_tidesdb.cc:3493+`), combining `compare_key_icp` end-range honoring with `pushed_idx_cond->val_bool()` and a kill check. The PK branch explicitly refuses ICP push (line 6712) to avoid the `in_range_check_pushed_down` end-range bypass.
 
 ```cpp
 inline int handler_index_cond_check(void * /*opaque*/) { return 0; }
@@ -707,49 +733,49 @@ for atomic-DDL work.
 
 ## Findings summary table
 
-| ID | Severity | Where | Issue |
-|---|---|---|---|
-| C-1 | CRITICAL | `ha_tidesdb.cc:5134-5196` | Encrypt/decrypt discard return values → uninitialized key or IV |
-| C-2 | CRITICAL | `ha_tidesdb.cc:194, ~2786, ~4049` | `tdb_global` shutdown race → null deref |
-| H-1 | HIGH | `ha_tidesdb.cc:397-412` | Deadlock not re-checked after cond_wait wakeup |
-| H-2 | HIGH | `ha_tidesdb.cc:656-677` | FTS doc/word counter lost-update; degrades BM25 silently |
-| H-3 | HIGH | `ha_tidesdb.cc:304-318, 435-457` | Suspected UAF in deadlock walker |
-| H-4 | HIGH | `ha_tidesdb.cc:1280-1291` | Hilbert encoder: `(uint32_t)s << 1` overflows; corrupts spatial keys |
-| H-5 | HIGH | `ha_tidesdb.cc:2033-2035, :1997, :2029` | S3 secret/master-key-path visible in `SHOW VARIABLES` |
-| H-6 | HIGH | `ha_tidesdb.cc:2133-2188, :2213-2249` | `tidesdb_backup_dir` / `_checkpoint_dir` accept any filesystem path |
-| H-7 | HIGH | `ha_tidesdb.cc:5137-5196` | Master-key stack bytes never zeroed; survives in core dumps |
-| H-8 | HIGH | `ha_tidesdb.cc:2133-2188` | Sysvar update callback races connection thread on `trx->txn` |
-| H-9 | HIGH | `ha_tidesdb.cc:2416-2418` | ENGINE_ATTRIBUTE JSON parser: unbounded recursion → stack overflow |
-| H-10 | HIGH | `tidesdb_compat.h:207` | `handler_index_cond_check` always returns 0; ICP advertised but broken |
-| M-1 | MEDIUM | `ha_tidesdb.cc:2507-2520` | TLS opts struct aliased if nested handler calls happen |
-| M-2 | MEDIUM | `tidesdb_compat.h:256-271` | `my_random_bytes` opens /dev/urandom per row |
-| M-3 | MEDIUM | `ha_tidesdb.cc:~3551` | `free()` on TidesDB-allocated buffer — heap corruption with mimalloc/jemalloc |
-| M-4 | MEDIUM | `ha_tidesdb.cc:656-677` | FTS meta RMW per row; expensive in bulk insert |
-| M-5 | MEDIUM | `ha_tidesdb.cc:5809-5827, 6888-6960, 7192-7207` | FTS tokenization allocates per token per row |
-| M-6 | MEDIUM | `ha_tidesdb.cc:5256-5261, 5375-5389` | Field::pack virtual-dispatched per field per row |
-| M-7 | MEDIUM | `ha_tidesdb.cc:4373-4390` | `key_copy_to_comparable` writes to `record[1]` per seek |
-| M-8 | MEDIUM | `tidesdb_keyring_compat.cc:101-111` | Mutex taken on every decrypt despite key being immutable |
-| M-9 | MEDIUM | `ha_tidesdb.cc:7641-7644` | MRR `std::string` per range key |
-| M-10 | MEDIUM | `ha_tidesdb.cc:265-291, 435-457` | Lock-table entries never recycled; unbounded growth |
-| M-11 | MEDIUM | `ha_tidesdb.cc:~5880-5930` | Stopword load holds FTS write-lock across table scan |
-| M-12 | MEDIUM | `ha_tidesdb.cc:777-870` | SUSPECTED: stopword-table-load bypasses table-level grants |
-| M-13 | MEDIUM | `ha_tidesdb.cc:2507-2520` | `tidesdb_opts_for_table` re-parses JSON on every call |
-| L-1 | LOW | `tidesdb_compat.h:218` | Zero-init mysql_mutex_t; UB on macOS/BSD but currently unused |
-| L-2 | LOW | `tidesdb_keyring_compat.cc:122-143` | `encryption_crypt` ignores `iv_len` parameter |
-| L-3 | LOW | `tidesdb_keyring_compat.cc:119` | Integer overflow on >4GB rows in encrypted_length |
-| L-4 | LOW | `ha_tidesdb.cc:3939-3940` | S3 bucket/endpoint logged at INFO on startup |
-| L-5 | LOW | `tidesdb_keyring_compat.cc:64-85` | Master key never `mlock`'d; survives in swap and core files |
-| L-6 | LOW | `ha_tidesdb.cc:7152-7163` | `std::string` per row in bulk-delete range tracking |
-| L-7 | LOW | `ha_tidesdb.cc:6782, :6820` | `update_row` rebuilds PK even for non-PK updates |
-| L-8 | LOW | `ha_tidesdb.cc:1045-1063` | FTS field concatenation allocates flat doc buffer |
+| ID | Severity | Where (original) | Issue | Status as of 2026-06-02 |
+|---|---|---|---|---|
+| C-1 | CRITICAL | `ha_tidesdb.cc:5134-5196` | Encrypt/decrypt discard return values → uninitialized key or IV | ✅ **FIXED** |
+| C-2 | CRITICAL | `ha_tidesdb.cc:194, ~2786, ~4049` | `tdb_global` shutdown race → null deref | ✅ **FIXED** (atomic, EngineContext) |
+| H-1 | HIGH | `ha_tidesdb.cc:397-412` | Deadlock not re-checked after cond_wait wakeup | ✅ **FIXED** |
+| H-2 | HIGH | `ha_tidesdb.cc:656-677` | FTS doc/word counter lost-update | ✅ **FIXED** (delta accum + per-share mutex) |
+| H-3 | HIGH | `ha_tidesdb.cc:304-318, 435-457` | Suspected UAF in deadlock walker | ✅ **FIXED** (lifecycle rwlock) |
+| H-4 | HIGH | `ha_tidesdb.cc:1280-1291` | Hilbert encoder `(uint32_t)s << 1` truncation | ✅ **FIXED** (n widened to u64; spatial extracted) |
+| H-5 | HIGH | `ha_tidesdb.cc:2033-2035, :1997, :2029` | S3 secret visible in SHOW VARIABLES | ✅ **FIXED** (`PLUGIN_VAR_NOSYSVAR`) |
+| H-6 | HIGH | `ha_tidesdb.cc:2133-2188, :2213-2249` | `tidesdb_backup_dir` / `_checkpoint_dir` accept any path | ✅ **FIXED** (37441d6, allowed-root + realpath) |
+| H-7 | HIGH | `ha_tidesdb.cc:5137-5196` | Master-key stack bytes never zeroed | ✅ **FIXED** (`tdb_secure_zero` everywhere) |
+| H-8 | HIGH | `ha_tidesdb.cc:2133-2188` | Sysvar update callback races on `trx->txn` | ✅ **FIXED** (callbacks no longer touch per-conn trx) |
+| H-9 | HIGH | `ha_tidesdb.cc:2416-2418` | ENGINE_ATTRIBUTE JSON parser stack overflow | ✅ **FIXED** (64 KiB cap + `kParseIterativeFlag`) |
+| H-10 | HIGH | `tidesdb_compat.h:207` | ICP stub always returns 0; ICP broken | ✅ **FIXED** (stub deleted; real eval inline) |
+| M-1 | MEDIUM | `ha_tidesdb.cc:2507-2520` | TLS opts struct aliased | Not re-verified |
+| M-2 | MEDIUM | `tidesdb_compat.h:256-271` | `my_random_bytes` opens /dev/urandom per row | Not re-verified |
+| M-3 | MEDIUM | `ha_tidesdb.cc:~3551` | `free()` on TidesDB pointer — corrupts non-libc heaps | Not re-verified |
+| M-4 | MEDIUM | `ha_tidesdb.cc:656-677` | FTS meta RMW per row | ✅ Fixed — delta accumulator (`fts_meta_doc_delta_`) |
+| M-5 | MEDIUM | `ha_tidesdb.cc:5809-5827, 6888-6960, 7192-7207` | FTS tokenization per-token alloc | Not re-verified |
+| M-6 | MEDIUM | `ha_tidesdb.cc:5256-5261, 5375-5389` | Field::pack virtual-dispatched per field | Not re-verified |
+| M-7 | MEDIUM | `ha_tidesdb.cc:4373-4390` | `key_copy_to_comparable` writes to record[1] per seek | Not re-verified |
+| M-8 | MEDIUM | `tidesdb_keyring_compat.cc:101-111` | Mutex on every decrypt | Not re-verified |
+| M-9 | MEDIUM | `ha_tidesdb.cc:7641-7644` | MRR `std::string` per range key | Not re-verified |
+| M-10 | MEDIUM | `ha_tidesdb.cc:265-291, 435-457` | Lock-table entries never recycled | Not re-verified |
+| M-11 | MEDIUM | `ha_tidesdb.cc:~5880-5930` | Stopword load holds FTS write-lock across scan | Not re-verified |
+| M-12 | MEDIUM | `ha_tidesdb.cc:777-870` | Stopword-table-load bypasses grants | ✅ Fixed — fail-closed `check_access(SELECT_ACL, ...)` |
+| M-13 | MEDIUM | `ha_tidesdb.cc:2507-2520` | `tidesdb_opts_for_table` re-parses JSON | Not re-verified |
+| L-1 | LOW | `tidesdb_compat.h:218` | Zero-init mysql_mutex_t (latent) | Not re-verified |
+| L-2 | LOW | `tidesdb_keyring_compat.cc:122-143` | `encryption_crypt` ignores `iv_len` | Not re-verified |
+| L-3 | LOW | `tidesdb_keyring_compat.cc:119` | Integer overflow on >4GB rows | ✅ Fixed — `TIDESDB_ENCRYPT_MAX_PLAIN = 0xEFFFFFFFu` (`ha_tidesdb.cc:4063`) |
+| L-4 | LOW | `ha_tidesdb.cc:3939-3940` | S3 bucket/endpoint logged at INFO | ✅ Fixed — `redact()` applied (`ha_tidesdb.cc:2719+`) |
+| L-5 | LOW | `tidesdb_keyring_compat.cc:64-85` | Master key never `mlock`'d | ✅ Fixed — master-key subsystem promotion (`tidesdb_master_key.cc`) |
+| L-6 | LOW | `ha_tidesdb.cc:7152-7163` | `std::string` per row in bulk-delete tracking | Not re-verified |
+| L-7 | LOW | `ha_tidesdb.cc:6782, :6820` | `update_row` rebuilds PK unconditionally | Not re-verified |
+| L-8 | LOW | `ha_tidesdb.cc:1045-1063` | FTS field concatenation allocates flat doc buffer | Not re-verified |
 
-| ID | Refactor (architecture) |
-|---|---|
-| A-1 | Extract row-lock manager to its own TU |
-| A-2 | Extract FTS and spatial subsystems |
-| A-3 | `TidesStore` abstraction; single error channel through `tdb_rc_to_ha` |
-| A-4 | `EngineContext` to replace global mutables |
-| A-5 | MySQL 9.7 atomic-DDL participation (SDI callbacks) |
-| A-6 | Delete `#if 0` blocks and MariaDB-only methods |
-| A-7 | Explicit state machine for inplace ALTER |
-| A-8 | Audit `tidesdb_compat.h`; delete inactive traps |
+| ID | Refactor (architecture) | Status as of 2026-06-02 |
+|---|---|---|
+| A-1 | Extract row-lock manager to its own TU | ✅ Done — `plugin/tidesdb_row_lock.{cc,h}` |
+| A-2 | Extract FTS and spatial subsystems | ✅ Done — `plugin/tidesdb_fts.{cc,h}`, `plugin/tidesdb_spatial.{cc,h}` |
+| A-3 | `TidesStore` abstraction; single error channel | Partial — error channel unified through `tdb_rc_to_ha`; no full `TidesStore` wrapper yet |
+| A-4 | `EngineContext` to replace global mutables | ✅ Done — `plugin/tidesdb_engine_context.{cc,h}` (`g_engine_ctx`) |
+| A-5 | MySQL 9.7 atomic-DDL participation (SDI callbacks) | **Open** |
+| A-6 | Delete `#if 0` blocks and MariaDB-only methods | Partial — `handler_index_cond_check` deleted; broader audit pending |
+| A-7 | Explicit state machine for inplace ALTER | ✅ Done — `plugin/tidesdb_inplace_alter.cc` |
+| A-8 | Audit `tidesdb_compat.h`; delete inactive traps | Partial — items have migrated out incrementally |

@@ -1,0 +1,9 @@
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY) ENGINE=TIDESDB;
+SET @@global.DEBUG = '+d,tidesdb_zero_se_private_data';
+FLUSH TABLES tdb_ddl_t;
+SELECT 1 AS open_was_rejected;
+open_was_rejected
+1
+SET @@global.DEBUG = '';
+DROP TABLE tdb_ddl_t;
+# Done.

@@ -1,0 +1,60 @@
+--source suite/tidesdb/include/tidesdb_ddl_helpers.inc
+--source include/have_debug.inc
+#
+# A-5 atomic-DDL Task 6: prepare_create persists se_private_data on CREATE.
+#
+# After CREATE TABLE ... ENGINE=TIDESDB, ha_tidesdb::create calls
+# TidesdbAtomicDdlBridge::prepare_create which writes five entries into
+# dd::Table::se_private_data:
+#
+#   cf_name      -- the column family name we passed to TidesDB
+#   fingerprint  -- SHA-256 over the canonical column list (hex)
+#   options_csum -- CRC32 over the normalised engine_attribute JSON
+#   atomic_ddl   -- the literal string "1"
+#   created_at   -- decimal seconds since epoch
+#
+# In MySQL 9.7 the Data Dictionary hides se_private_data of non-InnoDB
+# engines from information_schema. Surfacing it via a custom IS table
+# (or mysql.tables) is out of scope here. Instead we use a debug-only
+# dump path:
+#
+#   1. prepare_create caches a pointer to the just-written
+#      dd::Table* in a static last_created_table_def_ (debug builds).
+#   2. tidesdb_show_status, when armed with DBUG keyword
+#      'tidesdb_dump_se_private_data', iterates that Properties object
+#      and emits one INFO line per key=value pair.
+#   3. This test arms the keyword, creates a table, and greps the
+#      error log for the five expected keys.
+#
+
+SET @save_log_error_verbosity = @@global.log_error_verbosity;
+SET GLOBAL log_error_verbosity = 3;
+
+# Truncate the error log so the grep counts only INFO lines from this
+# test's CREATE + SHOW.
+--exec : > $MYSQLTEST_VARDIR/log/mysqld.1.err
+
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY, v VARCHAR(64)) ENGINE=TIDESDB;
+
+SET @@global.DEBUG = '+d,tidesdb_dump_se_private_data';
+SELECT @@global.DEBUG LIKE '%tidesdb_dump_se_private_data%' AS armed;
+
+--disable_result_log
+SHOW ENGINE TIDESDB STATUS;
+--enable_result_log
+
+# Five entries: cf_name, fingerprint, options_csum, atomic_ddl, created_at.
+# Each prints as a single INFO line "[TIDESDB] se_private_data key=...".
+let $log_file = $MYSQLTEST_VARDIR/log/mysqld.1.err;
+--exec grep -c "se_private_data key=cf_name"      $log_file
+--exec grep -c "se_private_data key=fingerprint"  $log_file
+--exec grep -c "se_private_data key=options_csum" $log_file
+--exec grep -c "se_private_data key=atomic_ddl"   $log_file
+--exec grep -c "se_private_data key=created_at"   $log_file
+
+SET @@global.DEBUG = '';
+SET GLOBAL log_error_verbosity = @save_log_error_verbosity;
+
+DROP TABLE tdb_ddl_t;
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

@@ -514,6 +514,12 @@ class ha_tidesdb_inplace_ctx : public inplace_alter_handler_ctx
     /* CF names to drop for removed indexes (dropped during commit phase) */
     std::vector<std::string> drop_cf_names;
 
+    /* Atomic-DDL participation (Task 9): the post-ALTER serialized
+       se_private_data, pre-staged during prepare_inplace_alter_table
+       and stamped onto new_table_def in commit_inplace_alter_table when
+       commit=true. Empty when not computed (e.g. NULL new_table_def). */
+    std::string new_se_private_serialized;
+
     virtual ~ha_tidesdb_inplace_ctx()
     {
     }

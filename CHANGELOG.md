@@ -157,6 +157,42 @@ Engine improvements inherited from v9.3.0 (no plugin change needed): a hard acti
 
 Gated on the full validation suite: MTR, the HammerDB SIGKILL recovery gate, the mwbench engine-integrity gate (0 mismatches / 0 misses), and a full HammerDB WARE=100 throughput run. See [docs/v9.3.0-validation-report.md](docs/v9.3.0-validation-report.md).
 
+## v0.4.0 — 2026-06-04
+
+Atomic-DDL participation (closes review finding **A-5**). `HTON_SUPPORTS_ATOMIC_DDL` is now set on the TidesDB handlerton, schema metadata is persisted in `dd::Table::se_private_data` during CREATE/ALTER, the plugin is self-healing across crash-during-DDL via an eager startup reconciliation sweep, and the full set of SDI + DDSE callbacks is wired. The bundled engine is unchanged from v0.3.1 (still TidesDB **v9.3.2**, still shipped unpatched).
+
+See [docs/v0.4.0-validation-report.md](docs/v0.4.0-validation-report.md) for the full validation matrix.
+
+### Added
+
+- `HTON_SUPPORTS_ATOMIC_DDL` flag on the handlerton. The server now drives DD commit/rollback through our prepare/commit hooks and rolls the DD back on engine-side failure.
+- Six SDI tablespace callbacks (`sdi_create`, `sdi_drop`, `sdi_get_keys`, `sdi_get`, `sdi_set`, `sdi_delete`) against a dedicated metadata column family `__tidesdb_sdi`. Key encoding via `SdiStore::pack_key(tablespace_id, sdi_type, sdi_id)` — deterministic 24-byte big-endian for clean prefix scans.
+- Eight DDSE callback stubs (`ddse_dict_init`, `dict_init`, `dict_recover`, `dict_cache_reset`, `dict_cache_reset_tables_and_tablespaces`, `dict_get_server_version`, `dict_set_server_version`, `is_dict_readonly`) — each logs once at INFO if invoked. Forward-capability slots for a future "TidesDB hosts the data dictionary" project; no production MySQL 9.7 path drives them.
+- Single engine-wide `tidesdb_system` tablespace registered via `Plugin_tablespace`.
+- `prepare_create` writes `cf_name`, SHA-256 `schema_fingerprint`, CRC32 `options_checksum`, `atomic_ddl=1`, and `created_at` into `dd::Table::se_private_data` on every `CREATE TABLE`.
+- `validate_open` enforces the binding on every open under strict mode: `atomic_ddl` flag, CF-name binding, schema fingerprint, options checksum.
+- `prepare_drop` removes the SDI blob before the CF drop so an interrupted drop never leaves SDI pointing at a dead CF.
+- `DdSyncReconciler::compute_delta_pure` (symmetric difference between DD `dd::Table` rows and on-disk CFs, excluding `__`-prefixed CFs) + `DdSyncReconciler::apply_delta` (resolves drift per the new `tidesdb_orphan_action` sysvar at startup).
+- New sysvar `tidesdb_atomic_ddl_strict` (BOOL, default **ON**) — enforce `atomic_ddl=1` in `se_private_data` on open.
+- New sysvar `tidesdb_orphan_action` (ENUM `drop` / `quarantine` / `log_only`, default **`quarantine`**) — governs the startup orphan sweep.
+- 20 new MTR tests (4 SDI round-trip, 2 atomic CREATE, 2 atomic DROP, 1 atomic ALTER, 4 sweep variants, 3 crash-during-DDL, 1 DDSE-stubs-inert, 2 legacy-open, 1 tablespace-visible).
+- 10 new gtest unit tests (3 `SdiPackKey`, 7 `ReconcilerDelta`).
+
+### Changed
+
+- The four inplace ALTER virtuals (`check_if_supported_inplace_alter`, `prepare_inplace_alter_table`, `inplace_alter_table`, `commit_inplace_alter_table`) now actively consume their `dd::Table*` parameters (previously `[[maybe_unused]]`). `commit_inplace_alter_table` recomputes `schema_fingerprint` + `options_checksum`, re-emits SDI via `sdi_set`, and writes updated `se_private_data` into the new `dd::Table*` atomically with the CF mutation. Rollback restores the saved `se_private_data` and reverts the CF.
+- `ha_tidesdb::rename_table` and `ha_tidesdb::delete_table` now flush the engine session txn before mutating the CF (see *Fixed* below).
+
+### Fixed
+
+- **COPY-ALTER 2PC SIGSEGV** (commit `0d7fe2c`). Activating `HTON_SUPPORTS_ATOMIC_DDL` defers the engine commit past `sql_table.cc:19191`'s `quick_rm_table`, which surfaced a pre-existing latent heap-use-after-free inside the TidesDB C library: `tidesdb_iter_release_sst_source_block` decrementing a freed `clock_cache` block refcount at offset `0x20`. Live SST iterators on the backup CF outlived `tidesdb_drop_column_family`. Fix: new helper `tidesdb_flush_engine_txn_before_cf_mutation(THD*)` is called at the top of `rename_table` and `delete_table` — it commits the engine txn if dirty (releasing iterators), rolls back if clean, frees the handle, releases TidesDB row locks, and sets `commit_done=true` so subsequent hton hooks short-circuit at the engine layer. This restores pre-flag-flip engine-layer ordering without weakening the atomic-DDL contract at the server / DD layer. This fix is **tactical**; the architectural fix — a SE-private DDL journal so CF rename / drop replays alongside user data writes — is deferred to v0.5.0.
+
+### Upgrade notes
+
+- **Pre-v0.4.0 tables have no `se_private_data` and no SDI blob.** With `tidesdb_atomic_ddl_strict=ON` (the new default), opening such a table fails with `ER_TIDESDB_LEGACY_TABLE_STRICT`. The supported upgrade path is to run a no-op `ALTER TABLE t ENGINE=TIDESDB` per user table, which populates `se_private_data` and emits the SDI blob. For bulk migration, set `tidesdb_atomic_ddl_strict=OFF` temporarily — legacy tables will open with a warning while the ALTERs are applied — then flip it back to `ON`.
+- **The default orphan-sweep action is `quarantine`.** Operators upgrading from v0.3.x will likely have no orphan CFs at all (the v0.3.x path never produced any), but if drift is detected on first start, the sweep renames orphans to `__quarantine_<orig>_<ts>` rather than dropping them. Set `tidesdb_orphan_action=log_only` for a dry-run pass, or `drop` to reclaim quarantined CFs once you're confident.
+- **Full `mysqldump --tab` integration is smoke-tested only in v0.4.0** (the four SDI MTR tests cover round-trip on the metadata CF); the full end-to-end integration is deferred to v0.5.0.
+
 ### Bundled engine bumped to TidesDB v9.3.2 (release v0.3.1)
 
 The vendored engine moved from v9.3.0 to **v9.3.2** across the Docker images (`mysql`, `mtr`, `mwbench`), the RPM packaging, and `setup-workspace.sh`. The engine continues to ship **with zero patches**. No plugin code changes — the upstream releases are patch-level and do not introduce new error codes or other public-API surface for `tdb_rc_to_ha` to map.

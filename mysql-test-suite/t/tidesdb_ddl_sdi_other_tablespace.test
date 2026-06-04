@@ -1,0 +1,45 @@
+--source suite/tidesdb/include/tidesdb_ddl_helpers.inc
+--source include/have_debug.inc
+#
+# A-5 atomic-DDL Task 5: SDI callbacks are inert for any tablespace
+# other than tidesdb_system.
+#
+# Every SDI adapter starts with a strcmp guard against kTidesdbTablespace
+# ("tidesdb_system"). For any other name (e.g. innodb_system, mysql,
+# sys, empty) the adapter returns false (success no-op) without touching
+# g_engine_ctx.sdi.
+#
+# Driving this from pure SQL would require constructing a real
+# dd::Tablespace with a fabricated name -- impractical (the interface
+# has ~20 pure virtuals). Instead we arm a debug keyword and let the
+# DBUG_EXECUTE_IF block in tidesdb_show_status call
+# SdiCallbacks::debug_invoke_other_tablespace(), which exercises every
+# guard against several foreign names and logs "sdi_other_tablespace ok"
+# on success.
+#
+
+# Bump the error log to INFO so the success message is recorded.
+SET @save_log_error_verbosity = @@global.log_error_verbosity;
+SET GLOBAL log_error_verbosity = 3;
+
+# Truncate the error log so the grep below counts only our INFO line.
+--exec : > $MYSQLTEST_VARDIR/log/mysqld.1.err
+
+SET @@global.DEBUG = '+d,tidesdb_force_sdi_other_tablespace';
+SELECT @@global.DEBUG LIKE '%tidesdb_force_sdi_other_tablespace%' AS forced;
+
+--disable_result_log
+SHOW ENGINE TIDESDB STATUS;
+--enable_result_log
+
+# The hook fires the helper exactly once per SHOW ENGINE STATUS. Match
+# the literal string (no brackets, no regex meta) so the grep counts
+# whole occurrences, not character-classes.
+let $log_file = $MYSQLTEST_VARDIR/log/mysqld.1.err;
+--exec grep -c "sdi_other_tablespace ok" $log_file
+
+SET @@global.DEBUG = '';
+SET GLOBAL log_error_verbosity = @save_log_error_verbosity;
+
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

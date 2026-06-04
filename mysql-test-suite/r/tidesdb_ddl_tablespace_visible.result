@@ -1,0 +1,23 @@
+#
+# TEST 1: TidesDB engine is loaded and active after plugin init
+#
+SELECT engine, support, transactions
+FROM information_schema.engines
+WHERE engine = 'TIDESDB';
+engine	support	transactions
+TidesDB	YES	YES
+#
+# TEST 2: Engine smoke test -- CREATE/INSERT/SELECT/DROP must
+# succeed end-to-end. This indirectly proves that
+# register_tablespace() returned non-null in tidesdb_init_func
+# (a null return path logs sql_print_error and continues, but
+# any later regression in init ordering would surface here).
+#
+CREATE TABLE t_tsv (i INT NOT NULL PRIMARY KEY, v VARCHAR(32)) ENGINE=TidesDB;
+INSERT INTO t_tsv VALUES (1, 'one'), (2, 'two');
+SELECT * FROM t_tsv ORDER BY i;
+i	v
+1	one
+2	two
+DROP TABLE t_tsv;
+# Done.

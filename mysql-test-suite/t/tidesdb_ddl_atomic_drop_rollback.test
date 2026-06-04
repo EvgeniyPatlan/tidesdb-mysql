@@ -1,0 +1,42 @@
+--source suite/tidesdb/include/tidesdb_ddl_helpers.inc
+--source include/have_debug.inc
+#
+# A-5 atomic-DDL Task 8: prepare_drop failure aborts DROP TABLE.
+#
+# Production engine-txn rollback for DROP TABLE under MySQL 9.7 also
+# requires HTON_SUPPORTS_ATOMIC_DDL (lands in Task 13). What Task 8
+# proves locally is the error-propagation path: when prepare_drop
+# returns false (via the DBUG keyword 'tidesdb_fail_after_sdi_del')
+# ha_tidesdb::delete_table returns HA_ERR_GENERIC, the server reports
+# an error, and the table remains usable.
+#
+# We do not assert on the exact mysqld errno because the SQL-layer
+# wrapper around HA_ERR_GENERIC can surface as either ER_GET_ERRNO
+# (1030) or ER_UNKNOWN_ERROR (1105) depending on which DROP code path
+# the optimizer takes. Allow either; both prove the drop was aborted.
+#
+# Debug-only: skips on Release MTR images (accepted gap per plan).
+#
+
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY) ENGINE=TIDESDB;
+
+SET @@global.DEBUG = '+d,tidesdb_fail_after_sdi_del';
+SELECT @@global.DEBUG LIKE '%tidesdb_fail_after_sdi_del%' AS armed;
+
+--error ER_GET_ERRNO,ER_UNKNOWN_ERROR
+DROP TABLE tdb_ddl_t;
+
+SET @@global.DEBUG = '';
+
+# Table should still exist after the aborted DROP.
+SELECT COUNT(*) AS dd_rows FROM information_schema.TABLES
+  WHERE TABLE_SCHEMA='test' AND TABLE_NAME='tdb_ddl_t';
+
+# And it should still be queryable end-to-end (proves the CF was not
+# half-dropped by the time prepare_drop returned false).
+SELECT COUNT(*) AS row_count FROM tdb_ddl_t;
+
+DROP TABLE tdb_ddl_t;
+
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

@@ -1,0 +1,54 @@
+--source suite/tidesdb/include/have_tidesdb.inc
+--source include/have_debug.inc
+
+#
+# A-5 atomic-DDL participation: DDSE callback stubs are inert.
+#
+# The plugin wires 8 no-op DDSE callbacks on tidesdb_hton in case a
+# future "TidesDB hosts the data dictionary" project comes along. In
+# production they are never invoked (TidesDB is not the active DDSE --
+# InnoDB is). To prove they exist and are inert, a debug-only
+# DBUG_EXECUTE_IF block in tidesdb_show_status invokes each stub
+# directly when the keyword 'tidesdb_force_ddse_stubs' is set.
+#
+# Expected observable side-effect: each named stub logs at most ONCE
+# per server lifetime (atomic bitmask). On the first
+# SHOW ENGINE TIDESDB STATUS under the keyword, all 8 INFO lines
+# appear in the error log; subsequent SHOWs add nothing.
+#
+
+# Bump the error log to INFO so the stub messages are recorded.
+SET @save_log_error_verbosity = @@global.log_error_verbosity;
+SET GLOBAL log_error_verbosity = 3;
+
+# Truncate the error log so the grep below counts only our INFO lines.
+--exec : > $MYSQLTEST_VARDIR/log/mysqld.1.err
+
+# Arm the DBUG keyword; SHOW ENGINE TIDESDB STATUS will see it inside
+# the DBUG_EXECUTE_IF block in tidesdb_show_status and call each stub
+# once.
+SET @@global.DEBUG = '+d,tidesdb_force_ddse_stubs';
+SELECT @@global.DEBUG LIKE '%tidesdb_force_ddse_stubs%' AS forced;
+
+--disable_result_log
+SHOW ENGINE TIDESDB STATUS;
+--enable_result_log
+
+# Each of the 8 named stubs logs exactly one INFO line via
+# log_ddse_stub_once. Grep matches the literal "[TIDESDB] DDSE stub"
+# prefix written by sql_print_information.
+let $log_file = $MYSQLTEST_VARDIR/log/mysqld.1.err;
+--exec grep -c "DDSE stub" $log_file
+
+# Calling SHOW ENGINE TIDESDB STATUS a second time must not produce
+# any additional INFO lines (atomic bitmask: once-per-process).
+--disable_result_log
+SHOW ENGINE TIDESDB STATUS;
+--enable_result_log
+--exec grep -c "DDSE stub" $log_file
+
+SET @@global.DEBUG = '';
+SET GLOBAL log_error_verbosity = @save_log_error_verbosity;
+
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

@@ -165,6 +165,7 @@ ENDIF()
 MYSQL_ADD_PLUGIN(tidesdb ha_tidesdb.cc tidesdb_master_key.cc tidesdb_row_lock.cc
                  tidesdb_engine_context.cc tidesdb_fts.cc tidesdb_spatial.cc
                  tidesdb_portability.cc tidesdb_inplace_alter.cc
+                 tidesdb_atomic_ddl.cc tidesdb_atomic_ddl_pure.cc
                  STORAGE_ENGINE MODULE_ONLY LINK_LIBRARIES ${TIDESDB_LIBS})
 
 ############# S3 compile definition for the plugin #############
@@ -225,5 +226,14 @@ IF(TIDESDB_SANITIZER_COMPILE_FLAGS)
     TARGET_LINK_OPTIONS(tidesdb PRIVATE ${TIDESDB_SANITIZER_LINK_FLAGS})
     MESSAGE(STATUS "TidesDB: Sanitizer compile flags: ${TIDESDB_SANITIZER_COMPILE_FLAGS}")
     MESSAGE(STATUS "TidesDB: Sanitizer link flags: ${TIDESDB_SANITIZER_LINK_FLAGS}")
+  ENDIF()
+ENDIF()
+
+############# Atomic-DDL unit tests (pure helpers, no MySQL harness) #############
+# Tests live in plugin/tests/ and use find_package(GTest). They are skipped
+# silently when gtest is not installed, so this is safe on minimal build images.
+IF(NOT DISABLE_TIDESDB_TESTS)
+  IF(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt)
+    ADD_SUBDIRECTORY(tests)
   ENDIF()
 ENDIF()

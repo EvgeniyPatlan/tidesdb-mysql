@@ -1,0 +1,26 @@
+--source suite/tidesdb/include/tidesdb_ddl_helpers.inc
+#
+# A-5 atomic-DDL Task 5: SDI populated after CREATE TABLE.
+#
+# After CREATE TABLE ... ENGINE=TIDESDB, MySQL writes the table's SDI
+# (serialized dictionary info) into the engine's tablespace via the
+# sdi_set callback we registered on tidesdb_hton. The observable
+# consequence:
+#   1. information_schema.TABLES shows the table with ENGINE='TIDESDB'.
+#   2. The table is openable for DML.
+#
+# Both of those rely on a successful SDI round trip through our
+# tidesdb_sdi_set adapter -- if the adapter returned "true" (failure)
+# for the tidesdb_system tablespace, the CREATE would have rolled back.
+#
+
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY, v VARCHAR(64)) ENGINE=TIDESDB;
+
+SELECT COUNT(*) > 0 AS has_table
+  FROM information_schema.TABLES
+  WHERE TABLE_SCHEMA='test' AND TABLE_NAME='tdb_ddl_t' AND ENGINE='TIDESDB';
+
+DROP TABLE tdb_ddl_t;
+
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

@@ -1,0 +1,34 @@
+--source suite/tidesdb/include/tidesdb_ddl_helpers.inc
+#
+# A-5 atomic-DDL Task 9: inplace ALTER state-machine integration.
+#
+# prepare_inplace_alter_table now pre-stages a recomputed
+# se_private_data into the inplace-alter ctx; commit_inplace_alter_table
+# stamps it onto new_table_def and emits an updated SDI blob via
+# SdiStore when commit=true. Rollback paths leave new_table_def
+# untouched (covered indirectly by the existing duplicate-detection
+# tests in the suite).
+#
+# Acceptance: a plain ADD COLUMN ALTER -- which is classified
+# INSTANT in check_if_supported_inplace_alter (the row format is
+# self-describing via the ROW_HEADER_MAGIC header, so existing rows
+# back-fill the new trailing column from default_values on deserialize)
+# -- must round-trip the table data and SHOW CREATE TABLE must reflect
+# the post-ALTER schema. This both proves the new code path is
+# wired (no crash, no error) and confirms that pre-Task-13, the SDI
+# write through SdiStore is harmless: the data CF is unchanged and
+# the row format adapts.
+#
+
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY, v VARCHAR(64)) ENGINE=TIDESDB;
+INSERT INTO tdb_ddl_t VALUES (1, 'one'), (2, 'two');
+
+ALTER TABLE tdb_ddl_t ADD COLUMN extra INT;
+
+SELECT * FROM tdb_ddl_t ORDER BY id;
+SHOW CREATE TABLE tdb_ddl_t;
+
+DROP TABLE tdb_ddl_t;
+
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

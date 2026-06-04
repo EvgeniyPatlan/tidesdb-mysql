@@ -1,0 +1,59 @@
+--source suite/tidesdb/include/tidesdb_ddl_helpers.inc
+--source include/have_debug.inc
+#
+# A-5 atomic-DDL Task 11: orphan-dd::Table path.
+#
+# Create a TIDESDB table normally, then drop the underlying CF directly
+# via the tidesdb_drop_cf_skip_dd DBUG hook -- the DD row stays. After
+# restart, drive the sweep manually; the reconciler should see a
+# dd::Table whose CF is missing and emit the operator-action WARNING
+# (which it ALWAYS does, regardless of tidesdb_orphan_action; we don't
+# auto-drop DD rows).
+#
+
+SET @save_log_error_verbosity = @@global.log_error_verbosity;
+SET GLOBAL log_error_verbosity = 3;
+
+CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY) ENGINE=TIDESDB;
+INSERT INTO tdb_ddl_t VALUES (1);
+
+# Drop the CF underneath while keeping the DD entry. The hook hard-codes
+# the CF name "test__tdb_ddl_t" -- path_to_cf_name's "<db>__<table>"
+# form for test.tdb_ddl_t.
+SET @@global.DEBUG = '+d,tidesdb_drop_cf_skip_dd';
+--disable_result_log
+SHOW ENGINE TIDESDB STATUS;
+--enable_result_log
+SET @@global.DEBUG = '';
+
+--source include/restart_mysqld.inc
+
+SET GLOBAL log_error_verbosity = 3;
+--exec : > $MYSQLTEST_VARDIR/log/mysqld.1.err
+
+SET @@global.DEBUG = '+d,tidesdb_run_reconcile';
+--disable_result_log
+SHOW ENGINE TIDESDB STATUS;
+--enable_result_log
+SET @@global.DEBUG = '';
+
+# Reconciler logs "orphan dd::Table 'test__tdb_ddl_t' has no backing CF"
+# along with the suggested DROP TABLE / restore-from-backup line. The
+# "<db>__<table>" form mirrors path_to_cf_name's CF naming for
+# symmetric-difference identity; the operator-action log line uses the
+# same string twice (its primary purpose is to surface the CF name
+# the reconciler is complaining about so the operator can map it back
+# to mysql.tables).
+let $log_file = $MYSQLTEST_VARDIR/log/mysqld.1.err;
+--exec grep -c "orphan dd::Table 'test__tdb_ddl_t'" $log_file
+
+# Cleanup: drop the DD row even though the CF is gone. delete_table
+# under strict=OFF tolerates a missing CF (returns success); we use IF
+# EXISTS so any future strict=ON flip doesn't break the cleanup.
+--disable_warnings
+DROP TABLE IF EXISTS tdb_ddl_t;
+--enable_warnings
+
+SET GLOBAL log_error_verbosity = @save_log_error_verbosity;
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.
