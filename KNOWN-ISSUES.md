@@ -50,6 +50,34 @@ Carried over from v9.3.0 and still handled plugin-side
   v0.2.5 validation; the plugin's `default_l0_queue_stall_threshold` default
   was lowered 20 → 10 to match upstream now that this is the gating surface.
 
+## Known limitations introduced or formalised in v0.4.0
+
+These are atomic-DDL participation limitations. They are not engine bugs — they are deliberate scope boundaries of the v0.4.0 contract, tracked here so operators know what to expect. Full write-up: [docs/v0.4.0-validation-report.md](docs/v0.4.0-validation-report.md) (*Known limitations*).
+
+### 1. DD-commit / engine-commit two-phase-commit gap
+
+A narrow window exists between the DD-side commit and the engine-side commit where the two can momentarily diverge. The same window exists in InnoDB. If the engine commit hook fails after the DD has already committed, the next-startup `DdSyncReconciler` sweep reconciles per the `tidesdb_orphan_action` sysvar (default `quarantine`). Full closure requires server-side XA-style 2PC, which is **not** in MySQL 9.7's atomic-DDL contract. No code-side mitigation is possible from a storage-engine plugin alone.
+
+### 2. DDSE callback stubs are inert
+
+All eight DDSE entry points (`ddse_dict_init`, `dict_init`, `dict_recover`, `dict_cache_reset`, `dict_cache_reset_tables_and_tablespaces`, `dict_get_server_version`, `dict_set_server_version`, `is_dict_readonly`) are wired so the handlerton registers cleanly. Each logs once at INFO if invoked, then returns success. No production MySQL 9.7 code path drives them for an engine that does not host the data dictionary itself. They exist as forward-capability slots for a future "TidesDB hosts the data dictionary" project.
+
+### 3. Legacy v0.3.x table SDI not auto-retrofitted on open
+
+Pre-v0.4.0 tables have no `se_private_data` and no SDI blob in `__tidesdb_sdi`. The supported upgrade path is **`ALTER TABLE t ENGINE=TIDESDB`** per user table, which populates `se_private_data` and emits the SDI blob. Strict mode (`tidesdb_atomic_ddl_strict=ON`, the default) refuses to open legacy tables; setting it to `OFF` temporarily during upgrade allows opens with a warning. Auto-retrofit on open was considered and rejected — it would silently rewrite metadata for tables the operator may not have intended to touch.
+
+### 4. `mysqldump --tab` round-trip is smoke-tested only
+
+The four SDI MTR tests exercise round-trip on the `__tidesdb_sdi` metadata CF, but a full `mysqldump --tab` end-to-end integration test is deferred to **v0.5.0**.
+
+### 5. Twelve crash-injection MTR tests skip on the Release `mysql-mtr` image
+
+The atomic-DDL test suite includes 12 tests that use `DBUG_SUICIDE` for controlled crash injection. These require a Debug `mysqld` (gated by `have_debug.inc`) and so skip on the Release-mode `tidesdb/mysql-mtr:9.7` image used for CI. They were validated locally on a one-off Debug image (`tidesdb/mysql-mtr:9.7-dbg4`, preserved locally) during root-cause analysis of the COPY-ALTER 2PC SIGSEGV. Producing a steady-state Debug MTR image for CI is a follow-up.
+
+### 6. COPY-ALTER fix is tactical
+
+The v0.4.0 fix for the COPY-ALTER 2PC use-after-free (`tidesdb_flush_engine_txn_before_cf_mutation`, commit `0d7fe2c`) flushes the engine session txn at the top of `ha_tidesdb::rename_table` and `ha_tidesdb::delete_table`. This restores pre-flag-flip engine-layer ordering and preserves the atomic-DDL contract at the server / DD layer, but it gives up a narrow window (engine has committed; DD has not) — the startup sweep recovers it. The architecturally correct fix — a SE-private DDL journal so CF rename / drop is itself transactional alongside user data writes — is deferred to **v0.5.0**.
+
 ## Verified fixed upstream in v9.3.0 (formerly our bloomfix patch)
 
 ### `bloom_filter_new()` use-after-free on its failure paths
