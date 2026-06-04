@@ -13,6 +13,22 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
+############# Optional perf instrumentation (v0.4.1) #############
+# -DTIDESDB_PERF=1 turns on the layer-by-layer perf instrumentation.
+# Default OFF; turn ON for the perf-image variant. Honour the cmake -D and
+# the TIDESDB_PERF environment variable (the latter is what scripts/build-plugin.sh
+# forwards via -e TIDESDB_PERF=1).
+OPTION(TIDESDB_PERF "Compile in TidesDB perf instrumentation" OFF)
+IF(DEFINED ENV{TIDESDB_PERF} AND NOT "$ENV{TIDESDB_PERF}" STREQUAL "0")
+    SET(TIDESDB_PERF ON CACHE BOOL "" FORCE)
+ENDIF()
+IF(TIDESDB_PERF)
+    ADD_COMPILE_DEFINITIONS(TIDESDB_PERF=1)
+    MESSAGE(STATUS "[TIDESDB] perf instrumentation ON")
+ELSE()
+    ADD_COMPILE_DEFINITIONS(TIDESDB_PERF=0)
+ENDIF()
+
 ############# Optional Plugin-level ASAN + UBSAN #############
 # You enable with cmake -DTIDESDB_WITH_ASAN=ON -DTIDESDB_WITH_UBSAN=ON ..
 # This instruments only the TidesDB plugin .so, not the whole server, though its good to build the server with sanitizers too.
@@ -166,6 +182,7 @@ MYSQL_ADD_PLUGIN(tidesdb ha_tidesdb.cc tidesdb_master_key.cc tidesdb_row_lock.cc
                  tidesdb_engine_context.cc tidesdb_fts.cc tidesdb_spatial.cc
                  tidesdb_portability.cc tidesdb_inplace_alter.cc
                  tidesdb_atomic_ddl.cc tidesdb_atomic_ddl_pure.cc
+                 tidesdb_perf_ring.cc
                  STORAGE_ENGINE MODULE_ONLY LINK_LIBRARIES ${TIDESDB_LIBS})
 
 ############# S3 compile definition for the plugin #############
