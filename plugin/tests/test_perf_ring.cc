@@ -10,6 +10,9 @@
 */
 #include <gtest/gtest.h>
 
+#include <thread>
+#include <vector>
+
 #include "tidesdb_perf_ring.h"
 #include "tidesdb_perf_scope.h"
 
@@ -126,6 +129,51 @@ TEST(PerfScope, CaptureOnPushesOneSample) {
     tdp::ring_free(tdp::t_ring);
     tdp::t_ring = nullptr;
     tdp::g_rings_head.store(nullptr);
+}
+
+TEST(PerfScope, NestedScopesOrdered) {
+    tdp::g_rings_head.store(nullptr);
+    tdp::t_ring = nullptr;
+    tdp::g_capture_active.store(true);
+    {
+        TDB_PERF_SCOPE(write_row);                     // outer
+        {
+            TDB_PERF_SCOPE(serialize_row);             // inner
+        }
+    }
+    ASSERT_NE(tdp::t_ring, nullptr);
+    /* Inner finishes (dtor runs) BEFORE outer; rings push in dtor order. */
+    ASSERT_GE(tdp::t_ring->write_idx.load(), 2u);
+    const auto &inner = tdp::t_ring->slots[0];
+    const auto &outer = tdp::t_ring->slots[1];
+    EXPECT_EQ(inner.method_id, uint8_t(tdp::MethodId::serialize_row));
+    EXPECT_EQ(outer.method_id, uint8_t(tdp::MethodId::write_row));
+    /* Inner is contained in outer (enter >, exit <). */
+    EXPECT_GE(inner.enter_tsc, outer.enter_tsc);
+    EXPECT_LE(inner.exit_tsc,  outer.exit_tsc);
+
+    tdp::g_capture_active.store(false);
+    tdp::ring_free(tdp::t_ring); tdp::t_ring = nullptr;
+    tdp::g_rings_head.store(nullptr);
+}
+
+TEST(PerfRing, ConcurrentPushSingleReader) {
+    auto *r = make_ring(12);  /* 4096 samples */
+    constexpr size_t kPerThread = 1000;
+    constexpr int kThreads = 4;
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; t++) {
+        threads.emplace_back([&, t]() {
+            for (size_t i = 0; i < kPerThread; i++) {
+                tdp::push_sample(r, uint8_t(tdp::MethodId::index_next),
+                                  static_cast<uint8_t>(t), i, i + 1);
+            }
+        });
+    }
+    for (auto &th : threads) th.join();
+    EXPECT_EQ(r->write_idx.load(), uint64_t(kPerThread) * kThreads);
+    free_ring(r);
 }
 
 #endif  /* TIDESDB_PERF */
