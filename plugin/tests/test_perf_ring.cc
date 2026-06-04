@@ -78,4 +78,54 @@ TEST(PerfRing, TombstoneDrained) {
     free_ring(r);
 }
 
+TEST(PerfRing, AllocSelfRegistersInGlobalList) {
+    /* Reset head; allocate two rings; expect both in g_rings_head chain. */
+    tdp::g_rings_head.store(nullptr);
+    auto *r1 = tdp::ring_alloc_for_thread();
+    auto *r2 = tdp::ring_alloc_for_thread();
+    ASSERT_NE(r1, nullptr);
+    ASSERT_NE(r2, nullptr);
+
+    /* Walk the chain. */
+    int count = 0;
+    for (auto *p = tdp::g_rings_head.load(); p != nullptr; p = p->next.load()) {
+        count++;
+    }
+    EXPECT_EQ(count, 2);
+
+    tdp::ring_free(r1);
+    tdp::ring_free(r2);
+    tdp::g_rings_head.store(nullptr);
+}
+
+TEST(PerfScope, NoCaptureZeroPushes) {
+    /* g_capture_active = false: PerfScope dtor must not write to any ring. */
+    tdp::g_capture_active.store(false);
+    tdp::t_ring = nullptr;
+    {
+        TDB_PERF_SCOPE(write_row);
+    }
+    EXPECT_EQ(tdp::t_ring, nullptr);  /* no ring allocated */
+}
+
+TEST(PerfScope, CaptureOnPushesOneSample) {
+    tdp::g_rings_head.store(nullptr);
+    tdp::t_ring = nullptr;
+    tdp::g_capture_active.store(true);
+    {
+        TDB_PERF_SCOPE(write_row);
+    }
+    ASSERT_NE(tdp::t_ring, nullptr);
+    EXPECT_EQ(tdp::t_ring->write_idx.load(), 1u);
+    EXPECT_EQ(tdp::t_ring->slots[0].method_id, uint8_t(tdp::MethodId::write_row));
+    /* enter <= exit, both nonzero. */
+    EXPECT_LE(tdp::t_ring->slots[0].enter_tsc, tdp::t_ring->slots[0].exit_tsc);
+    EXPECT_GT(tdp::t_ring->slots[0].enter_tsc, 0u);
+
+    tdp::g_capture_active.store(false);
+    tdp::ring_free(tdp::t_ring);
+    tdp::t_ring = nullptr;
+    tdp::g_rings_head.store(nullptr);
+}
+
 #endif  /* TIDESDB_PERF */
