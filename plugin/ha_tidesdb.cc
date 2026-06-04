@@ -8639,6 +8639,78 @@ THR_LOCK_DATA **ha_tidesdb::store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lo
    definitions relocated; declarations (with `override`) stay in
    ha_tidesdb.h and all call paths are unchanged. */
 
+/* Atomic-DDL (A-5) Task 13 follow-up: flush any pending engine-txn writes
+   BEFORE we mutate the CF set (rename / drop). Required because:
+
+   * copy_data_between_tables runs INSIDE the user's session txn; it builds
+     up writes on the intermediate CF and may hold iterators referencing
+     the source CF (the one about to be renamed to '#sql-backup-*').
+   * mysql_rename_table swaps original<->intermediate, then quick_rm_table
+     drops the '#sql-backup-*'. Both reach our rename_table / delete_table.
+   * Without HTON_SUPPORTS_ATOMIC_DDL the server eagerly committed the
+     engine txn before these CF mutations (the non-atomic path at
+     sql_table.cc:14746 runs trans_commit_implicit BEFORE the rename block).
+     With the flag set, commit is deferred to the end (sql_table.cc:19191)
+     and runs AFTER rename + delete -- so the trx's pending writes and
+     cached iterators end up pointing at SST source blocks that
+     tidesdb_drop_column_family has just released. The deferred
+     tidesdb_txn_commit then crashes inside tidesdb_iter_release_sst_source_block
+     (UAF on the freed clock-cache block, observable as SIGSEGV @ 0x20).
+
+   The fix: at the entry of any handler-level CF-mutating callback, if the
+   current connection has a dirty engine txn, commit it now. This restores
+   the pre-Task-13 ordering (engine commit precedes CF mutations) without
+   removing the atomic-DDL contract at the server / DD level -- the
+   subsequent trans_commit_implicit still drives binlog + DD commit
+   atomically; the engine's portion of the 2PC just lands a no-op
+   (commit_done=true short-circuits the prepare hook).
+
+   We also clear any cached iterators on the handler so they don't leak
+   into the next statement on the same connection (the post-ALTER
+   reopen will rebuild them on demand). */
+static void tidesdb_flush_engine_txn_before_cf_mutation(THD *thd)
+{
+    if (!thd) return;
+    tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, tidesdb_hton);
+    if (!trx || !trx->txn) return;
+
+    /* Release any active stmt savepoint before commit (TidesDB requires this). */
+    if (trx->stmt_savepoint_active)
+    {
+        tidesdb_txn_release_savepoint(trx->txn, "stmt");
+        trx->stmt_savepoint_active = false;
+    }
+
+    /* Commit if dirty, otherwise rollback. Either way, the txn handle is
+       freed and a fresh one will be created on the next operation that
+       needs it (get_or_create_trx replays from thd_get_ha_data). */
+    int rc;
+    if (trx->dirty) {
+        rc = tidesdb_txn_commit(trx->txn);
+        if (rc != TDB_SUCCESS) {
+            sql_print_warning(
+                "[TIDESDB] pre-CF-mutation flush: tidesdb_txn_commit returned %d "
+                "(dirty=%d gen=%lu) -- rolling back",
+                rc, trx->dirty, (unsigned long)trx->txn_generation);
+            tidesdb_txn_rollback(trx->txn);
+        }
+    } else {
+        tidesdb_txn_rollback(trx->txn);
+    }
+
+    /* Free and clear; subsequent ops re-create via get_or_create_trx.
+       Mark commit_done=true so the eventual hton-prepare/commit hooks
+       become no-ops for this txn cycle. */
+    tidesdb_txn_free(trx->txn);
+    trx->txn = NULL;
+    trx->txn_generation++;
+    trx->dirty = false;
+    trx->stmt_savepoint_active = false;
+    trx->needs_reset = false;
+    trx->commit_done = true;
+    row_locks_release_all(trx);
+}
+
 /* ******************** rename_table (ALTER TABLE / RENAME) ******************** */
 
 int ha_tidesdb::rename_table(const char *from, const char *to,
@@ -8646,6 +8718,10 @@ int ha_tidesdb::rename_table(const char *from, const char *to,
                              dd::Table *to_table_def)
 {
     DBUG_ENTER("ha_tidesdb::rename_table");
+
+    /* Atomic-DDL Task 13 follow-up: flush pending engine writes before any
+       CF mutation. See tidesdb_flush_engine_txn_before_cf_mutation. */
+    tidesdb_flush_engine_txn_before_cf_mutation(ha_thd());
 
     std::string old_cf = path_to_cf_name(from);
     std::string new_cf = path_to_cf_name(to);
@@ -8886,6 +8962,10 @@ static void tidesdb_hton_drop_database(handlerton *, char *path)
 int ha_tidesdb::delete_table(const char *name, const dd::Table *table_def)
 {
     DBUG_ENTER("ha_tidesdb::delete_table");
+
+    /* Atomic-DDL Task 13 follow-up: flush pending engine writes before any
+       CF mutation. See tidesdb_flush_engine_txn_before_cf_mutation. */
+    tidesdb_flush_engine_txn_before_cf_mutation(ha_thd());
 
     /* atomic-DDL: erase the table's SDI blob BEFORE the CF goes away.
        prepare_drop is idempotent and tolerates a missing dd::Table*
