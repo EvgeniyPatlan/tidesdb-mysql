@@ -1,0 +1,26 @@
+SET @save_capture = @@global.tidesdb_perf_capture;
+SET GLOBAL tidesdb_perf_capture = OFF;
+SELECT VARIABLE_NAME
+FROM performance_schema.session_variables
+WHERE VARIABLE_NAME IN (
+'tidesdb_perf_capture',
+'tidesdb_perf_output_dir',
+'tidesdb_perf_ring_capacity_pow2',
+'tidesdb_perf_flush_interval_ms')
+ORDER BY VARIABLE_NAME;
+VARIABLE_NAME
+tidesdb_perf_capture
+tidesdb_perf_flush_interval_ms
+tidesdb_perf_output_dir
+tidesdb_perf_ring_capacity_pow2
+SET GLOBAL tidesdb_perf_capture = ON;
+SELECT @@global.tidesdb_perf_capture AS on_value;
+on_value
+1
+SET GLOBAL tidesdb_perf_capture = OFF;
+SELECT @@global.tidesdb_perf_capture AS off_value;
+off_value
+0
+SET GLOBAL tidesdb_perf_ring_capacity_pow2 = 12;
+ERROR HY000: Variable 'tidesdb_perf_ring_capacity_pow2' is a read only variable
+SET GLOBAL tidesdb_perf_capture = @save_capture;

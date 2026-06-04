@@ -56,6 +56,7 @@ extern "C"
 #include "tidesdb_atomic_ddl.h"      /* register_tablespace (A-5 atomic-DDL) */
 #include "tidesdb_fts.h"             /* FTS subsystem (A-2 extraction) */
 #include "tidesdb_spatial.h"         /* Spatial subsystem (A-2 extraction) */
+#include "tidesdb_perf_ring.h"       /* v0.4.1 perf-instrumentation Task 2 */
 
 /* See plugin/tidesdb_compat.h's "Category 7: Logging shims" comment
  * for why sql_print_information/warning/error keep their stderr
@@ -638,6 +639,51 @@ static MYSQL_SYSVAR_ENUM(orphan_action, srv_orphan_action,
                          "logged -- the reconciler never modifies the DD.",
                          /*check=*/NULL, tidesdb_orphan_action_update,
                          /*default=*/1, &tidesdb_orphan_action_typelib);
+
+/* v0.4.1 perf-instrumentation (Task 2): four sysvars surfacing the
+   per-thread perf ring. All four exist regardless of TIDESDB_PERF build
+   flag so that DROP-IN configs are stable across feature toggles; the
+   capture path is inert when the plugin is compiled without the flag
+   (init/deinit are no-op stubs in that build). The storage cells live
+   here; the perf init/deinit calls below in tidesdb_init_func /
+   tidesdb_deinit_func reference them by name. */
+static my_bool tidesdb_perf_capture = 0;
+static MYSQL_SYSVAR_BOOL(perf_capture, tidesdb_perf_capture,
+                         PLUGIN_VAR_OPCMDARG,
+                         "Master switch for layer-by-layer perf instrumentation. "
+                         "Default OFF. Effective only in builds compiled with "
+                         "-DTIDESDB_PERF=1.",
+                         /*check=*/NULL, /*update=*/NULL, /*default=*/false);
+
+static char *tidesdb_perf_output_dir = nullptr;
+/* PLUGIN_VAR_MEMALLOC tells the server to own the storage for the
+   string (strdup on SET GLOBAL, free on shutdown / next SET), so a
+   STR sysvar without an update_func can still be runtime-mutable
+   without the "forced read-only" warning at startup. */
+static MYSQL_SYSVAR_STR(perf_output_dir, tidesdb_perf_output_dir,
+                        PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_MEMALLOC,
+                        "Directory where per-method perf .bin files land. "
+                        "Default /var/lib/mysql/tidesdb-perf/. Honoured at "
+                        "next flush tick after change.",
+                        /*check=*/NULL, /*update=*/NULL,
+                        /*default=*/"/var/lib/mysql/tidesdb-perf");
+
+static ulong tidesdb_perf_ring_capacity_pow2 = 16;
+static MYSQL_SYSVAR_ULONG(perf_ring_capacity_pow2, tidesdb_perf_ring_capacity_pow2,
+                          PLUGIN_VAR_READONLY,
+                          "Per-thread ring capacity in samples = 1 << pow2. "
+                          "Default 16 (= 65536 samples = ~1.5 MiB/thread). "
+                          "Server-start only.",
+                          /*check=*/NULL, /*update=*/NULL,
+                          /*default=*/16, /*min=*/8, /*max=*/24, /*block=*/1);
+
+static ulong tidesdb_perf_flush_interval_ms = 1000;
+static MYSQL_SYSVAR_ULONG(perf_flush_interval_ms, tidesdb_perf_flush_interval_ms,
+                          PLUGIN_VAR_OPCMDARG,
+                          "Flusher tick interval in milliseconds. "
+                          "Default 1000.",
+                          /*check=*/NULL, /*update=*/NULL,
+                          /*default=*/1000, /*min=*/100, /*max=*/60000, /*block=*/1);
 
 static MYSQL_SYSVAR_BOOL(pessimistic_locking, srv_pessimistic_locking, PLUGIN_VAR_RQCMDARG,
                          "Enable plugin-level row locks for SELECT ... FOR UPDATE, "
@@ -1348,6 +1394,10 @@ static SYS_VAR *tidesdb_system_variables[] = {
     MYSQL_SYSVAR(default_tombstone_density_min_entries),
     MYSQL_SYSVAR(atomic_ddl_strict),
     MYSQL_SYSVAR(orphan_action),
+    MYSQL_SYSVAR(perf_capture),
+    MYSQL_SYSVAR(perf_output_dir),
+    MYSQL_SYSVAR(perf_ring_capacity_pow2),
+    MYSQL_SYSVAR(perf_flush_interval_ms),
     NULL};
 
 /* ******************** Table options (per-table CF config) ******************** */
@@ -3005,6 +3055,21 @@ static int tidesdb_init_func(void *p)
            guard inside SdiStore rather than dereferencing a freed object. */
     }
 
+#if TIDESDB_PERF
+    /* v0.4.1 perf-instrumentation Task 2: hand the perf subsystem its
+       four sysvar values and then publish the master switch. init()
+       failure is non-fatal -- the capture path stays inert and the
+       engine remains fully usable. */
+    if (!tidesdb_perf::init(tidesdb_perf_output_dir,
+                            static_cast<size_t>(tidesdb_perf_ring_capacity_pow2),
+                            static_cast<uint64_t>(tidesdb_perf_flush_interval_ms))) {
+        sql_print_warning("[TIDESDB-PERF] init failed; perf capture will be inactive");
+    } else {
+        tidesdb_perf::g_capture_active.store(tidesdb_perf_capture,
+                                              std::memory_order_release);
+    }
+#endif
+
     /* Atomic-DDL (A-5) Task 5: wire the six SDI tablespace callbacks. They
        route SDI reads/writes for the tidesdb_system tablespace to
        g_engine_ctx.sdi and return success-no-op for every other tablespace. */
@@ -3199,6 +3264,15 @@ static void tidesdb_hton_kill_query(handlerton *, THD *thd, enum thd_kill_levels
 static int tidesdb_deinit_func(void *p)
 {
     DBUG_ENTER("tidesdb_deinit_func");
+
+#if TIDESDB_PERF
+    /* v0.4.1 perf-instrumentation Task 2: drain & shut the flusher
+       BEFORE we teardown the engine, so a final flush still has the
+       engine state available if a future tick needs it. The current
+       skeleton deinit is a no-op stub but the call site is correct
+       for when the flusher lands. */
+    tidesdb_perf::deinit();
+#endif
 
     g_engine_ctx.schema_cf = NULL;
 

@@ -1,0 +1,23 @@
+--source suite/tidesdb/include/tidesdb_perf_helpers.inc
+
+# All 4 sysvars surface via SHOW VARIABLES.
+SELECT VARIABLE_NAME
+  FROM performance_schema.session_variables
+  WHERE VARIABLE_NAME IN (
+    'tidesdb_perf_capture',
+    'tidesdb_perf_output_dir',
+    'tidesdb_perf_ring_capacity_pow2',
+    'tidesdb_perf_flush_interval_ms')
+  ORDER BY VARIABLE_NAME;
+
+# perf_capture is settable runtime.
+SET GLOBAL tidesdb_perf_capture = ON;
+SELECT @@global.tidesdb_perf_capture AS on_value;
+SET GLOBAL tidesdb_perf_capture = OFF;
+SELECT @@global.tidesdb_perf_capture AS off_value;
+
+# ring_capacity_pow2 is READONLY (cannot be set runtime).
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SET GLOBAL tidesdb_perf_ring_capacity_pow2 = 12;
+
+SET GLOBAL tidesdb_perf_capture = @save_capture;
