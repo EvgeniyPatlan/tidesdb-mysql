@@ -9,7 +9,7 @@ import struct
 
 import numpy as np
 
-SAMPLE_STRUCT = "<BBHQQ"
+SAMPLE_STRUCT = "<BBH4xQQ"
 SAMPLE_SIZE = 24
 
 METHOD_NAMES = {

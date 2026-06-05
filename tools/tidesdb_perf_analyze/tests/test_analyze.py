@@ -7,7 +7,7 @@ import tempfile
 import pytest
 
 
-SAMPLE_STRUCT = "<BBHQQ"
+SAMPLE_STRUCT = "<BBH4xQQ"
 SAMPLE_SIZE = 24
 
 
