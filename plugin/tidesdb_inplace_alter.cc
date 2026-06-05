@@ -51,6 +51,7 @@
 #include "tidesdb_atomic_ddl.h"      /* TidesdbAtomicDdlBridge, serialize_sdi */
 #include "tidesdb_engine_context.h"  /* tdb_get_engine, g_engine_ctx */
 #include "tidesdb_fts.h"             /* is_fts_index */
+#include "tidesdb_perf_scope.h"      /* v0.4.1 perf-instrumentation: TDB_PERF_SCOPE */
 #include "tidesdb_spatial.h"         /* is_spatial_index */
 
 #include "sql/dd/properties.h"       /* dd::Properties (for clear() call) */
@@ -72,6 +73,7 @@ enum_alter_inplace_result ha_tidesdb::check_if_supported_inplace_alter(
     TABLE *altered_table [[maybe_unused]], Alter_inplace_info *ha_alter_info)
 {
     DBUG_ENTER("ha_tidesdb::check_if_supported_inplace_alter");
+    TDB_PERF_SCOPE(check_if_supported_inplace_alter);
 
     Alter_inplace_info::HA_ALTER_FLAGS flags = ha_alter_info->handler_flags;
 
@@ -164,6 +166,7 @@ bool ha_tidesdb::prepare_inplace_alter_table(
     dd::Table *new_table_def)
 {
     DBUG_ENTER("ha_tidesdb::prepare_inplace_alter_table");
+    TDB_PERF_SCOPE(prepare_inplace_alter_table);
 
     ha_tidesdb_inplace_ctx *ctx;
     try
@@ -279,6 +282,7 @@ bool ha_tidesdb::inplace_alter_table(
     dd::Table *new_table_def [[maybe_unused]])
 {
     DBUG_ENTER("ha_tidesdb::inplace_alter_table");
+    TDB_PERF_SCOPE(inplace_alter_table);
 
     ha_tidesdb_inplace_ctx *ctx = static_cast<ha_tidesdb_inplace_ctx *>(ha_alter_info->handler_ctx);
 
@@ -680,6 +684,7 @@ bool ha_tidesdb::commit_inplace_alter_table(
     dd::Table *new_table_def)
 {
     DBUG_ENTER("ha_tidesdb::commit_inplace_alter_table");
+    TDB_PERF_SCOPE(commit_inplace_alter_table);
 
     ha_tidesdb_inplace_ctx *ctx = static_cast<ha_tidesdb_inplace_ctx *>(ha_alter_info->handler_ctx);
 

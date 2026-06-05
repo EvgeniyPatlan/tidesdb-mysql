@@ -1948,6 +1948,7 @@ static int tidesdb_savepoint_set(THD *thd, void *sv)
 static int tidesdb_savepoint_set(handlerton *, THD *thd, void *sv)
 #endif
 {
+    TDB_PERF_SCOPE(savepoint_set);
     tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, tidesdb_hton);
     if (!trx || !trx->txn || !sv) return 0;
 
@@ -1965,6 +1966,7 @@ static int tidesdb_savepoint_rollback(THD *thd, void *sv)
 static int tidesdb_savepoint_rollback(handlerton *, THD *thd, void *sv)
 #endif
 {
+    TDB_PERF_SCOPE(savepoint_rollback);
     tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, tidesdb_hton);
     if (!trx || !trx->txn || !sv) return 0;
 
@@ -1999,6 +2001,7 @@ static int tidesdb_savepoint_release(THD *thd, void *sv)
 static int tidesdb_savepoint_release(handlerton *, THD *thd, void *sv)
 #endif
 {
+    TDB_PERF_SCOPE(savepoint_release);
     tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, tidesdb_hton);
     if (!trx || !trx->txn || !sv) return 0;
 
@@ -2093,6 +2096,7 @@ static int tidesdb_commit(THD *thd, bool all)
 static int tidesdb_commit(handlerton *, THD *thd, bool all)
 #endif
 {
+    TDB_PERF_SCOPE(commit);
     tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, tidesdb_hton);
     if (!trx || !trx->txn)
     {
@@ -2193,6 +2197,7 @@ static int tidesdb_rollback(THD *thd, bool all)
 static int tidesdb_rollback(handlerton *, THD *thd, bool all)
 #endif
 {
+    TDB_PERF_SCOPE(rollback);
     tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, tidesdb_hton);
     if (!trx || !trx->txn) return 0;
 
@@ -3573,6 +3578,7 @@ uint ha_tidesdb::make_comparable_key(KEY *key_info, const uchar *record, uint nu
 uint ha_tidesdb::key_copy_to_comparable(KEY *key_info, const uchar *key_buf, uint key_len,
                                         uchar *out)
 {
+    TDB_PERF_SCOPE(key_copy_to_comparable);
     /* Use per-handler scratch buffer rather than table->record[1] so we
        don't pollute the row buffer the SQL layer is sharing. Lazy-size
        on first use (open() can't always size it -- altered tables may
@@ -3609,6 +3615,7 @@ uint ha_tidesdb::key_copy_to_comparable(KEY *key_info, const uchar *key_buf, uin
 */
 uint ha_tidesdb::pk_from_record(const uchar *record, uchar *out)
 {
+    TDB_PERF_SCOPE(pk_from_record);
     if (share->has_user_pk)
     {
         return make_comparable_key(&table->key_info[share->pk_index], record,
@@ -4081,6 +4088,7 @@ int ha_tidesdb::open(const char *name, int mode, uint test_if_locked,
                      const dd::Table *table_def)
 {
     DBUG_ENTER("ha_tidesdb::open");
+    TDB_PERF_SCOPE(open);
 
     if (!(share = get_share())) DBUG_RETURN(1);
 
@@ -4323,6 +4331,7 @@ int ha_tidesdb::open(const char *name, int mode, uint test_if_locked,
 int ha_tidesdb::close(void)
 {
     DBUG_ENTER("ha_tidesdb::close");
+    TDB_PERF_SCOPE(close);
     if (scan_iter)
     {
         tidesdb_iter_free(scan_iter);
@@ -4343,6 +4352,7 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
                        dd::Table *table_def)
 {
     DBUG_ENTER("ha_tidesdb::create");
+    TDB_PERF_SCOPE(create);
 
     std::string cf_name = path_to_cf_name(name);
 
@@ -4476,6 +4486,7 @@ static inline void tdb_secure_zero(void *p, size_t n)
 static bool tidesdb_encrypt_row_into(const std::string &plain, uint key_id, uint key_version,
                                      std::string &out)
 {
+    TDB_PERF_SCOPE(encrypt_row_into);
     unsigned char key[TIDESDB_ENC_KEY_LEN];
     unsigned int klen = sizeof(key);
     if (encryption_key_get(key_id, key_version, key, &klen) != 0)
@@ -4544,6 +4555,7 @@ static bool tidesdb_encrypt_row_into(const std::string &plain, uint key_id, uint
 */
 static std::string tidesdb_decrypt_row(const char *data, size_t len, uint key_id, uint key_version)
 {
+    TDB_PERF_SCOPE(decrypt_row);
     if (len <= TIDESDB_ENC_IV_LEN)
     {
         sql_print_error("[TIDESDB] encrypted row too short (%zu bytes)", len);
@@ -4590,6 +4602,7 @@ static std::string tidesdb_decrypt_row(const char *data, size_t len, uint key_id
 
 const std::string &ha_tidesdb::serialize_row(const uchar *buf)
 {
+    TDB_PERF_SCOPE(serialize_row);
     my_ptrdiff_t ptrdiff = (my_ptrdiff_t)(buf - table->record[0]);
 
     /* Upper-bound packed size.  For non-BLOB tables the estimate is constant
@@ -4685,6 +4698,7 @@ const std::string &ha_tidesdb::serialize_row(const uchar *buf)
 
 void ha_tidesdb::deserialize_row(uchar *buf, const uchar *data, size_t len)
 {
+    TDB_PERF_SCOPE(deserialize_row);
     const uchar *from = data;
     const uchar *from_end = data + len;
 
@@ -5436,6 +5450,7 @@ int ha_tidesdb::rnd_end()
 int ha_tidesdb::rnd_next(uchar *buf)
 {
     DBUG_ENTER("ha_tidesdb::rnd_next");
+    TDB_PERF_SCOPE(rnd_next);
 
     if (cached_thd_ && thd_killed(cached_thd_)) DBUG_RETURN(HA_ERR_ABORTED_BY_USER);
 
@@ -5463,6 +5478,7 @@ void ha_tidesdb::position(const uchar *record)
 int ha_tidesdb::rnd_pos(uchar *buf, uchar *pos)
 {
     DBUG_ENTER("ha_tidesdb::rnd_pos");
+    TDB_PERF_SCOPE(rnd_pos);
 
     /* Lazy txn, we ensure stmt_txn exists */
     {
@@ -5611,6 +5627,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
                                enum ha_rkey_function find_flag)
 {
     DBUG_ENTER("ha_tidesdb::index_read_map");
+    TDB_PERF_SCOPE(index_read_map);
 
     /* key_copy_to_comparable uses key_restore + make_comparable_key,
        which reads fields via make_sort_key_part. */
@@ -5926,6 +5943,7 @@ int ha_tidesdb::index_read_last_map(uchar *buf, const uchar *key,
 int ha_tidesdb::index_next(uchar *buf)
 {
     DBUG_ENTER("ha_tidesdb::index_next");
+    TDB_PERF_SCOPE(index_next);
 
     if (cached_thd_ && thd_killed(cached_thd_)) DBUG_RETURN(HA_ERR_ABORTED_BY_USER);
 
@@ -6006,6 +6024,7 @@ int ha_tidesdb::index_next(uchar *buf)
 int ha_tidesdb::index_prev(uchar *buf)
 {
     DBUG_ENTER("ha_tidesdb::index_prev");
+    TDB_PERF_SCOPE(index_prev);
 
     if (cached_thd_ && thd_killed(cached_thd_)) DBUG_RETURN(HA_ERR_ABORTED_BY_USER);
 
@@ -6238,6 +6257,7 @@ int ha_tidesdb::index_next_same(uchar *buf, const uchar *key, uint keylen)
 int ha_tidesdb::update_row(const uchar *old_data, uchar *new_data)
 {
     DBUG_ENTER("ha_tidesdb::update_row");
+    TDB_PERF_SCOPE(update_row);
 
     my_bitmap_map *old_map = tmp_use_all_columns(table, table->read_set);
 
@@ -6629,6 +6649,7 @@ err:
 int ha_tidesdb::delete_row(const uchar *buf)
 {
     DBUG_ENTER("ha_tidesdb::delete_row");
+    TDB_PERF_SCOPE(delete_row);
 
     my_bitmap_map *old_map = tmp_use_all_columns(table, table->read_set);
 
@@ -7358,6 +7379,7 @@ int ha_tidesdb::multi_range_read_next(range_id_t *range_info)
 int ha_tidesdb::info(uint flag)
 {
     DBUG_ENTER("ha_tidesdb::info");
+    TDB_PERF_SCOPE(info);
 
     if (share) ref_length = share->pk_key_len;
 
@@ -8605,6 +8627,7 @@ int ha_tidesdb::ensure_stmt_txn()
 int ha_tidesdb::external_lock(THD *thd, int lock_type)
 {
     DBUG_ENTER("ha_tidesdb::external_lock");
+    TDB_PERF_SCOPE(external_lock);
 
     if (lock_type != F_UNLCK)
     {
@@ -8709,6 +8732,7 @@ int ha_tidesdb::external_lock(THD *thd, int lock_type)
 
 THR_LOCK_DATA **ha_tidesdb::store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lock_type lock_type)
 {
+    TDB_PERF_SCOPE(store_lock);
     /* With lock_count()=0 MySQL skips THR_LOCK entirely.
        store_lock is still called for informational purposes but we
        do not push into the 'to' array (same pattern as InnoDB).
@@ -9076,6 +9100,7 @@ static void tidesdb_hton_drop_database(handlerton *, char *path)
 int ha_tidesdb::delete_table(const char *name, const dd::Table *table_def)
 {
     DBUG_ENTER("ha_tidesdb::delete_table");
+    TDB_PERF_SCOPE(delete_table);
 
     /* Atomic-DDL Task 13 follow-up: flush pending engine writes before any
        CF mutation. See tidesdb_flush_engine_txn_before_cf_mutation. */
