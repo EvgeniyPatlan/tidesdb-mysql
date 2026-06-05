@@ -212,6 +212,17 @@ IF(TARGET tidesdb)
       -fpermissive
     )
   ENDIF()
+  # Perf builds: static-link the C++ stdlib + libgcc so the .so is
+  # self-contained. The perf code uses <thread>, <chrono>, <mutex>,
+  # <condition_variable> which pull in GLIBCXX_3.4.32 symbols not present
+  # in the older runtime-image libstdc++. Without static linkage the .so
+  # fails dlopen with "GLIBCXX_3.4.32 not found".
+  IF(TIDESDB_PERF)
+    TARGET_LINK_OPTIONS(tidesdb PRIVATE
+      -static-libstdc++
+      -static-libgcc
+    )
+  ENDIF()
   # MySQL's data-dictionary headers (pulled in transitively from sql/handler.h
   # via sql/table.h -> sql/dd/types/foreign_key.h -> sql/dd/sdi_fwd.h) include
   # <rapidjson/fwd.h>. MYSQL_ADD_PLUGIN does not put the bundled rapidjson on
