@@ -656,6 +656,18 @@ static MYSQL_SYSVAR_BOOL(perf_capture, tidesdb_perf_capture,
                          /*check=*/NULL, /*update=*/NULL, /*default=*/false);
 
 static char *tidesdb_perf_output_dir = nullptr;
+/* SET GLOBAL tidesdb_perf_output_dir = '...' propagates the new value
+   into the perf module so the flusher can rotate fds at its next tick.
+   Without this hook, the sysvar storage cell changes but the flusher
+   keeps writing to the dir init() opened. */
+#if TIDESDB_PERF
+static void tidesdb_perf_output_dir_update(THD *, SYS_VAR *,
+                                           void *var_ptr, const void *save) {
+    const char *newval = *static_cast<const char *const *>(save);
+    *static_cast<const char **>(var_ptr) = newval;
+    tidesdb_perf::set_output_dir(newval);
+}
+#endif
 /* PLUGIN_VAR_MEMALLOC tells the server to own the storage for the
    string (strdup on SET GLOBAL, free on shutdown / next SET), so a
    STR sysvar without an update_func can still be runtime-mutable
@@ -665,7 +677,12 @@ static MYSQL_SYSVAR_STR(perf_output_dir, tidesdb_perf_output_dir,
                         "Directory where per-method perf .bin files land. "
                         "Default /var/lib/mysql/tidesdb-perf/. Honoured at "
                         "next flush tick after change.",
-                        /*check=*/NULL, /*update=*/NULL,
+                        /*check=*/NULL,
+#if TIDESDB_PERF
+                        /*update=*/tidesdb_perf_output_dir_update,
+#else
+                        /*update=*/NULL,
+#endif
                         /*default=*/"/var/lib/mysql/tidesdb-perf");
 
 static ulong tidesdb_perf_ring_capacity_pow2 = 16;

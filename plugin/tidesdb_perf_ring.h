@@ -44,6 +44,12 @@ extern thread_local TLS_Ring *t_ring;
 bool init(const char *output_dir, size_t ring_capacity_pow2, uint64_t flush_interval_ms);
 void deinit();
 
+/* Sysvar update hook: change the output directory at runtime. The
+   flusher thread picks up the new value at the next tick, mkdirs the
+   path, reopens meta.json + per-method fds. Safe to call before init()
+   (stashes the value; init() will read it). */
+void set_output_dir(const char *output_dir);
+
 /* Allocator helpers: exposed for unit tests. */
 TLS_Ring *ring_alloc_for_thread();
 void ring_free(TLS_Ring *r);
