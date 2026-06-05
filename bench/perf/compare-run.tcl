@@ -1,0 +1,1 @@
+../hammerdb/compare-run.tcl
