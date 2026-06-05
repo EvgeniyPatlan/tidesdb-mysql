@@ -1,0 +1,12 @@
+SET @save_capture = @@global.tidesdb_perf_capture;
+SET GLOBAL tidesdb_perf_capture = OFF;
+SET @save_output_dir = @@global.tidesdb_perf_output_dir;
+SET GLOBAL tidesdb_perf_output_dir = '/tmp/perf-test-growth';
+CREATE TABLE t (id INT PRIMARY KEY) ENGINE=TIDESDB;
+SET GLOBAL tidesdb_perf_capture = ON;
+INSERT INTO t VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
+SET GLOBAL tidesdb_perf_capture = OFF;
+INSERT INTO t VALUES (11),(12),(13),(14),(15);
+DROP TABLE t;
+SET GLOBAL tidesdb_perf_output_dir = @save_output_dir;
+SET GLOBAL tidesdb_perf_capture = @save_capture;

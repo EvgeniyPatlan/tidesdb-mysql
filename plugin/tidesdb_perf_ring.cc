@@ -52,6 +52,11 @@ struct PerfModuleState {
     std::mutex  shutdown_mu;
     std::condition_variable shutdown_cv;
     double      tsc_ghz = 0.0;
+    /* Overflow log throttle (spec §7 Logging discipline). The first wrap
+       is always logged; subsequent wraps emit at most one WARNING per
+       minute, gated by a CAS on g_last_overflow_log_ts. */
+    std::atomic<uint64_t> total_wraps_seen{0};
+    std::atomic<int64_t>  last_overflow_log_ts{0};
 };
 static PerfModuleState g_state;
 
@@ -167,28 +172,34 @@ static bool rotate_to_dir(const std::string &dir) {
 static void flush_once() {
     /* Rotate to desired dir if the sysvar update path moved it, or if
        the current dir disappeared under us (rm -rf, tmpfs reaper, etc.)
-       so files re-materialize on the next tick. */
-    std::string pending;
-    {
-        std::lock_guard<std::mutex> lk(g_state.dir_mu);
-        if (g_state.desired_dir != g_state.current_dir) {
-            pending = g_state.desired_dir;
-        } else if (!g_state.current_dir.empty()) {
-            struct stat st;
-            if (::stat(g_state.current_dir.c_str(), &st) != 0) {
-                pending = g_state.current_dir;
-                g_state.current_dir.clear();
+       so files re-materialize on the next tick. Skip rotation entirely
+       when capture is OFF -- otherwise just flipping the output_dir sysvar
+       (with capture OFF) would still mkdir the new path. The
+       tidesdb_perf_off_no_files MTR test pins this behaviour. */
+    if (g_capture_active.load(std::memory_order_relaxed)) {
+        std::string pending;
+        {
+            std::lock_guard<std::mutex> lk(g_state.dir_mu);
+            if (g_state.desired_dir != g_state.current_dir) {
+                pending = g_state.desired_dir;
+            } else if (!g_state.current_dir.empty()) {
+                struct stat st;
+                if (::stat(g_state.current_dir.c_str(), &st) != 0) {
+                    pending = g_state.current_dir;
+                    g_state.current_dir.clear();
+                }
             }
         }
-    }
-    if (!pending.empty()) {
-        if (rotate_to_dir(pending)) {
-            std::lock_guard<std::mutex> lk(g_state.dir_mu);
-            g_state.current_dir = pending;
+        if (!pending.empty()) {
+            if (rotate_to_dir(pending)) {
+                std::lock_guard<std::mutex> lk(g_state.dir_mu);
+                g_state.current_dir = pending;
+            }
         }
     }
 
     std::vector<std::vector<Sample>> by_method(kMethodCount + 1);
+    uint64_t wraps_this_tick = 0;
     TLS_Ring *r = g_rings_head.load(std::memory_order_acquire);
     while (r) {
         uint64_t w  = r->write_idx.load(std::memory_order_acquire);
@@ -202,6 +213,7 @@ static void flush_once() {
             }
         }
         r->read_idx.store(w, std::memory_order_release);
+        wraps_this_tick += r->wrap_count.load(std::memory_order_relaxed);
         r = r->next.load(std::memory_order_acquire);
     }
     for (uint8_t i = 1; i <= kMethodCount; i++) {
@@ -209,6 +221,29 @@ static void flush_once() {
         ssize_t wrote = ::write(g_state.method_fds[i], by_method[i].data(),
                                 by_method[i].size() * sizeof(Sample));
         (void)wrote;
+    }
+
+    /* Overflow surfacing (spec §7). If we've seen any new wraps since the
+       last tick, log a WARNING. Always log the first wrap; subsequent
+       logs are rate-limited to one per minute via a CAS on the last log
+       timestamp. */
+    uint64_t prev_total = g_state.total_wraps_seen.load(std::memory_order_relaxed);
+    if (wraps_this_tick > prev_total) {
+        g_state.total_wraps_seen.store(wraps_this_tick, std::memory_order_relaxed);
+        int64_t now = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        int64_t last = g_state.last_overflow_log_ts.load(std::memory_order_relaxed);
+        /* prev_total == 0 means this is the first overflow we've ever seen;
+           always log it. Otherwise gate on the 60 s window. */
+        bool should_log = (prev_total == 0) || (now - last >= 60);
+        if (should_log &&
+            g_state.last_overflow_log_ts.compare_exchange_strong(
+                last, now, std::memory_order_relaxed)) {
+            fprintf(stderr,
+                    "[TIDESDB-PERF] ring overflow detected (total wraps=%llu)\n",
+                    static_cast<unsigned long long>(wraps_this_tick));
+        }
     }
 }
 
@@ -302,9 +337,12 @@ static void ring_push_global(TLS_Ring *r) {
 TLS_Ring *ring_alloc_for_thread() {
     auto *r = new (std::nothrow) TLS_Ring{};
     if (!r) return nullptr;
-    /* Use the per-thread default; production code sources from the sysvar
-       via init()-stored module-globals (added in Task 6). */
-    r->capacity = 1u << TLS_Ring::kCapacityPow2Default;
+    /* Honour the runtime-configured capacity (Task 6 wiring); fall back to
+       the per-thread default if init() hasn't run yet (e.g. unit tests
+       that exercise ring_alloc_for_thread() directly without init()). */
+    size_t pow2 = g_state.ring_capacity_pow2;
+    if (pow2 < 4 || pow2 > 30) pow2 = TLS_Ring::kCapacityPow2Default;
+    r->capacity = static_cast<size_t>(1u) << pow2;
     r->slots = new (std::nothrow) Sample[r->capacity]{};
     if (!r->slots) { delete r; return nullptr; }
     r->owner_tid = static_cast<uint64_t>(pthread_self());

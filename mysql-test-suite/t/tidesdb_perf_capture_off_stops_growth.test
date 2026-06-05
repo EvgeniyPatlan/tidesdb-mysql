@@ -1,0 +1,29 @@
+--source suite/tidesdb/include/tidesdb_perf_helpers.inc
+
+SET @save_output_dir = @@global.tidesdb_perf_output_dir;
+SET GLOBAL tidesdb_perf_output_dir = '/tmp/perf-test-growth';
+--exec rm -rf /tmp/perf-test-growth
+
+CREATE TABLE t (id INT PRIMARY KEY) ENGINE=TIDESDB;
+
+# Capture ON: push samples, let the flusher drain at least once.
+SET GLOBAL tidesdb_perf_capture = ON;
+INSERT INTO t VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
+# Sleep > 2 * flush_interval so the file size has stabilised.
+--sleep 3
+--exec stat -c '%s' /tmp/perf-test-growth/*-01-write_row.bin > /tmp/perf-growth-size-1.txt
+
+# Capture OFF: PerfScope dtor short-circuits, no new samples reach the
+# ring, flusher writes nothing more.
+SET GLOBAL tidesdb_perf_capture = OFF;
+INSERT INTO t VALUES (11),(12),(13),(14),(15);
+--sleep 3
+--exec stat -c '%s' /tmp/perf-test-growth/*-01-write_row.bin > /tmp/perf-growth-size-2.txt
+
+# diff is empty when the two file sizes match -- proves the file stopped
+# growing after capture went OFF.
+--exec diff -u /tmp/perf-growth-size-1.txt /tmp/perf-growth-size-2.txt
+
+DROP TABLE t;
+SET GLOBAL tidesdb_perf_output_dir = @save_output_dir;
+SET GLOBAL tidesdb_perf_capture = @save_capture;

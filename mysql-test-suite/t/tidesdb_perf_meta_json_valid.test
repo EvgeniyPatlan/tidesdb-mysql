@@ -1,0 +1,22 @@
+--source suite/tidesdb/include/tidesdb_perf_helpers.inc
+
+SET @save_output_dir = @@global.tidesdb_perf_output_dir;
+SET GLOBAL tidesdb_perf_output_dir = '/tmp/perf-test-meta';
+--exec rm -rf /tmp/perf-test-meta
+
+SET GLOBAL tidesdb_perf_capture = ON;
+CREATE TABLE t (id INT PRIMARY KEY) ENGINE=TIDESDB;
+INSERT INTO t VALUES (1);
+# Sleep > 2 * flush_interval so the flusher has rotated to the new dir
+# and laid down meta.json.
+--sleep 3
+SET GLOBAL tidesdb_perf_capture = OFF;
+
+# Validate meta.json schema + value ranges. tsc_ghz parsed as float in
+# [0.5, 6.0]; capacity matches the runtime sysvar (default pow2=16 -> 65536);
+# method_count is the compile-time constant 32; format_version is 1.
+--exec python3 -c "import json,glob; d=json.load(open(glob.glob('/tmp/perf-test-meta/*-meta.json')[0])); assert 0.5 <= d['tsc_ghz'] <= 6.0, d; assert d['capacity'] == 65536, d; assert d['method_count'] == 32, d; assert d['format_version'] == 1, d; print('meta OK')"
+
+DROP TABLE t;
+SET GLOBAL tidesdb_perf_output_dir = @save_output_dir;
+SET GLOBAL tidesdb_perf_capture = @save_capture;

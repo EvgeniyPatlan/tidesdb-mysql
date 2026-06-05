@@ -57,6 +57,7 @@ extern "C"
 #include "tidesdb_fts.h"             /* FTS subsystem (A-2 extraction) */
 #include "tidesdb_spatial.h"         /* Spatial subsystem (A-2 extraction) */
 #include "tidesdb_perf_ring.h"       /* v0.4.1 perf-instrumentation Task 2 */
+#include "tidesdb_perf_scope.h"      /* v0.4.1 perf-instrumentation: TDB_PERF_SCOPE */
 
 /* See plugin/tidesdb_compat.h's "Category 7: Logging shims" comment
  * for why sql_print_information/warning/error keep their stderr
@@ -648,12 +649,30 @@ static MYSQL_SYSVAR_ENUM(orphan_action, srv_orphan_action,
    here; the perf init/deinit calls below in tidesdb_init_func /
    tidesdb_deinit_func reference them by name. */
 static my_bool tidesdb_perf_capture = 0;
+#if TIDESDB_PERF
+/* SET GLOBAL tidesdb_perf_capture = ON|OFF must propagate into the
+   perf module's runtime gate -- otherwise the PerfScope dtor + flusher
+   only see the value sampled at init time. */
+static void tidesdb_perf_capture_update(THD *, SYS_VAR *,
+                                        void *var_ptr, const void *save) {
+    my_bool newval = *static_cast<const my_bool *>(save);
+    *static_cast<my_bool *>(var_ptr) = newval;
+    tidesdb_perf::g_capture_active.store(newval != 0,
+                                          std::memory_order_release);
+}
+#endif
 static MYSQL_SYSVAR_BOOL(perf_capture, tidesdb_perf_capture,
                          PLUGIN_VAR_OPCMDARG,
                          "Master switch for layer-by-layer perf instrumentation. "
                          "Default OFF. Effective only in builds compiled with "
                          "-DTIDESDB_PERF=1.",
-                         /*check=*/NULL, /*update=*/NULL, /*default=*/false);
+                         /*check=*/NULL,
+#if TIDESDB_PERF
+                         /*update=*/tidesdb_perf_capture_update,
+#else
+                         /*update=*/NULL,
+#endif
+                         /*default=*/false);
 
 static char *tidesdb_perf_output_dir = nullptr;
 /* SET GLOBAL tidesdb_perf_output_dir = '...' propagates the new value
@@ -4922,6 +4941,10 @@ int ha_tidesdb::iter_read_current(uchar *buf)
 int ha_tidesdb::write_row(uchar *buf)
 {
     DBUG_ENTER("ha_tidesdb::write_row");
+    /* v0.4.1 perf-instrumentation: Task 8 precursor -- one scope so the
+       overflow + on_files_appear MTR tests actually have samples to
+       drain. Task 8 lands the full 32-site set. */
+    TDB_PERF_SCOPE(write_row);
 
     /* We need all columns readable for PK extraction, secondary index
        key building, serialization, and TTL computation. */

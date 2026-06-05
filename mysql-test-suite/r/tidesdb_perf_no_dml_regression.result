@@ -1,0 +1,15 @@
+SET @save_capture = @@global.tidesdb_perf_capture;
+SET GLOBAL tidesdb_perf_capture = OFF;
+CREATE TABLE t (id INT PRIMARY KEY) ENGINE=TIDESDB;
+SET @t0 = SYSDATE(6);
+SET @off_us = TIMESTAMPDIFF(MICROSECOND, @t0, SYSDATE(6));
+SET GLOBAL tidesdb_perf_capture = ON;
+SET @t0 = SYSDATE(6);
+SET @on_us = TIMESTAMPDIFF(MICROSECOND, @t0, SYSDATE(6));
+SET GLOBAL tidesdb_perf_capture = OFF;
+SELECT IF(@on_us <= @off_us * 1.25, 'OK',
+CONCAT('REGRESS off_us=', @off_us, ' on_us=', @on_us)) AS verdict;
+verdict
+OK
+DROP TABLE t;
+SET GLOBAL tidesdb_perf_capture = @save_capture;
