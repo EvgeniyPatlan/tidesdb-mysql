@@ -157,6 +157,35 @@ Engine improvements inherited from v9.3.0 (no plugin change needed): a hard acti
 
 Gated on the full validation suite: MTR, the HammerDB SIGKILL recovery gate, the mwbench engine-integrity gate (0 mismatches / 0 misses), and a full HammerDB WARE=100 throughput run. See [docs/v9.3.0-validation-report.md](docs/v9.3.0-validation-report.md).
 
+## v0.4.1 — 2026-06-07
+
+Perf-instrumentation **infrastructure** release. Adds a layer-by-layer latency capture surface to the plugin (thread-local rdtsc rings, per-method binary files, offline analyser) so future engine-side optimisation work has a fact base. No engine optimisations ship in this release — the deliverable is the **measurement surface**, not a perf improvement. The bundled engine is unchanged from v0.4.0 (still TidesDB **v9.3.2**, still shipped unpatched). The default `tidesdb/mysql:9.7` image is unchanged; instrumentation lives in a separate `tidesdb/mysql:9.7-perf` variant.
+
+See [docs/v0.4.1-validation-report.md](docs/v0.4.1-validation-report.md) for the full validation matrix and captured headline numbers from a WARE=10 RUNVU=8 3-min HammerDB TPROC-C run.
+
+### Added
+
+- `TDB_PERF_SCOPE(MethodId)` RAII macro covering the full plugin entry surface (32 `MethodId` values: `write_row`, `update_row`, `delete_row`, `index_read_map`, `index_next`, `index_prev`, `rnd_next`, `rnd_pos`, `external_lock`, `start_stmt`, `store_lock`, `commit`, `rollback`, four `savepoint_*`, `open`, `close`, `info`, `table_flags_cache_init`, `create`, `delete_table`, four inplace-ALTER virtuals, `serialize_row`, `deserialize_row`, `key_copy_to_comparable`, `pk_from_record`, `encrypt_row_into`, `decrypt_row`). On capture-off the overhead is two `__rdtsc()` reads + one atomic load per scope. Compile-time-gated on `TIDESDB_PERF`; with `TIDESDB_PERF=0` (the default) the macro expands to `((void)0)`.
+- Thread-local `TLS_Ring` (default `2^16` samples per thread, runtime-configurable). 24-byte `Sample` packed natural-alignment with `static_assert` on the layout. Rings self-register into a lock-free linked list (`g_rings_head`) on first use.
+- Background flusher thread pinned to CPU 0; walks the ring list every `tidesdb_perf_flush_interval_ms`, bucket-sorts by method, `pwritev`s each bucket to its method's append-only `.bin` file. Calibrates TSC via 20 ms `std::chrono::steady_clock` spin on `perf::init()` and writes the calibration to `meta.json`. Ring overflow logged on first occurrence then rate-limited to once per 60 seconds.
+- Four perf sysvars (all gated on `TIDESDB_PERF=1`): `tidesdb_perf_capture` (`BOOL`, default `OFF` — the kill-switch), `tidesdb_perf_output_dir` (`STRING`, default `/var/lib/mysql/tidesdb-perf`, `PLUGIN_VAR_MEMALLOC`), `tidesdb_perf_ring_capacity_pow2` (`INT`, default `16`, `PLUGIN_VAR_READONLY`), `tidesdb_perf_flush_interval_ms` (`INT`, default `1000`).
+- `tools/tidesdb_perf_analyze` — Python 3 + numpy offline analyser. Parses `.bin` files (`struct.pack('<BBH4xQQ', ...)`), aggregates per-method `calls / total_ms / mean_us / p50 / p95 / p99 / max`, emits markdown. `--compare A B` produces a side-by-side diff between two capture directories.
+- `bench/perf/run-perf-capture.sh` integration harness. Wraps `bench/hammerdb/run-hammerdb.sh`, forces perf sysvars ON via `DB_EXTRA_ARGS`, mounts the perf output directory into the container, copies + chowns artifacts back to the host, runs the analyser, writes `report.md`. `COMPARE=1` extends the same flow against `sut-mariadb-tidesdb:9.3.0-perf`.
+- `docker/patches/tidesql/0001-perf-instrumentation.patch` (880 lines) — ports `Sample` / `TLS_Ring` / `PerfScope` + 30 `TDB_PERF_SCOPE` call sites into TideSQL's `ha_tidesdb.cc` for the eventual MySQL-vs-MariaDB side-by-side run. Sysvar wiring deferred to v0.5.0.
+- `Dockerfile.mysql` build-arg `TIDESDB_PERF` (default `0`). `docker build --build-arg TIDESDB_PERF=1 -t tidesdb/mysql:9.7-perf .` produces the perf variant. Forwarded as both `-DTIDESDB_PERF` **and** the `TIDESDB_PERF` environment variable on the plugin cmake configure + build steps — the latter is required because the cmake `-D` from the top-level mysql cmake invocation does not always propagate into the plugin sub-scope across cmake versions; the plugin's `CMakeLists.txt` keys on `ENV{TIDESDB_PERF}` explicitly.
+- 5 new MTR tests (`tidesdb_perf_*`): no `.bin` files when capture OFF, growth stops when capture is flipped OFF mid-run, `meta.json` is valid, ring overflow is logged once + rate-limited, no DML regression with capture ON.
+- 8 new gtest unit tests in `tidesdb_atomic_ddl_tests` covering the ring (`PushReadRoundTrip`, `WrapBehaviour`, `TombstoneDrained`, `AllocSelfRegistersInGlobalList`, `NoCaptureZeroPushes`, `CaptureOnPushesOneSample`, `NestedScopesOrdered`, `ConcurrentPushSingleReader`).
+
+### Changed
+
+- `bench/perf/run-perf-capture.sh` now docker-mediates the artifact copy (rather than a bare `cp -r`) so that `.bin` files written by mysql uid 999 inside the container (mode 640) become readable by the invoking host user.
+
+### Deferred to v0.5.0
+
+- **Engine-side optimisations.** v0.4.1 ships the measurement surface; the captured hotspots (`write_row` 5.29M calls / mean 16.5 μs / max 72 ms — long compaction tail; `index_read_map` 1.9M calls / mean 13.2 μs / p99 108 μs) are the entry points for the v0.5.0 work.
+- **`sut-mariadb-tidesdb:9.3.0-perf` SUT image.** TideSQL perf patch is committed but not yet applied + built; `COMPARE=1` runs against MariaDB are not yet wired end-to-end.
+- **TideSQL perf sysvars.** The TideSQL patch wires the scope macros + ring; sysvar wiring is deferred (would have inflated the patch by hundreds of lines).
+
 ## v0.4.0 — 2026-06-04
 
 Atomic-DDL participation (closes review finding **A-5**). `HTON_SUPPORTS_ATOMIC_DDL` is now set on the TidesDB handlerton, schema metadata is persisted in `dd::Table::se_private_data` during CREATE/ALTER, the plugin is self-healing across crash-during-DDL via an eager startup reconciliation sweep, and the full set of SDI + DDSE callbacks is wired. The bundled engine is unchanged from v0.3.1 (still TidesDB **v9.3.2**, still shipped unpatched).
