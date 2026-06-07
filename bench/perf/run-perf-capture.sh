@@ -21,13 +21,15 @@
 #    bench/results/perf-<ts>/mariadb/ (if COMPARE=1)
 #    bench/results/perf-<ts>/diff.md  (if COMPARE=1)
 #
-#  KNOWN LIMITATION (v0.4.1): the perf-flavoured plugin .so links against
-#  glibc 2.39 (from the tides-builder Ubuntu 24.04 image), but the runtime
-#  image base is Oracle Linux 9 with glibc 2.34. This causes dlopen to fail
-#  with "GLIBC_2.38 not found". Tracked as a Task 13 release-validation
-#  work item: either rebuild tides-builder on Oracle Linux 9, or rebase the
-#  runtime image on a newer distro. Until then, this harness is for code
-#  review and CI lint only; it will not produce a successful run end-to-end.
+#  Image:
+#    tidesdb/mysql:9.7-perf is produced by
+#      sg docker -c "docker build -f docker/Dockerfile.mysql \\
+#        --build-arg TIDESDB_PERF=1 -t tidesdb/mysql:9.7-perf ."
+#    Stage 1 (Oracle Linux 9 + gcc-toolset-14) builds the plugin with
+#    -DTIDESDB_PERF=1 propagated via the TIDESDB_PERF env-var (which the
+#    plugin's CMakeLists.txt picks up explicitly -- the cmake -D from the
+#    top-level mysql cmake invocation does not reach the plugin sub-scope
+#    reliably across all cmake versions).
 # ============================================================================
 set -uo pipefail
 
@@ -87,7 +89,10 @@ run_sut() {
     KEEP_DB=0 \
         sg docker -c "cd $(pwd) && DB_EXTRA_ARGS='--loose_tidesdb_perf_capture=$PERF_CAPTURE --loose_tidesdb_perf_output_dir=$PERF_DIR --loose_tidesdb_perf_flush_interval_ms=$PERF_FLUSH_MS' WARE=$WARE BUILDVU=$BUILDVU RUNVU=$RUNVU RAMP=$RAMP DUR=$DUR CPUS=$CPUS MEM=$MEM $HERE/run-hammerdb-perf.sh 2>&1" \
         > "$dest/hammerdb.log" 2>&1 || true
-    cp -r "$PERF_DIR"/. "$dest/" 2>/dev/null || true
+    # Files in $PERF_DIR are owned by mysql uid 999 (mode 640) so the host
+    # user can't read them; rsync via a root-running docker helper that also
+    # chowns to the invoking host uid:gid.
+    sg docker -c "docker run --rm -v $PERF_DIR:/src -v $dest:/dst alpine sh -c 'cp -r /src/. /dst/ && chown -R $(id -u):$(id -g) /dst'" > /dev/null 2>&1 || true
 
     # Restore the original tidesdb/mysql:9.7 tag if we saved one.
     if [ -n "$saved" ]; then
@@ -98,11 +103,12 @@ run_sut() {
 
     # Analyse.
     if ls "$dest"/*-meta.json > /dev/null 2>&1; then
-        python3 -m tidesdb_perf_analyze "$dest" --output "$dest/report.md" \
+        (cd "$(cd "$HERE/../../tools" && pwd)" && \
+         python3 -m tidesdb_perf_analyze "$dest" --output "$dest/report.md") \
             2> "$dest/analyse.err" || echo "[perf] $label analyse failed; see $dest/analyse.err"
         echo "[perf] $label report -> $dest/report.md"
     else
-        echo "[perf] $label produced no perf data (likely the GLIBC ABI skew limitation -- see script header)"
+        echo "[perf] $label produced no perf data"
     fi
 }
 

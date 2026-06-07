@@ -46,6 +46,11 @@ FROM oraclelinux:9 AS builder
 ARG MYSQL_TAG=mysql-9.7.0
 ARG TIDESDB_TAG=v9.3.2
 
+# v0.4.1: build the plugin with -DTIDESDB_PERF=1 to compile in the
+# layer-by-layer perf instrumentation. Default OFF; pass --build-arg
+# TIDESDB_PERF=1 for the perf image variant.
+ARG TIDESDB_PERF=0
+
 # Build dependencies. MySQL 9.7 requires GCC 14, which OL9 ships only as
 # the gcc-toolset-14 SCL; the default GCC is 11. Other -devel packages
 # come from base + ol9_codeready_builder + EPEL.
@@ -113,9 +118,11 @@ COPY plugin/ /build/mysql-server/storage/tidesdb/
 #    everything else (auth plugins, ndb, federated, etc.) is disabled to
 #    keep the build short.
 RUN cd mysql-server && \
+    TIDESDB_PERF=${TIDESDB_PERF} \
     TIDESDB_ROOT=/build/tidesdb-prefix \
     cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=Release \
+          -DTIDESDB_PERF=${TIDESDB_PERF} \
           -DDOWNLOAD_BOOST=1 \
           -DWITH_BOOST=/build/boost \
           -DWITH_UNIT_TESTS=OFF \
@@ -134,6 +141,7 @@ RUN cd mysql-server && \
           -DWITH_AUTHENTICATION_WEBAUTHN=OFF
 
 RUN cd mysql-server && \
+    TIDESDB_PERF=${TIDESDB_PERF} \
     TIDESDB_ROOT=/build/tidesdb-prefix \
     cmake --build build --target tidesdb -j"$(nproc)"
 
