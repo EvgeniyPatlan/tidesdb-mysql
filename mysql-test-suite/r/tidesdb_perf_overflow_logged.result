@@ -1,0 +1,12 @@
+# restart: --tidesdb_perf_ring_capacity_pow2=8
+SET @save_capture = @@global.tidesdb_perf_capture;
+SET GLOBAL tidesdb_perf_capture = OFF;
+SET @save_output_dir = @@global.tidesdb_perf_output_dir;
+SET GLOBAL tidesdb_perf_output_dir = '/tmp/perf-test-overflow';
+CREATE TABLE t (id INT PRIMARY KEY) ENGINE=TIDESDB;
+SET GLOBAL tidesdb_perf_capture = ON;
+SET GLOBAL tidesdb_perf_capture = OFF;
+overflow logged OK
+DROP TABLE t;
+SET GLOBAL tidesdb_perf_output_dir = @save_output_dir;
+SET GLOBAL tidesdb_perf_capture = @save_capture;

@@ -27,7 +27,9 @@ add_executable(tidesdb_atomic_ddl_tests
     test_sdi_pack_key.cc
     test_reconciler_delta.cc
     test_server_stubs.cc
+    test_perf_ring.cc
     ${CMAKE_SOURCE_DIR}/storage/tidesdb/tidesdb_atomic_ddl_pure.cc
+    ${CMAKE_SOURCE_DIR}/storage/tidesdb/tidesdb_perf_ring.cc
 )
 
 # Inherit the plugin target's include paths and compile definitions. This is

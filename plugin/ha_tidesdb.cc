@@ -56,6 +56,8 @@ extern "C"
 #include "tidesdb_atomic_ddl.h"      /* register_tablespace (A-5 atomic-DDL) */
 #include "tidesdb_fts.h"             /* FTS subsystem (A-2 extraction) */
 #include "tidesdb_spatial.h"         /* Spatial subsystem (A-2 extraction) */
+#include "tidesdb_perf_ring.h"       /* v0.4.1 perf-instrumentation Task 2 */
+#include "tidesdb_perf_scope.h"      /* v0.4.1 perf-instrumentation: TDB_PERF_SCOPE */
 
 /* See plugin/tidesdb_compat.h's "Category 7: Logging shims" comment
  * for why sql_print_information/warning/error keep their stderr
@@ -638,6 +640,86 @@ static MYSQL_SYSVAR_ENUM(orphan_action, srv_orphan_action,
                          "logged -- the reconciler never modifies the DD.",
                          /*check=*/NULL, tidesdb_orphan_action_update,
                          /*default=*/1, &tidesdb_orphan_action_typelib);
+
+/* v0.4.1 perf-instrumentation (Task 2): four sysvars surfacing the
+   per-thread perf ring. All four exist regardless of TIDESDB_PERF build
+   flag so that DROP-IN configs are stable across feature toggles; the
+   capture path is inert when the plugin is compiled without the flag
+   (init/deinit are no-op stubs in that build). The storage cells live
+   here; the perf init/deinit calls below in tidesdb_init_func /
+   tidesdb_deinit_func reference them by name. */
+static my_bool tidesdb_perf_capture = 0;
+#if TIDESDB_PERF
+/* SET GLOBAL tidesdb_perf_capture = ON|OFF must propagate into the
+   perf module's runtime gate -- otherwise the PerfScope dtor + flusher
+   only see the value sampled at init time. */
+static void tidesdb_perf_capture_update(THD *, SYS_VAR *,
+                                        void *var_ptr, const void *save) {
+    my_bool newval = *static_cast<const my_bool *>(save);
+    *static_cast<my_bool *>(var_ptr) = newval;
+    tidesdb_perf::g_capture_active.store(newval != 0,
+                                          std::memory_order_release);
+}
+#endif
+static MYSQL_SYSVAR_BOOL(perf_capture, tidesdb_perf_capture,
+                         PLUGIN_VAR_OPCMDARG,
+                         "Master switch for layer-by-layer perf instrumentation. "
+                         "Default OFF. Effective only in builds compiled with "
+                         "-DTIDESDB_PERF=1.",
+                         /*check=*/NULL,
+#if TIDESDB_PERF
+                         /*update=*/tidesdb_perf_capture_update,
+#else
+                         /*update=*/NULL,
+#endif
+                         /*default=*/false);
+
+static char *tidesdb_perf_output_dir = nullptr;
+/* SET GLOBAL tidesdb_perf_output_dir = '...' propagates the new value
+   into the perf module so the flusher can rotate fds at its next tick.
+   Without this hook, the sysvar storage cell changes but the flusher
+   keeps writing to the dir init() opened. */
+#if TIDESDB_PERF
+static void tidesdb_perf_output_dir_update(THD *, SYS_VAR *,
+                                           void *var_ptr, const void *save) {
+    const char *newval = *static_cast<const char *const *>(save);
+    *static_cast<const char **>(var_ptr) = newval;
+    tidesdb_perf::set_output_dir(newval);
+}
+#endif
+/* PLUGIN_VAR_MEMALLOC tells the server to own the storage for the
+   string (strdup on SET GLOBAL, free on shutdown / next SET), so a
+   STR sysvar without an update_func can still be runtime-mutable
+   without the "forced read-only" warning at startup. */
+static MYSQL_SYSVAR_STR(perf_output_dir, tidesdb_perf_output_dir,
+                        PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_MEMALLOC,
+                        "Directory where per-method perf .bin files land. "
+                        "Default /var/lib/mysql/tidesdb-perf/. Honoured at "
+                        "next flush tick after change.",
+                        /*check=*/NULL,
+#if TIDESDB_PERF
+                        /*update=*/tidesdb_perf_output_dir_update,
+#else
+                        /*update=*/NULL,
+#endif
+                        /*default=*/"/var/lib/mysql/tidesdb-perf");
+
+static ulong tidesdb_perf_ring_capacity_pow2 = 16;
+static MYSQL_SYSVAR_ULONG(perf_ring_capacity_pow2, tidesdb_perf_ring_capacity_pow2,
+                          PLUGIN_VAR_READONLY,
+                          "Per-thread ring capacity in samples = 1 << pow2. "
+                          "Default 16 (= 65536 samples = ~1.5 MiB/thread). "
+                          "Server-start only.",
+                          /*check=*/NULL, /*update=*/NULL,
+                          /*default=*/16, /*min=*/8, /*max=*/24, /*block=*/1);
+
+static ulong tidesdb_perf_flush_interval_ms = 1000;
+static MYSQL_SYSVAR_ULONG(perf_flush_interval_ms, tidesdb_perf_flush_interval_ms,
+                          PLUGIN_VAR_OPCMDARG,
+                          "Flusher tick interval in milliseconds. "
+                          "Default 1000.",
+                          /*check=*/NULL, /*update=*/NULL,
+                          /*default=*/1000, /*min=*/100, /*max=*/60000, /*block=*/1);
 
 static MYSQL_SYSVAR_BOOL(pessimistic_locking, srv_pessimistic_locking, PLUGIN_VAR_RQCMDARG,
                          "Enable plugin-level row locks for SELECT ... FOR UPDATE, "
@@ -1348,6 +1430,10 @@ static SYS_VAR *tidesdb_system_variables[] = {
     MYSQL_SYSVAR(default_tombstone_density_min_entries),
     MYSQL_SYSVAR(atomic_ddl_strict),
     MYSQL_SYSVAR(orphan_action),
+    MYSQL_SYSVAR(perf_capture),
+    MYSQL_SYSVAR(perf_output_dir),
+    MYSQL_SYSVAR(perf_ring_capacity_pow2),
+    MYSQL_SYSVAR(perf_flush_interval_ms),
     NULL};
 
 /* ******************** Table options (per-table CF config) ******************** */
@@ -1862,6 +1948,7 @@ static int tidesdb_savepoint_set(THD *thd, void *sv)
 static int tidesdb_savepoint_set(handlerton *, THD *thd, void *sv)
 #endif
 {
+    TDB_PERF_SCOPE(savepoint_set);
     tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, tidesdb_hton);
     if (!trx || !trx->txn || !sv) return 0;
 
@@ -1879,6 +1966,7 @@ static int tidesdb_savepoint_rollback(THD *thd, void *sv)
 static int tidesdb_savepoint_rollback(handlerton *, THD *thd, void *sv)
 #endif
 {
+    TDB_PERF_SCOPE(savepoint_rollback);
     tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, tidesdb_hton);
     if (!trx || !trx->txn || !sv) return 0;
 
@@ -1913,6 +2001,7 @@ static int tidesdb_savepoint_release(THD *thd, void *sv)
 static int tidesdb_savepoint_release(handlerton *, THD *thd, void *sv)
 #endif
 {
+    TDB_PERF_SCOPE(savepoint_release);
     tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, tidesdb_hton);
     if (!trx || !trx->txn || !sv) return 0;
 
@@ -2007,6 +2096,7 @@ static int tidesdb_commit(THD *thd, bool all)
 static int tidesdb_commit(handlerton *, THD *thd, bool all)
 #endif
 {
+    TDB_PERF_SCOPE(commit);
     tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, tidesdb_hton);
     if (!trx || !trx->txn)
     {
@@ -2107,6 +2197,7 @@ static int tidesdb_rollback(THD *thd, bool all)
 static int tidesdb_rollback(handlerton *, THD *thd, bool all)
 #endif
 {
+    TDB_PERF_SCOPE(rollback);
     tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, tidesdb_hton);
     if (!trx || !trx->txn) return 0;
 
@@ -3005,6 +3096,21 @@ static int tidesdb_init_func(void *p)
            guard inside SdiStore rather than dereferencing a freed object. */
     }
 
+#if TIDESDB_PERF
+    /* v0.4.1 perf-instrumentation Task 2: hand the perf subsystem its
+       four sysvar values and then publish the master switch. init()
+       failure is non-fatal -- the capture path stays inert and the
+       engine remains fully usable. */
+    if (!tidesdb_perf::init(tidesdb_perf_output_dir,
+                            static_cast<size_t>(tidesdb_perf_ring_capacity_pow2),
+                            static_cast<uint64_t>(tidesdb_perf_flush_interval_ms))) {
+        sql_print_warning("[TIDESDB-PERF] init failed; perf capture will be inactive");
+    } else {
+        tidesdb_perf::g_capture_active.store(tidesdb_perf_capture,
+                                              std::memory_order_release);
+    }
+#endif
+
     /* Atomic-DDL (A-5) Task 5: wire the six SDI tablespace callbacks. They
        route SDI reads/writes for the tidesdb_system tablespace to
        g_engine_ctx.sdi and return success-no-op for every other tablespace. */
@@ -3199,6 +3305,15 @@ static void tidesdb_hton_kill_query(handlerton *, THD *thd, enum thd_kill_levels
 static int tidesdb_deinit_func(void *p)
 {
     DBUG_ENTER("tidesdb_deinit_func");
+
+#if TIDESDB_PERF
+    /* v0.4.1 perf-instrumentation Task 2: drain & shut the flusher
+       BEFORE we teardown the engine, so a final flush still has the
+       engine state available if a future tick needs it. The current
+       skeleton deinit is a no-op stub but the call site is correct
+       for when the flusher lands. */
+    tidesdb_perf::deinit();
+#endif
 
     g_engine_ctx.schema_cf = NULL;
 
@@ -3463,6 +3578,7 @@ uint ha_tidesdb::make_comparable_key(KEY *key_info, const uchar *record, uint nu
 uint ha_tidesdb::key_copy_to_comparable(KEY *key_info, const uchar *key_buf, uint key_len,
                                         uchar *out)
 {
+    TDB_PERF_SCOPE(key_copy_to_comparable);
     /* Use per-handler scratch buffer rather than table->record[1] so we
        don't pollute the row buffer the SQL layer is sharing. Lazy-size
        on first use (open() can't always size it -- altered tables may
@@ -3499,6 +3615,7 @@ uint ha_tidesdb::key_copy_to_comparable(KEY *key_info, const uchar *key_buf, uin
 */
 uint ha_tidesdb::pk_from_record(const uchar *record, uchar *out)
 {
+    TDB_PERF_SCOPE(pk_from_record);
     if (share->has_user_pk)
     {
         return make_comparable_key(&table->key_info[share->pk_index], record,
@@ -3971,6 +4088,7 @@ int ha_tidesdb::open(const char *name, int mode, uint test_if_locked,
                      const dd::Table *table_def)
 {
     DBUG_ENTER("ha_tidesdb::open");
+    TDB_PERF_SCOPE(open);
 
     if (!(share = get_share())) DBUG_RETURN(1);
 
@@ -4213,6 +4331,7 @@ int ha_tidesdb::open(const char *name, int mode, uint test_if_locked,
 int ha_tidesdb::close(void)
 {
     DBUG_ENTER("ha_tidesdb::close");
+    TDB_PERF_SCOPE(close);
     if (scan_iter)
     {
         tidesdb_iter_free(scan_iter);
@@ -4233,6 +4352,7 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
                        dd::Table *table_def)
 {
     DBUG_ENTER("ha_tidesdb::create");
+    TDB_PERF_SCOPE(create);
 
     std::string cf_name = path_to_cf_name(name);
 
@@ -4366,6 +4486,7 @@ static inline void tdb_secure_zero(void *p, size_t n)
 static bool tidesdb_encrypt_row_into(const std::string &plain, uint key_id, uint key_version,
                                      std::string &out)
 {
+    TDB_PERF_SCOPE(encrypt_row_into);
     unsigned char key[TIDESDB_ENC_KEY_LEN];
     unsigned int klen = sizeof(key);
     if (encryption_key_get(key_id, key_version, key, &klen) != 0)
@@ -4434,6 +4555,7 @@ static bool tidesdb_encrypt_row_into(const std::string &plain, uint key_id, uint
 */
 static std::string tidesdb_decrypt_row(const char *data, size_t len, uint key_id, uint key_version)
 {
+    TDB_PERF_SCOPE(decrypt_row);
     if (len <= TIDESDB_ENC_IV_LEN)
     {
         sql_print_error("[TIDESDB] encrypted row too short (%zu bytes)", len);
@@ -4480,6 +4602,7 @@ static std::string tidesdb_decrypt_row(const char *data, size_t len, uint key_id
 
 const std::string &ha_tidesdb::serialize_row(const uchar *buf)
 {
+    TDB_PERF_SCOPE(serialize_row);
     my_ptrdiff_t ptrdiff = (my_ptrdiff_t)(buf - table->record[0]);
 
     /* Upper-bound packed size.  For non-BLOB tables the estimate is constant
@@ -4575,6 +4698,7 @@ const std::string &ha_tidesdb::serialize_row(const uchar *buf)
 
 void ha_tidesdb::deserialize_row(uchar *buf, const uchar *data, size_t len)
 {
+    TDB_PERF_SCOPE(deserialize_row);
     const uchar *from = data;
     const uchar *from_end = data + len;
 
@@ -4831,6 +4955,10 @@ int ha_tidesdb::iter_read_current(uchar *buf)
 int ha_tidesdb::write_row(uchar *buf)
 {
     DBUG_ENTER("ha_tidesdb::write_row");
+    /* v0.4.1 perf-instrumentation: Task 8 precursor -- one scope so the
+       overflow + on_files_appear MTR tests actually have samples to
+       drain. Task 8 lands the full 32-site set. */
+    TDB_PERF_SCOPE(write_row);
 
     /* We need all columns readable for PK extraction, secondary index
        key building, serialization, and TTL computation. */
@@ -5322,6 +5450,7 @@ int ha_tidesdb::rnd_end()
 int ha_tidesdb::rnd_next(uchar *buf)
 {
     DBUG_ENTER("ha_tidesdb::rnd_next");
+    TDB_PERF_SCOPE(rnd_next);
 
     if (cached_thd_ && thd_killed(cached_thd_)) DBUG_RETURN(HA_ERR_ABORTED_BY_USER);
 
@@ -5349,6 +5478,7 @@ void ha_tidesdb::position(const uchar *record)
 int ha_tidesdb::rnd_pos(uchar *buf, uchar *pos)
 {
     DBUG_ENTER("ha_tidesdb::rnd_pos");
+    TDB_PERF_SCOPE(rnd_pos);
 
     /* Lazy txn, we ensure stmt_txn exists */
     {
@@ -5497,6 +5627,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
                                enum ha_rkey_function find_flag)
 {
     DBUG_ENTER("ha_tidesdb::index_read_map");
+    TDB_PERF_SCOPE(index_read_map);
 
     /* key_copy_to_comparable uses key_restore + make_comparable_key,
        which reads fields via make_sort_key_part. */
@@ -5812,6 +5943,7 @@ int ha_tidesdb::index_read_last_map(uchar *buf, const uchar *key,
 int ha_tidesdb::index_next(uchar *buf)
 {
     DBUG_ENTER("ha_tidesdb::index_next");
+    TDB_PERF_SCOPE(index_next);
 
     if (cached_thd_ && thd_killed(cached_thd_)) DBUG_RETURN(HA_ERR_ABORTED_BY_USER);
 
@@ -5892,6 +6024,7 @@ int ha_tidesdb::index_next(uchar *buf)
 int ha_tidesdb::index_prev(uchar *buf)
 {
     DBUG_ENTER("ha_tidesdb::index_prev");
+    TDB_PERF_SCOPE(index_prev);
 
     if (cached_thd_ && thd_killed(cached_thd_)) DBUG_RETURN(HA_ERR_ABORTED_BY_USER);
 
@@ -6124,6 +6257,7 @@ int ha_tidesdb::index_next_same(uchar *buf, const uchar *key, uint keylen)
 int ha_tidesdb::update_row(const uchar *old_data, uchar *new_data)
 {
     DBUG_ENTER("ha_tidesdb::update_row");
+    TDB_PERF_SCOPE(update_row);
 
     my_bitmap_map *old_map = tmp_use_all_columns(table, table->read_set);
 
@@ -6515,6 +6649,7 @@ err:
 int ha_tidesdb::delete_row(const uchar *buf)
 {
     DBUG_ENTER("ha_tidesdb::delete_row");
+    TDB_PERF_SCOPE(delete_row);
 
     my_bitmap_map *old_map = tmp_use_all_columns(table, table->read_set);
 
@@ -7244,6 +7379,7 @@ int ha_tidesdb::multi_range_read_next(range_id_t *range_info)
 int ha_tidesdb::info(uint flag)
 {
     DBUG_ENTER("ha_tidesdb::info");
+    TDB_PERF_SCOPE(info);
 
     if (share) ref_length = share->pk_key_len;
 
@@ -8491,6 +8627,7 @@ int ha_tidesdb::ensure_stmt_txn()
 int ha_tidesdb::external_lock(THD *thd, int lock_type)
 {
     DBUG_ENTER("ha_tidesdb::external_lock");
+    TDB_PERF_SCOPE(external_lock);
 
     if (lock_type != F_UNLCK)
     {
@@ -8595,6 +8732,7 @@ int ha_tidesdb::external_lock(THD *thd, int lock_type)
 
 THR_LOCK_DATA **ha_tidesdb::store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lock_type lock_type)
 {
+    TDB_PERF_SCOPE(store_lock);
     /* With lock_count()=0 MySQL skips THR_LOCK entirely.
        store_lock is still called for informational purposes but we
        do not push into the 'to' array (same pattern as InnoDB).
@@ -8962,6 +9100,7 @@ static void tidesdb_hton_drop_database(handlerton *, char *path)
 int ha_tidesdb::delete_table(const char *name, const dd::Table *table_def)
 {
     DBUG_ENTER("ha_tidesdb::delete_table");
+    TDB_PERF_SCOPE(delete_table);
 
     /* Atomic-DDL Task 13 follow-up: flush pending engine writes before any
        CF mutation. See tidesdb_flush_engine_txn_before_cf_mutation. */

@@ -1,0 +1,50 @@
+# Quick presence check before we restart (skips on builds without -DTIDESDB_PERF).
+--source suite/tidesdb/include/have_tidesdb.inc
+let $perf_present = `SELECT COUNT(*) FROM performance_schema.session_variables
+                      WHERE VARIABLE_NAME='tidesdb_perf_capture'`;
+if (!$perf_present) {
+  --skip Test requires plugin built with -DTIDESDB_PERF=1
+}
+
+# Restart with a tiny per-thread ring (256 samples = 1 << 8) so a 1000-row
+# INSERT loop is guaranteed to overrun the ring before the flusher drains
+# it. ring_capacity_pow2 is read-only at runtime so a restart is required.
+let $restart_parameters = restart: --tidesdb_perf_ring_capacity_pow2=8;
+--source include/restart_mysqld.inc
+
+# Session vars are lost across restart -- re-establish the helper state.
+SET @save_capture = @@global.tidesdb_perf_capture;
+SET GLOBAL tidesdb_perf_capture = OFF;
+SET @save_output_dir = @@global.tidesdb_perf_output_dir;
+SET GLOBAL tidesdb_perf_output_dir = '/tmp/perf-test-overflow';
+--exec rm -rf /tmp/perf-test-overflow
+
+CREATE TABLE t (id INT PRIMARY KEY) ENGINE=TIDESDB;
+SET GLOBAL tidesdb_perf_capture = ON;
+
+# Tight loop: 1000 INSERTs >> 256-sample ring; samples wrap.
+--disable_query_log
+--disable_result_log
+let $i = 0;
+while ($i < 1000) {
+  --eval INSERT INTO t VALUES ($i)
+  inc $i;
+}
+--enable_result_log
+--enable_query_log
+
+# Wait for at least one full flusher tick after the last INSERT so the
+# wrap-detection log line has a chance to land in the error log.
+--sleep 3
+SET GLOBAL tidesdb_perf_capture = OFF;
+
+# The flusher emits the WARNING with the [TIDESDB-PERF] prefix. Look for
+# the "ring overflow detected" substring -- a single match is enough to
+# prove the overflow path fired and was surfaced. grep exits 0 on match,
+# 1 on no match -- so a clean grep is a passing test.
+let $log = $MYSQLTEST_VARDIR/log/mysqld.1.err;
+--exec grep -q "TIDESDB-PERF.*ring overflow detected" $log && echo "overflow logged OK"
+
+DROP TABLE t;
+SET GLOBAL tidesdb_perf_output_dir = @save_output_dir;
+SET GLOBAL tidesdb_perf_capture = @save_capture;
