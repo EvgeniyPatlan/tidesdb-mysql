@@ -1,0 +1,94 @@
+From: tidesdb-mysql
+Subject: [PATCH] perf-autostart for sut-mariadb-tidesdb:9.3.0-perf
+
+Stacks on top of 0001-perf-instrumentation.patch. The TideSQL fork does not
+have MariaDB sysvars wired for perf capture (that surface is deferred to
+v0.5.0), so this patch flips three small switches that make the
+compiled-in perf code actually emit data when the bench image runs:
+
+  1. Default g_capture_active to true so capture starts the moment the
+     plugin is loaded -- there is no SET GLOBAL surface to flip it from
+     SQL on this fork.
+
+  2. Have tidesdb_init_func call perf::init() with an explicit output_dir
+     ("/tmp/perf-out") matching the path the perf-capture harness mounts,
+     and a 200ms flush interval to keep the on-disk delay short for short
+     benchmark runs.
+
+  3. Add ARG TIDESDB_PERF=0 to the Ubuntu Dockerfile and forward it as
+     -DTIDESDB_PERF=ON on the MariaDB cmake step. Default off; the
+     benchmark image is built with --build-arg TIDESDB_PERF=1.
+
+These three switches together make `docker build --build-arg
+TIDESDB_PERF=1` produce an image that emits per-method .bin files into
+/tmp/perf-out from the moment mariadbd accepts its first connection.
+
+---
+ docker/ubuntu/Dockerfile           | 7 ++++++-
+ tidesdb/ha_tidesdb.cc              | 4 ++--
+ tidesdb/perf/tidesdb_perf_ring.cc  | 5 ++++-
+ 3 files changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/docker/ubuntu/Dockerfile b/docker/ubuntu/Dockerfile
+--- a/docker/ubuntu/Dockerfile
++++ b/docker/ubuntu/Dockerfile
+@@ -17,6 +17,11 @@ ARG WITH_S3=0
+ # Affects only TidesDB's internal allocations; mariadbd's allocator is unchanged.
+ # Combine with LD_PRELOAD at container startup for a process-wide swap.
+ ARG ALLOCATOR=system
++# Set TIDESDB_PERF=1 to compile in the layer-by-layer perf instrumentation.
++# Used for the sut-mariadb-tidesdb:9.3.0-perf benchmark variant. The vendored
++# perf ring auto-starts capture (no MariaDB sysvars are wired in the
++# TideSQL fork; that surface is deferred to v0.5.0).
++ARG TIDESDB_PERF=0
+
+ # Persist key paths as environment variables so they are available in every
+ # RUN step and at container runtime.
+@@ -117,6 +122,7 @@ RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
+     TEST_DIR_FLAG=$([ "${WITH_TESTS:-0}" = "1" ] || echo "-DINSTALL_MYSQLTESTDIR=OFF") && \
+     ENGINE_FLAGS=$(cmake_exclude_engines.sh "${DISABLED_ENGINES:-}") && \
+     S3_FLAG=$([ "${WITH_S3}" = "1" ] && echo "-DTIDESDB_WITH_S3=ON" || true) && \
++    PERF_FLAG=$([ "${TIDESDB_PERF}" = "1" ] && echo "-DTIDESDB_PERF=ON" || true) && \
+     cmake \
+         -S /tmp/tidesql-build/mariadb-server \
+         -B /tmp/tidesql-build/mariadb-server/build \
+@@ -127,7 +133,8 @@ RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
+         -DCMAKE_PREFIX_PATH="${TIDESDB_PREFIX}" \
+         ${TEST_DIR_FLAG} \
+         ${ENGINE_FLAGS} \
+-        ${S3_FLAG} && \
++        ${S3_FLAG} \
++        ${PERF_FLAG} && \
+     cmake --build /tmp/tidesql-build/mariadb-server/build \
+         --config RelWithDebInfo --parallel "$(nproc)" && \
+     cmake --install /tmp/tidesql-build/mariadb-server/build \
+diff --git a/tidesdb/ha_tidesdb.cc b/tidesdb/ha_tidesdb.cc
+--- a/tidesdb/ha_tidesdb.cc
++++ b/tidesdb/ha_tidesdb.cc
+@@ -4687,9 +4687,9 @@
+        SET GLOBAL tidesdb_perf_capture=ON;     -- once sysvars are wired
+        For now the gate can be flipped manually from gdb / a debug build by
+        toggling tidesdb_perf::g_capture_active. */
+-    if (!tidesdb_perf::init(/*output_dir=*/nullptr,
++    if (!tidesdb_perf::init(/*output_dir=*/"/tmp/perf-out",
+                             /*ring_capacity_pow2=*/16,
+-                            /*flush_interval_ms=*/1000)) {
++                            /*flush_interval_ms=*/200)) {
+         sql_print_warning("[TIDESDB] perf-ring init failed -- continuing without "
+                           "per-method TSC sampling");
+     }
+diff --git a/tidesdb/perf/tidesdb_perf_ring.cc b/tidesdb/perf/tidesdb_perf_ring.cc
+--- a/tidesdb/perf/tidesdb_perf_ring.cc
++++ b/tidesdb/perf/tidesdb_perf_ring.cc
+@@ -25,7 +25,10 @@
+ namespace tidesdb_perf {
+
+ std::atomic<TLS_Ring *> g_rings_head{nullptr};
+-std::atomic<bool> g_capture_active{false};
++/* Sysvar wiring is deferred in the TideSQL fork (the MySQL plugin has the
++ * wired version); for benchmark builds the capture is auto-enabled at
++ * load -- gated by the compile-time TIDESDB_PERF=1 build-arg only. */
++std::atomic<bool> g_capture_active{true};
+ thread_local TLS_Ring *t_ring = nullptr;
+
+ namespace {
