@@ -100,6 +100,25 @@ RUN git clone --depth=1 --branch ${MYSQL_TAG} \
 #    if a future regression forces it.
 RUN git clone --depth=1 --branch ${TIDESDB_TAG} \
         https://github.com/tidesdb/tidesdb.git tidesdb
+
+# Apply local patches against the engine source. As of v0.4.2 we carry
+# 0001-graduated-active-memtable-backpressure.patch which smooths the
+# 2x write_buffer_size cliff stall into three graduated delay tiers
+# (1.0x/1.3x/1.7x -> 200us/500us/2ms) so the writer slows progressively
+# instead of going from full-speed to a hard stall. Rationale lives in
+# the patch header. The COPY is conditional via shell so an empty
+# patches/tidesdb/ directory just produces a friendly skip log.
+COPY docker/patches/tidesdb/ /build/tidesdb-patches/
+RUN cd /build/tidesdb && \
+    if ls /build/tidesdb-patches/*.patch >/dev/null 2>&1; then \
+        for p in /build/tidesdb-patches/*.patch; do \
+            echo "[patches] applying $p"; \
+            git apply --check "$p" && git apply "$p" || { echo "[patches] FAILED $p"; exit 1; }; \
+        done; \
+    else \
+        echo "[patches] no patches to apply"; \
+    fi
+
 RUN cd tidesdb && \
     cmake -S . -B build-static \
           -DCMAKE_BUILD_TYPE=Release \
