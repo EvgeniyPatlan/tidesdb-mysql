@@ -3653,6 +3653,42 @@ uint comparable_key_length(const KEY *ki)
 }
 
 /*
+  M-6 fix: classify a Field into a codec category so serialize_row /
+  deserialize_row can skip Field::pack/unpack virtual dispatch for the
+  common fixed-width-binary case.
+
+  Conservative whitelist: only types whose Field::pack reduces to a
+  single memcpy(pos, field_ptr, pack_length()) -- no overrides for
+  length prefixes, trailing-space stripping, indirect blob pointers,
+  decimal binary encoding, charset-dependent collation, etc.
+
+  Anything not whitelisted falls back to Field::pack via virtual
+  dispatch (FIELD_CODEC_GENERIC).  Wrong classification = silent data
+  corruption, so when in doubt, return GENERIC.
+*/
+static uint8_t classify_field_codec(const Field *f)
+{
+    switch (f->real_type())
+    {
+        case MYSQL_TYPE_TINY:
+        case MYSQL_TYPE_SHORT:
+        case MYSQL_TYPE_LONG:
+        case MYSQL_TYPE_LONGLONG:
+        case MYSQL_TYPE_INT24:
+        case MYSQL_TYPE_FLOAT:
+        case MYSQL_TYPE_DOUBLE:
+        case MYSQL_TYPE_YEAR:
+        case MYSQL_TYPE_NEWDATE:
+        case MYSQL_TYPE_DATETIME2:
+        case MYSQL_TYPE_TIMESTAMP2:
+        case MYSQL_TYPE_TIME2:
+            return TidesDB_share::FIELD_CODEC_MEMCPY;
+        default:
+            return TidesDB_share::FIELD_CODEC_GENERIC;
+    }
+}
+
+/*
   Build a secondary index CF entry key:
     [comparable index-column bytes] + [comparable PK bytes]
 */
@@ -4215,6 +4251,30 @@ int ha_tidesdb::open(const char *name, int mode, uint test_if_locked,
         }
         share->has_ttl = (share->default_ttl > 0 || share->ttl_field_idx >= 0);
 
+        /* M-6 fix: build the per-table field codec dispatch table.
+           One entry per table field; populated once here so the hot
+           loops in serialize_row / deserialize_row don't pay a
+           Field::pack virtual call on numeric / date columns.
+
+           The offset is computed against table->record[0] of THIS handler
+           instance.  That offset is invariant across all TABLE clones of
+           the share (the field layout is determined by the share, not by
+           which TABLE is "current"), so caching it once is safe even
+           though Field::field_ptr() itself is moved by other TABLE clones
+           via move_field_offset.  Both serialize_row and deserialize_row
+           pass `buf + fc.offset` directly, avoiding the per-row
+           f->field_ptr() - record[0] subtraction. */
+        share->field_codecs.resize(table->s->fields);
+        for (uint i = 0; i < table->s->fields; i++)
+        {
+            Field *f = table->field[i];
+            auto &fc = share->field_codecs[i];
+            fc.offset = (uint32_t)(f->field_ptr() - table->record[0]);
+            fc.pack_length = (uint16_t)f->pack_length();
+            fc.category = classify_field_codec(f);
+            fc.reserved = 0;
+        }
+
         /* We precompute comparable key lengths and index-type flags per index.
            Caching the type flags avoids a ki->algorithm dereference per row
            in write_row's dup-check loop and in update_row/delete_row. */
@@ -4647,16 +4707,27 @@ const std::string &ha_tidesdb::serialize_row(const uchar *buf)
     memcpy(pos, buf, table->s->null_bytes);
     pos += table->s->null_bytes;
 
-    /* Pack each non-null field using Field::pack().
-       -- Fixed-size fields (INT, BIGINT, DATE)     copies pack_length() bytes
-       -- CHAR                                      strips trailing spaces, stores length + data
-       -- VARCHAR                                   stores actual length + data (not padded to max)
-       -- BLOB                                      stores length + blob data inline */
+    /* Pack each non-null field.  M-6 fix: numeric / date columns short-
+       circuit Field::pack via a precomputed dispatch table
+       (FIELD_CODEC_MEMCPY) and become a single memcpy of pack_length
+       bytes -- no vtable hop.  CHAR / VARCHAR / BLOB / DECIMAL / BIT /
+       ENUM / SET still go through Field::pack via the GENERIC fallback. */
+    const auto *fcs = share->field_codecs.data();
     for (uint i = 0; i < table->s->fields; i++)
     {
         Field *f = table->field[i];
         if (f->is_real_null(ptrdiff)) continue;
-        pos = f->pack(pos, buf + (uintptr_t)(f->field_ptr() - table->record[0]), UINT_MAX);
+        const auto &fce = fcs[i];
+        const uchar *src = buf + fce.offset;
+        if (fce.category == TidesDB_share::FIELD_CODEC_MEMCPY)
+        {
+            memcpy(pos, src, fce.pack_length);
+            pos += fce.pack_length;
+        }
+        else
+        {
+            pos = f->pack(pos, src, UINT_MAX);
+        }
     }
 
     row_buf_.resize((size_t)(pos - start));
@@ -4772,12 +4843,21 @@ void ha_tidesdb::deserialize_row(uchar *buf, const uchar *data, size_t len)
     }
 
     my_ptrdiff_t ptrdiff = (my_ptrdiff_t)(buf - table->record[0]);
+    const auto *fcs = share->field_codecs.data();
     for (uint i = 0; i < unpack_count; i++)
     {
         Field *f = table->field[i];
         if (f->is_real_null(ptrdiff)) continue;
         if (from >= from_end) break;
-        uchar *to = buf + (uintptr_t)(f->field_ptr() - table->record[0]);
+        const auto &fce = fcs[i];
+        uchar *to = buf + fce.offset;
+        if (fce.category == TidesDB_share::FIELD_CODEC_MEMCPY)
+        {
+            if ((size_t)(from_end - from) < fce.pack_length) break;
+            memcpy(to, from, fce.pack_length);
+            from += fce.pack_length;
+            continue;
+        }
         /* Field_blob::unpack uses set_ptr() which writes through field->field_ptr()
            (always pointing into record[0]).  When buf != record[0], we must
            shift the field pointer so set_ptr writes into the correct record. */

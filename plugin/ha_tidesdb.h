@@ -429,6 +429,25 @@ class TidesDB_share : public Handler_share
        scanning all fields for the BLOB_FLAG. */
     std::vector<uint16> blob_field_indices;
 
+    /* M-6 fix: per-table dispatch table that lets serialize_row /
+       deserialize_row skip the Field::pack / Field::unpack virtual call
+       for the common case where pack reduces to memcpy(pos, src,
+       pack_length).  Populated once at open() by classify_field_codec();
+       reset on schema changes.  For TPC-C-shaped tables (~10 columns of
+       INT / BIGINT / DECIMAL / DATETIME), MEMCPY-category fields dominate
+       and the dispatch shaves a vtable hop per field per row. */
+    enum FieldCodecCategory : uint8_t {
+        FIELD_CODEC_MEMCPY = 0,  /* pack = memcpy(pos, src, pack_length); unpack = inverse */
+        FIELD_CODEC_GENERIC = 1, /* fall back to Field::pack/unpack (virtual dispatch) */
+    };
+    struct FieldCodecEntry {
+        uint32_t offset;       /* field_ptr() - record[0]  (constant for table lifetime) */
+        uint16_t pack_length;  /* cached Field::pack_length() */
+        uint8_t category;      /* FieldCodecCategory */
+        uint8_t reserved;
+    };
+    std::vector<FieldCodecEntry> field_codecs;
+
     /* Cached scan_time range cost (refreshed every TIDESDB_STATS_REFRESH_US) */
     std::atomic<double> cached_scan_cost{0.0};
     std::atomic<long long> scan_cost_time{0};
