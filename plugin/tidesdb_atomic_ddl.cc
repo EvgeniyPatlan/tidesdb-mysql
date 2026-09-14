@@ -350,6 +350,21 @@ ReconcileDelta DdSyncReconciler::compute_delta() {
     std::set<std::string> actual;
 
     if (dc_) {
+        /* Every object handed back by fetch_* is registered for auto-delete
+           against the client's *current* releaser. Dictionary_client asserts
+           that this is not the default one -- "we must require a top level
+           non-default releaser to ensure a predictable life span of the
+           objects" (sql/dd/cache/dictionary_client.h) -- and without one a
+           Debug server aborts here on signal 6 the moment the sweep runs.
+           On a Release server the assert is compiled out and the objects
+           instead accumulate against the default releaser, which lives as
+           long as the client does.
+
+           Scope one releaser around both fetch loops so the schemas and
+           tables enumerated below are released when compute_delta returns.
+           The same idiom InnoDB uses in clone0api.cc. */
+        dd::cache::Dictionary_client::Auto_releaser releaser(dc_);
+
         /* fetch_global_components<Schema> + fetch_schema_components<Table>
            is the canonical idiom used elsewhere in 9.7 (e.g.
            sql/events.cc:1170-1180 for cross-schema event enumeration). */
