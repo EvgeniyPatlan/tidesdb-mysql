@@ -48,36 +48,35 @@ extern "C"
    TidesDB_share::cached_opts. */
 struct ha_table_option_struct
 {
-    ulonglong write_buffer_size;
-    ulonglong min_disk_space;
-    ulonglong klog_value_threshold;
-    ulonglong sync_interval_us;
-    ulonglong index_sample_ratio;
-    ulonglong block_index_prefix_len;
+    /* Per-column-family in TidesDB 10. */
     ulonglong level_size_ratio;
     ulonglong min_levels;
     ulonglong dividing_level_offset;
-    ulonglong skip_list_max_level;
-    ulonglong skip_list_probability; /* percentage      -- 25 = 0.25 */
     ulonglong bloom_fpr;             /* parts per 10000 -- 100 = 1% */
     ulonglong l1_file_count_trigger;
-    ulonglong l0_queue_stall_threshold;
-    uint compression;
-    uint sync_mode;
     uint isolation_level;
     bool bloom_filter;
-    bool block_indexes;
-    bool use_btree;
-    bool object_lazy_compaction;     /* double L1 file count trigger in object store mode */
-    bool object_prefetch_compaction; /* prefetch input SSTables before compaction merge */
-    ulonglong ttl;                   /* default TTL in seconds (0 = no expiration) */
-    bool encrypted;                  /* ENCRYPTED=YES enables data-at-rest encryption */
-    ulonglong encryption_key_id;     /* ENCRYPTION_KEY_ID (default 1) */
     /* Tombstone-density compaction trigger. Stored as parts-per-10000
        (e.g. 5000 = 0.50 ratio) so the option list can use integer
        storage; converted to a double at build_cf_config time. */
     ulonglong tombstone_density_trigger;
     ulonglong tombstone_density_min_entries;
+
+    /* Compression selects the column family's encoding pipeline; the
+       compression enumerators are the pipeline's ids. */
+    uint compression;
+
+    /* Opt the family out of database-wide value separation entirely.
+       Replaces the per-table klog_value_threshold, which became the
+       database-level tidesdb_value_separation_threshold -- a family now
+       either follows that threshold or keeps every value inline. */
+    bool keep_values_inline;
+
+    /* Handled by the plugin, not the engine, and so unaffected by the
+       engine's own option churn. */
+    ulonglong ttl;                   /* default TTL in seconds (0 = no expiration) */
+    bool encrypted;                  /* ENCRYPTED=YES enables data-at-rest encryption */
+    ulonglong encryption_key_id;     /* ENCRYPTION_KEY_ID (default 1) */
 };
 
 struct ha_field_option_struct

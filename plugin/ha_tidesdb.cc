@@ -1648,14 +1648,12 @@ static bool tidesdb_engine_attribute_to_options(LEX_CSTRING attr,
         else if (!strcasecmp(s, "LZ4_FAST")) opts->compression = 4;
     }
 
-    get_bool("bloom_filter",      opts->bloom_filter);
-    get_bool("block_indexes",     opts->block_indexes);
-    get_bool("encrypted",         opts->encrypted);
-    get_uint("write_buffer_size", opts->write_buffer_size);
-    get_uint("ttl",               opts->ttl);
-    get_uint("encryption_key_id", opts->encryption_key_id);
-    get_uint("min_disk_space",    opts->min_disk_space);
-    get_uint("bloom_fpr",         opts->bloom_fpr);
+    get_bool("bloom_filter",        opts->bloom_filter);
+    get_bool("keep_values_inline",  opts->keep_values_inline);
+    get_bool("encrypted",           opts->encrypted);
+    get_uint("ttl",                 opts->ttl);
+    get_uint("encryption_key_id",   opts->encryption_key_id);
+    get_uint("bloom_fpr",           opts->bloom_fpr);
 
     return true;
 }
@@ -1669,31 +1667,18 @@ static bool tidesdb_engine_attribute_to_options(LEX_CSTRING attr,
  * value in that case, which is what tidesdb_opts_for_table needs when
  * called from a background thread that has no THD attached. */
 static void tidesdb_seed_opts_from_session(THD *thd, ha_table_option_struct *opts) {
-    opts->write_buffer_size       = THDVAR(thd, default_write_buffer_size);
-    opts->min_disk_space          = THDVAR(thd, default_min_disk_space);
-    opts->klog_value_threshold    = THDVAR(thd, default_klog_value_threshold);
-    opts->sync_interval_us        = THDVAR(thd, default_sync_interval_us);
-    opts->index_sample_ratio      = THDVAR(thd, default_index_sample_ratio);
-    opts->block_index_prefix_len  = THDVAR(thd, default_block_index_prefix_len);
     opts->level_size_ratio        = THDVAR(thd, default_level_size_ratio);
     opts->min_levels              = THDVAR(thd, default_min_levels);
     opts->dividing_level_offset   = THDVAR(thd, default_dividing_level_offset);
-    opts->skip_list_max_level     = THDVAR(thd, default_skip_list_max_level);
-    opts->skip_list_probability   = THDVAR(thd, default_skip_list_probability);
     opts->bloom_fpr               = THDVAR(thd, default_bloom_fpr);
     opts->l1_file_count_trigger   = THDVAR(thd, default_l1_file_count_trigger);
-    opts->l0_queue_stall_threshold= THDVAR(thd, default_l0_queue_stall_threshold);
     opts->compression             = THDVAR(thd, default_compression);
-    opts->sync_mode               = THDVAR(thd, default_sync_mode);
     opts->isolation_level         = THDVAR(thd, default_isolation_level);
     opts->bloom_filter            = THDVAR(thd, default_bloom_filter);
-    opts->block_indexes           = THDVAR(thd, default_block_indexes);
-    opts->use_btree               = THDVAR(thd, default_use_btree);
-    opts->object_lazy_compaction  = THDVAR(thd, default_object_lazy_compaction);
-    opts->object_prefetch_compaction = THDVAR(thd, default_object_prefetch_compaction);
     opts->tombstone_density_trigger      = THDVAR(thd, default_tombstone_density_trigger);
     opts->tombstone_density_min_entries  = THDVAR(thd, default_tombstone_density_min_entries);
     /* Per-table opt-in keys with no session default. */
+    opts->keep_values_inline = false;
     opts->ttl                = 0;
     opts->encrypted          = false;
     opts->encryption_key_id  = 1;
@@ -1877,32 +1862,43 @@ tidesdb_column_family_config_t build_cf_config(const ha_table_option_struct *opt
     tidesdb_column_family_config_t cfg = tidesdb_default_column_family_config();
     if (!opts) return cfg;
 
-    cfg.write_buffer_size = (size_t)opts->write_buffer_size;
-    cfg.compression_algorithm = (compression_algorithm)tdb_compression_map[opts->compression];
-    cfg.enable_bloom_filter = opts->bloom_filter ? 1 : 0;
-    cfg.bloom_fpr = (double)opts->bloom_fpr / TIDESDB_BLOOM_FPR_DIVISOR;
-    cfg.enable_block_indexes = opts->block_indexes ? 1 : 0;
-    cfg.index_sample_ratio = (int)opts->index_sample_ratio;
-    cfg.block_index_prefix_len = (int)opts->block_index_prefix_len;
-    cfg.sync_mode = tdb_sync_mode_map[opts->sync_mode];
-    cfg.sync_interval_us = (uint64_t)opts->sync_interval_us;
-    cfg.klog_value_threshold = (size_t)opts->klog_value_threshold;
-    cfg.min_disk_space = (size_t)opts->min_disk_space;
-    cfg.default_isolation_level =
-        (tidesdb_isolation_level_t)tdb_isolation_map[opts->isolation_level];
-    cfg.level_size_ratio = (int)opts->level_size_ratio;
+    /* Still per-column-family in TidesDB 10. */
+    cfg.level_size_ratio = (size_t)opts->level_size_ratio;
     cfg.min_levels = (int)opts->min_levels;
     cfg.dividing_level_offset = (int)opts->dividing_level_offset;
-    cfg.skip_list_max_level = (int)opts->skip_list_max_level;
-    cfg.skip_list_probability = (float)opts->skip_list_probability / TIDESDB_SKIP_LIST_PROB_DIV;
+    cfg.enable_bloom_filter = opts->bloom_filter ? 1 : 0;
+    cfg.bloom_fpr = (double)opts->bloom_fpr / TIDESDB_BLOOM_FPR_DIVISOR;
+    cfg.default_isolation_level =
+        (tidesdb_isolation_level_t)tdb_isolation_map[opts->isolation_level];
     cfg.l1_file_count_trigger = (int)opts->l1_file_count_trigger;
-    cfg.l0_queue_stall_threshold = (int)opts->l0_queue_stall_threshold;
-    cfg.use_btree = opts->use_btree ? 1 : 0;
-    cfg.object_lazy_compaction = opts->object_lazy_compaction ? 1 : 0;
-    cfg.object_prefetch_compaction = opts->object_prefetch_compaction ? 1 : 0;
     cfg.tombstone_density_trigger =
         (double)opts->tombstone_density_trigger / TIDESDB_TOMBSTONE_DENSITY_DIVISOR;
     cfg.tombstone_density_min_entries = (uint64_t)opts->tombstone_density_min_entries;
+
+    /* Compression is an encoding pipeline now rather than a single field. The
+       pipeline is an ordered list of encodings applied to btree klog nodes and
+       undone in reverse on read, and the compression enumerators double as its
+       ids. One compression encoding is the whole pipeline here; NONE means an
+       empty one, not an entry that encodes nothing. */
+    const tidesdb_compression_algorithm_t algo =
+        (tidesdb_compression_algorithm_t)tdb_compression_map[opts->compression];
+    if (algo == TDB_COMPRESS_NONE)
+    {
+        cfg.encoding_count = 0;
+    }
+    else
+    {
+        cfg.encoding_pipeline[0] = (uint8_t)algo;
+        cfg.encoding_count = 1;
+    }
+
+    /* Value separation is database-wide in v10: the threshold lives on
+       tidesdb_config_t and a column family opts out of it wholesale rather
+       than carrying a threshold of its own. A family scanned far more often
+       than it is merged can be worth keeping whole even with large values,
+       which is what this selects. */
+    cfg.keep_values_inline = opts->keep_values_inline ? 1 : 0;
+
     return cfg;
 }
 
@@ -3123,9 +3119,19 @@ static int tidesdb_init_func(void *p)
             g_engine_ctx.path = ".tidesdb";
     }
 
-    /* We map log level enum index to TidesDB constants */
-    static const int log_level_map[] = {TDB_LOG_DEBUG, TDB_LOG_INFO,  TDB_LOG_WARN,
-                                        TDB_LOG_ERROR, TDB_LOG_FATAL, TDB_LOG_NONE};
+    /* Map the sysvar's enum index onto TidesDB's levels.
+
+       v10 dropped TDB_LOG_DEBUG and TDB_LOG_FATAL; its scale is NONE, TRACE,
+       INFO, WARN, ERROR. The sysvar keeps its existing names so an operator's
+       my.cnf and any tooling reading the value still work, and the two
+       retired names fold onto their nearest surviving level: 'debug' selects
+       TRACE, which is the level v10 documents for "highly detailed messages
+       for technical debugging", and 'fatal' selects ERROR, the most severe
+       level that still exists. Folding rather than rejecting keeps an
+       existing configuration starting; the alternative refuses to boot over a
+       log level. */
+    static const int log_level_map[] = {TDB_LOG_TRACE, TDB_LOG_INFO,  TDB_LOG_WARN,
+                                        TDB_LOG_ERROR, TDB_LOG_ERROR, TDB_LOG_NONE};
 
     tidesdb_config_t cfg = tidesdb_default_config();
     cfg.db_path = const_cast<char *>(g_engine_ctx.path.c_str());
@@ -3136,13 +3142,18 @@ static int tidesdb_init_func(void *p)
     cfg.max_open_sstables = (int)srv_max_open_sstables;
     cfg.log_to_file = srv_log_to_file ? 1 : 0;
     cfg.log_truncation_at = (size_t)srv_log_truncation_at;
-    cfg.max_memory_usage = (size_t)srv_max_memory_usage;
-    cfg.unified_memtable = srv_unified_memtable ? 1 : 0;
-    cfg.unified_memtable_write_buffer_size = (size_t)srv_unified_memtable_write_buffer_size;
-    cfg.unified_memtable_sync_mode = tdb_sync_mode_map[srv_unified_memtable_sync_mode];
-    cfg.unified_memtable_sync_interval_us = (uint64_t)srv_unified_memtable_sync_interval;
-    cfg.unified_memtable_skip_list_max_level = 0;      /* 0 = library default */
-    cfg.unified_memtable_skip_list_probability = 0.0f; /* 0 = library default */
+    /* The memtable is permanently unified in v10, so these lost the
+       "unified_" qualifier and tidesdb_config_t::unified_memtable itself is
+       gone -- there is nothing left to switch off. max_memory_usage is gone
+       too; the engine derives its own ceiling.
+
+       Value separation and the vlog segment size are database-wide settings
+       v10 introduced, replacing the per-table klog_value_threshold. */
+    cfg.memtable_write_buffer_size = (size_t)srv_unified_memtable_write_buffer_size;
+    cfg.memtable_sync_mode = tdb_sync_mode_map[srv_unified_memtable_sync_mode];
+    cfg.memtable_sync_interval_us = (uint64_t)srv_unified_memtable_sync_interval;
+    cfg.memtable_skip_list_max_level = 0;      /* 0 = library default */
+    cfg.memtable_skip_list_probability = 0.0f; /* 0 = library default */
 
     /* Object store connector setup */
     tidesdb_objstore_t *objstore_connector = NULL;
@@ -4609,9 +4620,9 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
         std::string idx_cf = cf_name + CF_INDEX_INFIX + table_arg->key_info[i].name;
         if (!tidesdb_get_column_family(tdb_get_engine(), idx_cf.c_str()))
         {
+            /* No per-index USE_BTREE override in v10: a key log is always a
+               btree, and that btree is the index. Nothing left to select. */
             tidesdb_column_family_config_t idx_cfg = cfg;
-            ha_index_option_struct *iopts = TDB_INDEX_OPTIONS(&table_arg->key_info[i]);
-            if (iopts) idx_cfg.use_btree = iopts->use_btree ? 1 : 0;
 
             int rc = tidesdb_create_column_family(tdb_get_engine(), idx_cf.c_str(), &idx_cfg);
             if (rc != TDB_SUCCESS)
@@ -7140,12 +7151,8 @@ int ha_tidesdb::delete_all_rows(void)
         const std::string &idx_name = share->idx_cf_names[i];
         tidesdb_drop_column_family(tdb_get_engine(), idx_name.c_str());
 
+        /* No per-index USE_BTREE override in v10 -- see create(). */
         tidesdb_column_family_config_t idx_cfg = cfg;
-        if (i < table->s->keys && TDB_INDEX_OPTIONS(&table->key_info[i]))
-        {
-            ha_index_option_struct *iopts = TDB_INDEX_OPTIONS(&table->key_info[i]);
-            idx_cfg.use_btree = iopts->use_btree ? 1 : 0;
-        }
 
         int rc = tidesdb_create_column_family(tdb_get_engine(), idx_name.c_str(), &idx_cfg);
         if (rc != TDB_SUCCESS)

@@ -133,8 +133,11 @@ bool SdiStore::init() {
     /* Fixed-size char[TDB_MAX_CF_NAME_LEN] -- copy with a guaranteed NUL. */
     strncpy(cfg.name, kSdiCfName, sizeof(cfg.name) - 1);
     cfg.name[sizeof(cfg.name) - 1] = '\0';
-    cfg.write_buffer_size = 16 * 1024 * 1024; /* 16 MiB; metadata CF is small */
-    cfg.compression_algorithm = TDB_COMPRESS_LZ4;
+    /* The write buffer is database-wide in v10, so a metadata family can no
+       longer ask for a smaller one of its own; it shares the server's.
+       Compression is an encoding pipeline, and LZ4's enumerator is its id. */
+    cfg.encoding_pipeline[0] = (uint8_t)TDB_COMPRESS_LZ4;
+    cfg.encoding_count = 1;
 
     int rc = tidesdb_create_column_family(engine_, cfg.name, &cfg);
     if (rc != TDB_SUCCESS && rc != TDB_ERR_EXISTS) {

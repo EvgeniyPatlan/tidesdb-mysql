@@ -202,9 +202,10 @@ bool ha_tidesdb::prepare_inplace_alter_table(
             /* We drop stale CF if it exists from a previous failed ALTER */
             tidesdb_drop_column_family(tdb_get_engine(), idx_cf.c_str());
 
+            /* The per-index USE_BTREE override is gone: in v10 a key log is
+               always a btree and the btree per key log *is* the index, so
+               there is no alternative layout left to select. */
             tidesdb_column_family_config_t idx_cfg = cfg;
-            ha_index_option_struct *iopts = TDB_INDEX_OPTIONS(new_key);
-            if (iopts) idx_cfg.use_btree = iopts->use_btree ? 1 : 0;
 
             int rc = tidesdb_create_column_family(tdb_get_engine(), idx_cf.c_str(), &idx_cfg);
             if (rc != TDB_SUCCESS)
@@ -803,7 +804,7 @@ bool ha_tidesdb::commit_inplace_alter_table(
         /* Main data CF */
         if (share->cf)
         {
-            int rc = tidesdb_cf_update_runtime_config(share->cf, &cfg, 1);
+            int rc = tidesdb_cf_update_runtime_config(tdb_get_engine(), share->cf, &cfg, 1);
             if (rc != TDB_SUCCESS)
                 sql_print_information(
                     "[TIDESDB] ALTER: failed to update runtime config for "
@@ -816,14 +817,11 @@ bool ha_tidesdb::commit_inplace_alter_table(
         {
             if (share->idx_cfs[i])
             {
+                /* No per-index USE_BTREE override in v10 -- see above. */
                 tidesdb_column_family_config_t idx_cfg = cfg;
-                if (i < altered_table->s->keys && TDB_INDEX_OPTIONS(&altered_table->key_info[i]))
-                {
-                    ha_index_option_struct *iopts = TDB_INDEX_OPTIONS(&altered_table->key_info[i]);
-                    idx_cfg.use_btree = iopts->use_btree ? 1 : 0;
-                }
 
-                int rc = tidesdb_cf_update_runtime_config(share->idx_cfs[i], &idx_cfg, 1);
+                int rc = tidesdb_cf_update_runtime_config(tdb_get_engine(), share->idx_cfs[i],
+                                                          &idx_cfg, 1);
                 if (rc != TDB_SUCCESS)
                     sql_print_information(
                         "[TIDESDB] ALTER: failed to update runtime config for "
