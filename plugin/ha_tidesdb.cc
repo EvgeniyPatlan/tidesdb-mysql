@@ -9298,36 +9298,53 @@ static long long srv_stat_cache_partitions;
 #define TIDESQL_VERSION_HEX 0x40400
 
 static const char *srv_stat_version = TIDESQL_VERSION_STR;
+/* Compile-time, never refreshed: 1 when the plugin was built with
+   -DTIDESDB_PERF=1, 0 otherwise. The four tidesdb_perf_* sysvars are
+   registered in both builds (they are inert without the instrumentation),
+   so their presence cannot tell an operator -- or a test -- which binary
+   this is. The perf MTR tests guard on this the way the atomic-DDL tests
+   guard on have_debug.inc, instead of failing on a default build. */
+static long long srv_stat_perf_compiled = TIDESDB_PERF;
 static long long srv_stat_version_hex = TIDESQL_VERSION_HEX;
 
+/* Every entry carries SHOW_SCOPE_GLOBAL explicitly. MySQL's SHOW_VAR has a
+   fourth member MariaDB's does not:
+
+     struct SHOW_VAR { name; value; type; enum_mysql_show_scope scope; };
+
+   and SHOW_SCOPE_UNDEF is 0, so a three-field initializer carried over from
+   the MariaDB source leaves every variable at UNDEF -- which the server
+   filters out of SHOW STATUS and performance_schema.global_status alike.
+   The whole array was invisible: not one tidesdb_* status variable was
+   reachable, tidesdb_version included. */
 static SHOW_VAR tidesdb_status_variables[] = {
-    {"tidesdb_version", (char *)&srv_stat_version, SHOW_CHAR_PTR},
-    {"tidesdb_version_hex", (char *)&srv_stat_version_hex, SHOW_LONGLONG},
-    {"tidesdb_column_families", (char *)&srv_stat_column_families, SHOW_LONGLONG},
-    {"tidesdb_global_sequence", (char *)&srv_stat_global_seq, SHOW_LONGLONG},
-    {"tidesdb_memtable_bytes", (char *)&srv_stat_memtable_bytes, SHOW_LONGLONG},
-    {"tidesdb_txn_memory_bytes", (char *)&srv_stat_txn_memory_bytes, SHOW_LONGLONG},
-    {"tidesdb_memory_limit", (char *)&srv_stat_memory_limit, SHOW_LONGLONG},
-    {"tidesdb_memory_pressure", (char *)&srv_stat_memory_pressure, SHOW_LONGLONG},
-    {"tidesdb_total_sstables", (char *)&srv_stat_total_sstables, SHOW_LONGLONG},
-    {"tidesdb_open_sstables", (char *)&srv_stat_open_sstables, SHOW_LONGLONG},
-    {"tidesdb_data_size_bytes", (char *)&srv_stat_data_size_bytes, SHOW_LONGLONG},
-    {"tidesdb_immutable_memtables", (char *)&srv_stat_immutable_memtables, SHOW_LONGLONG},
-    {"tidesdb_flush_pending", (char *)&srv_stat_flush_pending, SHOW_LONGLONG},
-    {"tidesdb_flush_queue", (char *)&srv_stat_flush_queue, SHOW_LONGLONG},
-    {"tidesdb_compaction_queue", (char *)&srv_stat_compaction_queue, SHOW_LONGLONG},
-    {"tidesdb_cache_entries", (char *)&srv_stat_cache_entries, SHOW_LONGLONG},
-    {"tidesdb_cache_bytes", (char *)&srv_stat_cache_bytes, SHOW_LONGLONG},
-    {"tidesdb_cache_hits", (char *)&srv_stat_cache_hits, SHOW_LONGLONG},
-    {"tidesdb_cache_misses", (char *)&srv_stat_cache_misses, SHOW_LONGLONG},
-    {"tidesdb_cache_hit_rate", (char *)&srv_stat_cache_hit_rate, SHOW_DOUBLE},
-    {"tidesdb_cache_partitions", (char *)&srv_stat_cache_partitions, SHOW_LONGLONG},
-    {"tidesdb_total_tombstones", (char *)&srv_stat_total_tombstones, SHOW_LONGLONG},
-    {"tidesdb_tombstone_ratio", (char *)&srv_stat_tombstone_ratio, SHOW_DOUBLE},
-    {"tidesdb_max_sst_tombstone_density", (char *)&srv_stat_max_sst_density, SHOW_DOUBLE},
-    {"tidesdb_max_sst_tombstone_density_level", (char *)&srv_stat_max_sst_density_level,
-     SHOW_LONGLONG},
-    {NullS, NullS, SHOW_LONG}};
+    {"tidesdb_version", (char *)&srv_stat_version, SHOW_CHAR_PTR, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_version_hex", (char *)&srv_stat_version_hex, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_perf_compiled", (char *)&srv_stat_perf_compiled, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_column_families", (char *)&srv_stat_column_families, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_global_sequence", (char *)&srv_stat_global_seq, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_memtable_bytes", (char *)&srv_stat_memtable_bytes, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_txn_memory_bytes", (char *)&srv_stat_txn_memory_bytes, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_memory_limit", (char *)&srv_stat_memory_limit, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_memory_pressure", (char *)&srv_stat_memory_pressure, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_total_sstables", (char *)&srv_stat_total_sstables, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_open_sstables", (char *)&srv_stat_open_sstables, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_data_size_bytes", (char *)&srv_stat_data_size_bytes, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_immutable_memtables", (char *)&srv_stat_immutable_memtables, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_flush_pending", (char *)&srv_stat_flush_pending, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_flush_queue", (char *)&srv_stat_flush_queue, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_compaction_queue", (char *)&srv_stat_compaction_queue, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_cache_entries", (char *)&srv_stat_cache_entries, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_cache_bytes", (char *)&srv_stat_cache_bytes, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_cache_hits", (char *)&srv_stat_cache_hits, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_cache_misses", (char *)&srv_stat_cache_misses, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_cache_hit_rate", (char *)&srv_stat_cache_hit_rate, SHOW_DOUBLE, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_cache_partitions", (char *)&srv_stat_cache_partitions, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_total_tombstones", (char *)&srv_stat_total_tombstones, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_tombstone_ratio", (char *)&srv_stat_tombstone_ratio, SHOW_DOUBLE, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_max_sst_tombstone_density", (char *)&srv_stat_max_sst_density, SHOW_DOUBLE, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_max_sst_tombstone_density_level", (char *)&srv_stat_max_sst_density_level, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {NullS, NullS, SHOW_LONG, SHOW_SCOPE_GLOBAL}};
 
 /* We refresh status variable values from the library.
    Called from tidesdb_show_status (SHOW ENGINE STATUS) and periodically. */

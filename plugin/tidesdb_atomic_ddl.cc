@@ -26,6 +26,8 @@
 #include <cstring>
 #include <ctime>
 #include <set>
+#include <utility>
+#include <vector>
 #include <string>
 
 /* my_rapidjson_size_t.h MUST precede any rapidjson header so the typedef of
@@ -635,13 +637,25 @@ uint32_t compute_options_checksum(const dd::Table &t) {
   code paths never touch this pointer (it's only read inside the DBUG
   hook in tidesdb_show_status).
 
-  The DD object the server passes into ha_tidesdb::create lives for the
-  duration of the DDL transaction, so this pointer is only safe to read
-  inside the same SQL statement (or the very next SHOW ENGINE STATUS in
-  the same connection). The MTR test follows that ordering: arm keyword,
-  then SHOW ENGINE STATUS in the same session right after CREATE.
+  Snapshot of the se_private_data the most recent prepare_create wrote,
+  held as owned strings.
+
+  This was a `const dd::Table *` aimed at the object the server hands to
+  ha_tidesdb::create, on the stated assumption that it stayed valid
+  "inside the same SQL statement (or the very next SHOW ENGINE STATUS in
+  the same connection)". It does not. The DD releases that object when
+  the CREATE statement's transaction ends, so by the following statement
+  the pointer dangles -- and the dump below then called a virtual on a
+  freed object, killing the server with SIGSEGV (invalid permissions for
+  mapped object) through a stale vtable. That is precisely the ordering
+  tidesdb_ddl_atomic_create_commit uses, so the documented-safe sequence
+  was the crashing one.
+
+  Copying the key/value pairs out at write time removes the lifetime
+  question rather than narrowing it.
 */
-const dd::Table *g_last_created_table = nullptr;
+bool g_last_create_seen = false;
+std::vector<std::pair<std::string, std::string>> g_last_se_private_data;
 #endif
 
 }  /* anonymous namespace */
@@ -701,7 +715,14 @@ bool TidesdbAtomicDdlBridge::prepare_create(THD * /*thd*/, dd::Table *new_table_
     DBUG_EXECUTE_IF("tidesdb_fail_after_se_private_data", { return false; });
 
 #ifndef NDEBUG
-    g_last_created_table = new_table_def;
+    g_last_create_seen = true;
+    g_last_se_private_data.clear();
+    {
+        const dd::Properties &snap = new_table_def->se_private_data();
+        for (auto it = snap.begin(); it != snap.end(); ++it) {
+            g_last_se_private_data.emplace_back(it->first.c_str(), it->second.c_str());
+        }
+    }
 #endif
     return true;
 }
@@ -883,16 +904,14 @@ bool TidesdbAtomicDdlBridge::validate_open(THD *thd, const dd::Table *table_def,
   log isn't mistaken for "wiring works but Properties were empty").
 */
 bool TidesdbAtomicDdlBridge::debug_dump_last_se_private_data() {
-    if (!g_last_created_table) {
+    if (!g_last_create_seen) {
         sql_print_information("[TIDESDB] se_private_data dump: no table created yet");
         return false;
     }
-    const dd::Properties &p = g_last_created_table->se_private_data();
     bool emitted = false;
-    for (auto it = p.begin(); it != p.end(); ++it) {
-        /* dd::Properties iterators yield std::pair<const String_type, String_type>. */
+    for (const auto &kv : g_last_se_private_data) {
         sql_print_information("[TIDESDB] se_private_data key=%s val=%s",
-                              it->first.c_str(), it->second.c_str());
+                              kv.first.c_str(), kv.second.c_str());
         emitted = true;
     }
     if (!emitted) {
