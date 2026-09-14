@@ -8,7 +8,19 @@
 # destructive operator path is wired through the sysvar.
 #
 
-SET @save_log_error_verbosity = @@global.log_error_verbosity;
+# log_error_verbosity is saved into a mysqltest variable, not a SQL user
+# variable. This test restarts the server, and @user_variables do not
+# survive the reconnect -- the restore then ran
+# SET GLOBAL log_error_verbosity = NULL and failed with
+# ER_WRONG_TYPE_FOR_VAR. mysqltest variables live in the client, so they
+# cross a restart intact.
+--let $save_log_error_verbosity = `SELECT @@global.log_error_verbosity`
+# tidesdb_orphan_action must be restored too. This is the only test that
+# leaves it on a non-default value, and MTR's check-testcase phase compares
+# global variables before and after every test -- leaking 'drop' failed the
+# check even when the test body succeeded, and changed how sibling tests
+# behaved when they ran after it.
+--let $save_orphan_action = `SELECT @@global.tidesdb_orphan_action`
 SET GLOBAL log_error_verbosity = 3;
 SET GLOBAL tidesdb_orphan_action = 'drop';
 
@@ -34,6 +46,7 @@ SET @@global.DEBUG = '';
 let $log_file = $MYSQLTEST_VARDIR/log/mysqld.1.err;
 --exec grep -c "dropped orphan CF 'test_orphan_cf_inj'" $log_file
 
-SET GLOBAL log_error_verbosity = @save_log_error_verbosity;
+--eval SET GLOBAL log_error_verbosity = $save_log_error_verbosity
+--eval SET GLOBAL tidesdb_orphan_action = '$save_orphan_action'
 --source suite/tidesdb/include/cleanup_tidesdb.inc
 --echo # Done.

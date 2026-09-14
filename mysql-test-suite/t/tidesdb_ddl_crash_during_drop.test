@@ -12,7 +12,13 @@
 # CFs still present). Either surfaces in the error log.
 #
 
-SET @save_log_error_verbosity = @@global.log_error_verbosity;
+# log_error_verbosity is saved into a mysqltest variable, not a SQL user
+# variable. This test restarts the server, and @user_variables do not
+# survive the reconnect -- the restore then ran
+# SET GLOBAL log_error_verbosity = NULL and failed with
+# ER_WRONG_TYPE_FOR_VAR. mysqltest variables live in the client, so they
+# cross a restart intact.
+--let $save_log_error_verbosity = `SELECT @@global.log_error_verbosity`
 SET GLOBAL log_error_verbosity = 3;
 SET GLOBAL tidesdb_orphan_action = 'quarantine';
 
@@ -52,6 +58,6 @@ let $log_file = $MYSQLTEST_VARDIR/log/mysqld.1.err;
 DROP TABLE IF EXISTS tdb_ddl_t;
 --enable_warnings
 
-SET GLOBAL log_error_verbosity = @save_log_error_verbosity;
+--eval SET GLOBAL log_error_verbosity = $save_log_error_verbosity
 --source suite/tidesdb/include/cleanup_tidesdb.inc
 --echo # Done.
