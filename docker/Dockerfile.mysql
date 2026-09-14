@@ -57,7 +57,7 @@ FROM oraclelinux:9 AS builder
 # Pin sources for reproducibility; bump when the engine is known-compatible.
 ARG MYSQL_VERSION
 ARG MYSQL_TAG=mysql-${MYSQL_VERSION}
-ARG TIDESDB_TAG=v9.3.2
+ARG TIDESDB_TAG=v10.0.1
 
 # v0.4.1: build the plugin with -DTIDESDB_PERF=1 to compile in the
 # layer-by-layer perf instrumentation. Default OFF; pass --build-arg
@@ -95,7 +95,7 @@ RUN git clone --depth=1 --branch ${MYSQL_TAG} \
 
 # 2) Clone TidesDB and build the static archive (PIC so it can link into a .so).
 #
-#    We ship the engine source UNPATCHED as of v9.3.2 -- every fix we used to
+#    We ship the engine source UNPATCHED as of v10.0.1 -- every fix we used to
 #    carry is now upstream:
 #      * 0001-walfix.patch (four durability bugs we carried against v9.2.0:
 #        inverted convert_sync_mode, raw sync_mode at WAL opens, unconditional

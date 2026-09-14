@@ -21,7 +21,7 @@ cd "$REPO"
 
 # Pin versions for reproducibility. Bump when known-compatible.
 MYSQL_TAG="${MYSQL_TAG:-mysql-9.7.0}"
-TIDESDB_TAG="${TIDESDB_TAG:-v9.3.2}"
+TIDESDB_TAG="${TIDESDB_TAG:-v10.0.1}"
 # Where that tag is cloned to. Overridable so a second engine version can sit
 # beside the pinned one without disturbing it; pair it with TIDESDB_PREFIX_DIR
 # when running scripts/build-tidesdb.sh.
