@@ -22,6 +22,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cctype>
 #include <cstring>
 #include <ctime>
 #include <set>
@@ -75,6 +76,32 @@ bool g_atomic_ddl_strict = true;
   literal here so this TU does not have to pull the whole plugin header in.
 */
 static constexpr time_t kSdiTtlNone = static_cast<time_t>(-1);
+
+/*
+  The data dictionary stores a table's engine name exactly as the plugin
+  registered it -- mysql_declare_plugin spells this engine "TidesDB"
+  (ha_tidesdb.cc) -- while the rest of the plugin spells it "TIDESDB"
+  (TIDESDB_ENGINE_NAME). SQL treats engine names case-insensitively and
+  CREATE TABLE ... ENGINE=tidesdb is equally legal, so the reconciler must
+  not compare against a single literal spelling.
+
+  Comparing against "TIDESDB" alone left `expected` permanently empty: no
+  dd::Table ever matched, so compute_delta reported every real CF as an
+  orphan and never reported a genuinely orphaned dd::Table. That is the
+  behaviour ha_tidesdb.cc's init-time sweep comment records as
+  "mis-classify legitimate user tables as orphan CFs and quarantine them"
+  and attributes to DD warm-up; it is neither timing-dependent nor
+  recoverable by waiting.
+*/
+static bool dd_engine_is_tidesdb(const dd::String_type &engine) {
+    static constexpr char kName[] = "TIDESDB";
+    constexpr size_t kLen = sizeof(kName) - 1;
+    if (engine.length() != kLen) return false;
+    for (size_t i = 0; i < kLen; i++) {
+        if (std::toupper(static_cast<unsigned char>(engine[i])) != kName[i]) return false;
+    }
+    return true;
+}
 
 /* -------------------- SdiStore -------------------- */
 
@@ -386,7 +413,7 @@ ReconcileDelta DdSyncReconciler::compute_delta() {
                 }
                 for (const dd::Table *t : tables) {
                     if (!t) continue;
-                    if (t->engine() == "TIDESDB") {
+                    if (dd_engine_is_tidesdb(t->engine())) {
                         /* Use the same "<db>__<table>" form path_to_cf_name
                            produces so the symmetric-difference compares
                            identical CF names. CF_DB_TABLE_SEP is "__"; we
