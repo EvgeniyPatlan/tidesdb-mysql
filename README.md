@@ -196,7 +196,21 @@ CREATE TABLE t (id INT PRIMARY KEY, v BLOB) ENGINE=TIDESDB
   ENGINE_ATTRIBUTE='{"compression":"LZ4","bloom_filter":true}';
 ```
 
-Server-level system variables: `tidesdb_flush_threads`, `tidesdb_compaction_threads`, `tidesdb_block_cache_size`, `tidesdb_max_open_sstables`, `tidesdb_unified_memtable_write_buffer_size`, `tidesdb_unified_memtable_sync_mode`, `tidesdb_default_write_buffer_size`, `tidesdb_default_sync_mode`, `tidesdb_default_compression`, `tidesdb_log_level`. See [`docs/build-and-load.md`](docs/build-and-load.md) for the full reference.
+Server-level system variables: `tidesdb_flush_threads`, `tidesdb_compaction_threads`, `tidesdb_block_cache_size`, `tidesdb_max_open_sstables`, `tidesdb_unified_memtable_write_buffer_size`, `tidesdb_unified_memtable_sync_mode`, `tidesdb_default_write_buffer_size`, `tidesdb_default_sync_mode`, `tidesdb_default_compression`, `tidesdb_log_level`, `tidesdb_fast_mode`. See [`docs/build-and-load.md`](docs/build-and-load.md) for the full reference.
+
+`tidesdb_fast_mode=ON` (server start only) drops `HTON_SUPPORTS_ATOMIC_DDL`, so
+commits take MySQL's single-phase path instead of 2PC. It is intended for
+benchmark and bulk-load profiles and trades away the atomic-DDL crash-safety
+contract to do it.
+
+It also **forces `tidesdb_atomic_ddl_strict=OFF`** at handlerton init, and warns
+when it does. Without the atomic-DDL flag, `CREATE TABLE` runs outside the data-
+dictionary transaction, so the `se_private_data` binding is never persisted and
+strict mode would otherwise reject the table on its first `INSERT`. The
+consequence outlives the session: tables created under `fast_mode` carry no
+binding, and a normally-started server refuses to open them until each is
+rebuilt with `ALTER TABLE <t> ENGINE=TIDESDB` — the same repair used for legacy
+pre-v0.4.0 tables.
 
 ## Status
 

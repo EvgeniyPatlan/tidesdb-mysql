@@ -805,6 +805,22 @@ static MYSQL_SYSVAR_ULONGLONG(log_truncation_at, srv_log_truncation_at,
                               "(0 = no truncation, default: 24MB)",
                               NULL, NULL, 24ULL * 1024 * 1024, 0, ULONGLONG_MAX, 0);
 
+/* B1: tidesdb_fast_mode -- when set at server start, the handlerton does
+ * NOT advertise HTON_SUPPORTS_ATOMIC_DDL.  The server then routes commits
+ * through the single-phase path instead of 2PC, eliminating the per-
+ * statement prepare hook + DD checks.  Tradeoff: loses A-5's atomic-DDL
+ * contract -- CREATE / ALTER / DROP can leave the catalog and the engine
+ * out of sync on crash mid-DDL.  Reserved for benchmark and bulk-load
+ * profiles; default OFF. */
+static my_bool srv_fast_mode = 0;
+static MYSQL_SYSVAR_BOOL(fast_mode, srv_fast_mode,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Disable HTON_SUPPORTS_ATOMIC_DDL participation for higher steady-state "
+                         "OLTP throughput.  ON drops the 2PC commit path and the data-dictionary "
+                         "prepare hook; OFF keeps the v0.4.0 atomic-DDL contract.  Set only at "
+                         "server start.  Default OFF.",
+                         NULL, NULL, 0);
+
 static MYSQL_SYSVAR_BOOL(unified_memtable, srv_unified_memtable,
                          PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
                          "Use a single unified WAL and memtable across all column families. "
@@ -1405,6 +1421,7 @@ static SYS_VAR *tidesdb_system_variables[] = {
     MYSQL_SYSVAR(default_isolation_level),
     MYSQL_SYSVAR(log_to_file),
     MYSQL_SYSVAR(log_truncation_at),
+    MYSQL_SYSVAR(fast_mode),
     MYSQL_SYSVAR(unified_memtable),
     MYSQL_SYSVAR(unified_memtable_write_buffer_size),
     MYSQL_SYSVAR(unified_memtable_sync_mode),
@@ -2894,12 +2911,47 @@ static int tidesdb_init_func(void *p)
 
     tidesdb_hton = (handlerton *)p;
     tidesdb_hton->create = tidesdb_create_handler;
-    /* Task 13: HTON_SUPPORTS_ATOMIC_DDL activates the spec'd contract --
-       ha_tidesdb::create now runs INSIDE the open DD transaction, so
+    /* Task 13 / A-5: HTON_SUPPORTS_ATOMIC_DDL activates the spec'd
+       contract -- ha_tidesdb::create runs INSIDE the open DD transaction,
        prepare_create's mutations to dd::Table::se_private_data persist,
-       prepare_drop's marker survives a rollback, and validate_open can
-       trust the binding cell on every open. */
-    tidesdb_hton->flags = HTON_SUPPORTS_ENGINE_ATTRIBUTE | HTON_SUPPORTS_ATOMIC_DDL;
+       prepare_drop's marker survives a rollback, validate_open can trust
+       the binding cell on every open.
+       B1 / fast_mode: when tidesdb_fast_mode=ON the flag is dropped at
+       handlerton init so the server routes commits through the single-
+       phase path.  Eliminates the prepare-hook 2PC tax in steady-state
+       OLTP; the tradeoff is losing the atomic-DDL crash-safety contract
+       above. */
+    tidesdb_hton->flags = HTON_SUPPORTS_ENGINE_ATTRIBUTE |
+                          (srv_fast_mode ? 0 : HTON_SUPPORTS_ATOMIC_DDL);
+
+    /* B1: strict mode enforces an artifact fast_mode prevents from being
+       created.  Without HTON_SUPPORTS_ATOMIC_DDL, ha_tidesdb::create runs
+       outside the DD transaction, so prepare_create still writes
+       se_private_data but the server discards it -- validate_open then
+       rejects the table on its first open.  Left coupled, the default
+       pairing (fast_mode=ON, strict=ON) yields a table that CREATEs
+       successfully and fails on the very next INSERT.
+
+       Resolve it here rather than at the rejection site: the contradiction
+       is in the configuration, and it has exactly one coherent reading.
+       Same shape as the pessimistic-locking path, which downgrades
+       engine-level OCC to READ_COMMITTED instead of failing on an
+       equivalent conflict.
+
+       Tables created in this mode carry no binding for the life of the
+       table.  A normally-started server (strict=ON) will refuse to open
+       them until each is rebuilt with ALTER TABLE ... ENGINE=TIDESDB --
+       the same repair KNOWN-ISSUES documents for legacy pre-v0.4.0
+       tables. */
+    if (srv_fast_mode && tidesdb_mysql::g_atomic_ddl_strict)
+    {
+        tidesdb_mysql::g_atomic_ddl_strict = false;
+        sql_print_warning(
+            "[TIDESDB] tidesdb_fast_mode=ON forces tidesdb_atomic_ddl_strict=OFF. "
+            "Tables created in this mode carry no se_private_data binding and a "
+            "server started without fast_mode will refuse to open them; rebuild "
+            "each with ALTER TABLE <t> ENGINE=TIDESDB before switching back.");
+    }
     tidesdb_hton->savepoint_offset = sizeof(tidesdb_savepoint_t);
     tidesdb_hton->file_extensions = ha_tidesdb_exts;  /* MariaDB: tablefile_extensions */
     /* MariaDB-only handlerton members (table_options/field_options/index_options)

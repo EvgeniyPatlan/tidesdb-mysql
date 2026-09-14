@@ -1,0 +1,30 @@
+--source suite/tidesdb/include/have_tidesdb.inc
+#
+# B1 tidesdb_fast_mode: default state and settability.
+#
+# No .opt here -- this is a normally started server, so the handlerton
+# advertises HTON_SUPPORTS_ATOMIC_DDL and the atomic-DDL contract is in
+# force. Companion to tidesdb_fast_mode.test, which starts with the
+# variable ON.
+#
+# fast_mode is PLUGIN_VAR_READONLY: it is read once at handlerton init to
+# decide whether to advertise the flag, so changing it on a running server
+# would leave the advertised flag and the variable disagreeing. The server
+# must refuse SET GLOBAL.
+#
+
+SELECT @@global.tidesdb_fast_mode AS fast_mode_default_off;
+
+# READONLY -- settable only at server start.
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SET @@global.tidesdb_fast_mode = ON;
+
+# Still off after the rejected SET.
+SELECT @@global.tidesdb_fast_mode AS still_off;
+
+# There is no session scope for this variable.
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SET @@session.tidesdb_fast_mode = ON;
+
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

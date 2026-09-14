@@ -1,0 +1,45 @@
+--source suite/tidesdb/include/have_tidesdb.inc
+#
+# B1 tidesdb_fast_mode: the handlerton drops HTON_SUPPORTS_ATOMIC_DDL when
+# the server starts with --tidesdb-fast-mode=ON, routing commits through
+# the single-phase path instead of 2PC.
+#
+# Regression guard for the coupling with tidesdb_atomic_ddl_strict.
+# Without HTON_SUPPORTS_ATOMIC_DDL, ha_tidesdb::create runs outside the DD
+# transaction: prepare_create still writes se_private_data but the server
+# discards it, and validate_open rejects the table on its first open. Left
+# uncoupled, the default pairing (fast_mode=ON, strict=ON) produced a table
+# that CREATEd successfully and failed on the next INSERT with
+# ER_TABLEACCESS_DENIED_ERROR.
+#
+# tidesdb_init_func now forces strict=OFF when fast_mode=ON and warns. This
+# test asserts the forcing happened and that the table is actually usable.
+#
+# The .opt deliberately sets ONLY fast_mode -- strict is left at its ON
+# default so the forcing is what makes this pass.
+#
+
+--disable_query_log
+--disable_warnings
+DROP TABLE IF EXISTS test.tdb_fast_t;
+--enable_warnings
+--enable_query_log
+
+SELECT @@global.tidesdb_fast_mode AS fast_mode_on;
+
+# Forced off at handlerton init despite its ON default.
+SELECT @@global.tidesdb_atomic_ddl_strict AS strict_forced_off;
+
+CREATE TABLE tdb_fast_t (id INT PRIMARY KEY, v VARCHAR(64)) ENGINE=TIDESDB;
+
+# The INSERT is the assertion: this is where the uncoupled build failed.
+INSERT INTO tdb_fast_t VALUES (1,'a'), (2,'b');
+
+# Force close + reopen; validate_open runs here.
+FLUSH TABLES tdb_fast_t;
+SELECT id, v FROM tdb_fast_t ORDER BY id;
+
+DROP TABLE tdb_fast_t;
+
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

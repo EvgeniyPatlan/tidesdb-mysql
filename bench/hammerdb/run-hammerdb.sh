@@ -76,6 +76,27 @@ case "${DB_EXTRA_ARGS:-}" in
     fi ;;
 esac
 
+# Same treatment for tidesdb_fast_mode, which drops HTON_SUPPORTS_ATOMIC_DDL
+# so commits take the single-phase path:
+#   DB_EXTRA_ARGS="--loose_tidesdb_fast_mode=ON"
+# It is PLUGIN_VAR_READONLY like unified_memtable, so it needs the loose_
+# prefix and only applies at server start. Both effective values are printed
+# because fast_mode=ON forces tidesdb_atomic_ddl_strict=OFF at handlerton
+# init -- a throughput number from this mode is only interpretable if the
+# report says the atomic-DDL contract was off while it was measured.
+FAST_MODE=$(docker exec "$DB" mysql -uroot -N -B \
+  -e "SHOW GLOBAL VARIABLES LIKE 'tidesdb_fast_mode'" 2>/dev/null | awk '{print $2}')
+DDL_STRICT=$(docker exec "$DB" mysql -uroot -N -B \
+  -e "SHOW GLOBAL VARIABLES LIKE 'tidesdb_atomic_ddl_strict'" 2>/dev/null | awk '{print $2}')
+echo "[hdb] effective tidesdb_fast_mode = ${FAST_MODE:-?} (atomic_ddl_strict = ${DDL_STRICT:-?})"
+case "${DB_EXTRA_ARGS:-}" in
+  *fast_mode=1*|*fast_mode=ON*|*fast-mode=1*|*fast-mode=ON*)
+    if [ "$FAST_MODE" != "ON" ]; then
+      echo "[hdb] FATAL: requested fast_mode=ON but server reports '${FAST_MODE}'" >&2
+      exit 1
+    fi ;;
+esac
+
 docker exec -i "$DB" mysql -uroot >/dev/null 2>&1 <<SQL
 CREATE USER IF NOT EXISTS '$USER'@'%' IDENTIFIED BY '$PASS';
 GRANT ALL PRIVILEGES ON *.* TO '$USER'@'%' WITH GRANT OPTION;
