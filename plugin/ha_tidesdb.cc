@@ -15,6 +15,7 @@
   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 */
 #include "ha_tidesdb.h"
+#include "storage/tidesdb/tidesdb_legacy_options.h"
 
 extern "C"
 {
@@ -626,6 +627,40 @@ static void tidesdb_orphan_action_update(THD *, SYS_VAR *, void *var_ptr,
     *static_cast<ulong *>(var_ptr) = v;
     tidesdb_mysql::g_orphan_action = static_cast<tidesdb_mysql::OrphanAction>(v);
 }
+
+/* How to treat an ENGINE_ATTRIBUTE key that an engine version has retired
+   (see tidesdb_legacy_options.h).
+
+   'strict' (default) refuses the DDL and names the replacement. 'warn'
+   accepts it, says the same thing as a warning, and ignores the key.
+
+   warn exists for one specific window. A TidesDB major version can change
+   the on-disk format with no in-place upgrade, which makes dump-and-reload
+   the migration path -- and mysqldump reproduces ENGINE_ATTRIBUTE verbatim,
+   so a dump taken from the older server carries keys the newer one rejects.
+   Strict would fail every CREATE TABLE in that reload and leave the operator
+   hand-editing the dump, which is not an upgrade path. The sequence is: set
+   warn, reload, set strict.
+
+   Deliberately not PLUGIN_VAR_READONLY. The reload window needs SET GLOBAL
+   at runtime, and the my.cnf case needs it readable at plugin init; a
+   read-only variable would serve the second and break the first. */
+static const char *tidesdb_legacy_compat_names[] = {"strict", "warn", NullS};
+static TYPELIB tidesdb_legacy_compat_typelib = {
+    array_elements(tidesdb_legacy_compat_names) - 1, "tidesdb_legacy_compat_typelib",
+    tidesdb_legacy_compat_names, NULL};
+static ulong srv_legacy_compat = 0; /* 0 = strict, 1 = warn */
+static MYSQL_SYSVAR_ENUM(legacy_compat, srv_legacy_compat,
+                         PLUGIN_VAR_RQCMDARG,
+                         "How to treat an ENGINE_ATTRIBUTE key retired by the "
+                         "bundled engine version. 'strict' (default) rejects "
+                         "the CREATE / ALTER and names the replacement; 'warn' "
+                         "accepts it with a warning and ignores the key. Use "
+                         "'warn' only for the duration of a dump-and-reload "
+                         "upgrade, where the dump carries attributes written "
+                         "by an older server, then set it back to 'strict'.",
+                         /*check=*/NULL, /*update=*/NULL,
+                         /*default=*/0, &tidesdb_legacy_compat_typelib);
 
 static MYSQL_SYSVAR_ENUM(orphan_action, srv_orphan_action,
                          PLUGIN_VAR_RQCMDARG,
@@ -1446,6 +1481,7 @@ static SYS_VAR *tidesdb_system_variables[] = {
     MYSQL_SYSVAR(default_tombstone_density_trigger),
     MYSQL_SYSVAR(default_tombstone_density_min_entries),
     MYSQL_SYSVAR(atomic_ddl_strict),
+    MYSQL_SYSVAR(legacy_compat),
     MYSQL_SYSVAR(orphan_action),
     MYSQL_SYSVAR(perf_capture),
     MYSQL_SYSVAR(perf_output_dir),
@@ -1506,6 +1542,62 @@ static SYS_VAR *tidesdb_system_variables[] = {
    is generous defense against a CREATE TABLE storing a malicious
    attribute that exhausts memory on every open. */
 static constexpr size_t TIDESDB_ENGINE_ATTRIBUTE_MAX_LEN = 65536;
+
+/* Walk an ENGINE_ATTRIBUTE object's member names and act on any that the
+   bundled engine version has retired (tidesdb_legacy_options.h).
+
+   Returns false only when the statement should be refused; the caller raises
+   nothing itself. Under 'warn', and for every key still live, returns true.
+
+   Called from ha_tidesdb::create -- where DDL is authored -- and not from
+   tidesdb_compute_opts_for_table, which re-parses the attribute persisted in
+   the data dictionary on every OPEN TABLE. That asymmetry is the point: a
+   hard failure on the open path makes an existing table unopenable, and
+   therefore undroppable, so the operator cannot even clear it. Reject where
+   the DDL is written; warn where stored state is replayed. */
+static bool tidesdb_check_legacy_engine_attribute(THD *thd, LEX_CSTRING attr)
+{
+    if (tdb_legacy_options_empty()) return true; /* nothing retired yet */
+    if (!attr.str || attr.length == 0) return true;
+    if (attr.length > TIDESDB_ENGINE_ATTRIBUTE_MAX_LEN) return true; /* the parser reports this */
+
+    rapidjson::Document doc;
+    doc.Parse<rapidjson::kParseIterativeFlag>(attr.str, attr.length);
+    if (doc.HasParseError() || !doc.IsObject()) return true; /* likewise */
+
+    bool ok = true;
+    for (auto m = doc.MemberBegin(); m != doc.MemberEnd(); ++m)
+    {
+        if (!m->name.IsString()) continue;
+        const TdbLegacyOption *e = tdb_legacy_option_lookup(m->name.GetString());
+        if (e == nullptr) continue;
+
+        char msg[512];
+        if (e->disposition == TdbLegacyDisposition::Relocated)
+        {
+            snprintf(msg, sizeof(msg),
+                     "ENGINE_ATTRIBUTE '%s' is no longer a table option; "
+                     "it is database-wide -- set @@%s",
+                     e->key, e->replacement ? e->replacement : "?");
+        }
+        else
+        {
+            snprintf(msg, sizeof(msg),
+                     "ENGINE_ATTRIBUTE '%s' was removed: %s",
+                     e->key, e->reason ? e->reason : "no longer supported");
+        }
+
+        if (srv_legacy_compat == 0) /* strict */
+        {
+            my_error(ER_WRONG_ARGUMENTS, MYF(0), msg);
+            ok = false;
+            break; /* first offender is enough; the operator fixes and retries */
+        }
+        push_warning_printf(thd, Sql_condition::SL_WARNING, ER_WRONG_ARGUMENTS,
+                            "%s (ignored: tidesdb_legacy_compat=warn)", msg);
+    }
+    return ok;
+}
 
 static bool tidesdb_engine_attribute_to_options(LEX_CSTRING attr,
                                                 ha_table_option_struct *opts) {
@@ -4482,6 +4574,10 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
     tidesdb_seed_opts_from_session(ha_thd(), &opts_storage);
     if (create_info && create_info->engine_attribute.str &&
         create_info->engine_attribute.length) {
+        if (!tidesdb_check_legacy_engine_attribute(ha_thd(),
+                                                   create_info->engine_attribute)) {
+            DBUG_RETURN(HA_WRONG_CREATE_OPTION); /* my_error already raised */
+        }
         if (!tidesdb_engine_attribute_to_options(create_info->engine_attribute,
                                                  &opts_storage)) {
             my_error(ER_WRONG_ARGUMENTS, MYF(0),

@@ -1,0 +1,53 @@
+--source suite/tidesdb/include/have_tidesdb.inc
+#
+# tidesdb_legacy_compat: how an ENGINE_ATTRIBUTE key retired by the bundled
+# engine version is treated. 'strict' (default) refuses the DDL and names the
+# replacement; 'warn' accepts it with a warning and ignores the key.
+#
+# The retired-key table (plugin/tidesdb_legacy_options.h) is empty while the
+# engine retires nothing, so there is no key to reject yet and this test
+# covers the surface rather than a rejection: the variable exists, defaults to
+# strict, takes both values at runtime, and refuses anything else. The
+# rejection cases join this file when the table is populated.
+#
+# Runtime-settable is not incidental. The dump-and-reload upgrade a major
+# engine version forces needs SET GLOBAL mid-session (set warn, reload, set
+# strict), so a PLUGIN_VAR_READONLY here would defeat the variable's purpose.
+#
+
+--disable_query_log
+--disable_warnings
+DROP TABLE IF EXISTS test.tdb_legacy_t;
+--enable_warnings
+--enable_query_log
+
+--let $save_legacy_compat = `SELECT @@global.tidesdb_legacy_compat`
+
+SELECT @@global.tidesdb_legacy_compat AS default_is_strict;
+
+# Settable at runtime, both directions.
+SET GLOBAL tidesdb_legacy_compat = 'warn';
+SELECT @@global.tidesdb_legacy_compat AS now_warn;
+SET GLOBAL tidesdb_legacy_compat = 'strict';
+SELECT @@global.tidesdb_legacy_compat AS back_to_strict;
+
+# Only the two documented values.
+--error ER_WRONG_VALUE_FOR_VAR
+SET GLOBAL tidesdb_legacy_compat = 'lenient';
+
+# A live attribute is unaffected under either setting -- the table holds no
+# entries, and even when it does, a key still in use must not be rejected.
+CREATE TABLE tdb_legacy_t (id INT PRIMARY KEY, v VARCHAR(32)) ENGINE=TIDESDB
+  ENGINE_ATTRIBUTE='{"bloom_filter":true}';
+INSERT INTO tdb_legacy_t VALUES (1,'a');
+SELECT id, v FROM tdb_legacy_t;
+DROP TABLE tdb_legacy_t;
+
+SET GLOBAL tidesdb_legacy_compat = 'warn';
+CREATE TABLE tdb_legacy_t (id INT PRIMARY KEY) ENGINE=TIDESDB
+  ENGINE_ATTRIBUTE='{"bloom_filter":true}';
+DROP TABLE tdb_legacy_t;
+
+--eval SET GLOBAL tidesdb_legacy_compat = '$save_legacy_compat'
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

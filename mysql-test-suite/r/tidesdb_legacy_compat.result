@@ -1,0 +1,26 @@
+SELECT @@global.tidesdb_legacy_compat AS default_is_strict;
+default_is_strict
+strict
+SET GLOBAL tidesdb_legacy_compat = 'warn';
+SELECT @@global.tidesdb_legacy_compat AS now_warn;
+now_warn
+warn
+SET GLOBAL tidesdb_legacy_compat = 'strict';
+SELECT @@global.tidesdb_legacy_compat AS back_to_strict;
+back_to_strict
+strict
+SET GLOBAL tidesdb_legacy_compat = 'lenient';
+ERROR 42000: Variable 'tidesdb_legacy_compat' can't be set to the value of 'lenient'
+CREATE TABLE tdb_legacy_t (id INT PRIMARY KEY, v VARCHAR(32)) ENGINE=TIDESDB
+ENGINE_ATTRIBUTE='{"bloom_filter":true}';
+INSERT INTO tdb_legacy_t VALUES (1,'a');
+SELECT id, v FROM tdb_legacy_t;
+id	v
+1	a
+DROP TABLE tdb_legacy_t;
+SET GLOBAL tidesdb_legacy_compat = 'warn';
+CREATE TABLE tdb_legacy_t (id INT PRIMARY KEY) ENGINE=TIDESDB
+ENGINE_ATTRIBUTE='{"bloom_filter":true}';
+DROP TABLE tdb_legacy_t;
+SET GLOBAL tidesdb_legacy_compat = 'strict';
+# Done.
