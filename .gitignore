@@ -58,3 +58,7 @@ core
 core.*
 .gdb_history
 dist/
+
+# Second engine tree + prefix for side-by-side version work (see scripts/build-tidesdb.sh)
+vendor/tidesdb-v10/
+vendor/tidesdb-prefix-v10/

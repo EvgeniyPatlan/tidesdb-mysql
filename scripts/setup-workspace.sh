@@ -22,6 +22,10 @@ cd "$REPO"
 # Pin versions for reproducibility. Bump when known-compatible.
 MYSQL_TAG="${MYSQL_TAG:-mysql-9.7.0}"
 TIDESDB_TAG="${TIDESDB_TAG:-v9.3.2}"
+# Where that tag is cloned to. Overridable so a second engine version can sit
+# beside the pinned one without disturbing it; pair it with TIDESDB_PREFIX_DIR
+# when running scripts/build-tidesdb.sh.
+TIDESDB_SRC_DIR="${TIDESDB_SRC_DIR:-vendor/tidesdb}"
 WITH_TIDESQL_REFERENCE="${WITH_TIDESQL_REFERENCE:-0}"
 
 mkdir -p vendor
@@ -36,14 +40,14 @@ else
 fi
 
 # ---------- 2) TidesDB ----------
-if [ ! -d vendor/tidesdb/.git ]; then
-    echo "[setup] Cloning TidesDB $TIDESDB_TAG"
+if [ ! -d "$TIDESDB_SRC_DIR/.git" ]; then
+    echo "[setup] Cloning TidesDB $TIDESDB_TAG -> $TIDESDB_SRC_DIR"
     git clone --depth=1 --branch "$TIDESDB_TAG" \
-        https://github.com/tidesdb/tidesdb.git vendor/tidesdb
+        https://github.com/tidesdb/tidesdb.git "$TIDESDB_SRC_DIR"
     # Engine shipped unpatched as of v9.3.0: walfix landed in v9.2.5, the
     # bloom_filter_new UAF (PR #626) in v9.3.0. No patches/ step required.
 else
-    echo "[setup] vendor/tidesdb already present — skipping clone"
+    echo "[setup] $TIDESDB_SRC_DIR already present — skipping clone"
 fi
 
 # ---------- 3) TideSQL reference (optional) ----------
