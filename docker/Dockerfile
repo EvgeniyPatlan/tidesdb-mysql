@@ -33,6 +33,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libzstd-dev \
     liblz4-dev \
     libsnappy-dev \
+    # plugin/tests -- the gtest suite skips itself when these are absent, so
+    # without them the pure-helper tests silently never run
+    libgtest-dev \
+    libgmock-dev \
     # Debugging
     gdb \
     procps \
