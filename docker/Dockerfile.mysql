@@ -1,5 +1,17 @@
 # syntax=docker/dockerfile:1.6
 
+# The MySQL version this image is built for. It drives BOTH the source tree the
+# plugin compiles against and the runtime base image, because those two must
+# agree: a storage-engine .so carries MYSQL_HANDLERTON_INTERFACE_VERSION from
+# the headers it was built with, and mysqld refuses to load one that does not
+# match ("API version for STORAGE ENGINE plugin is too different").
+#
+# They used to be written separately -- ARG MYSQL_TAG=mysql-9.7.0 against
+# FROM mysql:9.7 -- so the pinned source stayed put while the floating base tag
+# moved to 9.7.2 underneath it. The result was an image that built and started
+# cleanly with no TidesDB engine in it. Keep them derived from one value.
+ARG MYSQL_VERSION=9.7.2
+
 ###############################################################################
 #  TidesDB storage engine for MySQL 9.7 — runnable image
 #
@@ -43,7 +55,8 @@
 FROM oraclelinux:9 AS builder
 
 # Pin sources for reproducibility; bump when the engine is known-compatible.
-ARG MYSQL_TAG=mysql-9.7.0
+ARG MYSQL_VERSION
+ARG MYSQL_TAG=mysql-${MYSQL_VERSION}
 ARG TIDESDB_TAG=v9.3.2
 
 # v0.4.1: build the plugin with -DTIDESDB_PERF=1 to compile in the
@@ -171,9 +184,12 @@ RUN ls -la /build/mysql-server/build/plugin_output_directory/ha_tidesdb.so
 
 
 ###############################################################################
-# Stage 2: runtime — official mysql:9.7 with ha_tidesdb.so installed
+# Stage 2: runtime — official mysql:${MYSQL_VERSION} with ha_tidesdb.so installed
 ###############################################################################
-FROM mysql:9.7
+# MYSQL_VERSION resolves from the global ARG above the first FROM, which is the
+# only scope a FROM can read. Do not re-declare it here -- an ARG on this line
+# would belong to the builder stage, not this one.
+FROM mysql:${MYSQL_VERSION}
 
 LABEL org.opencontainers.image.title="MySQL 9.7 + TidesDB"
 LABEL org.opencontainers.image.description="MySQL 9.7 LTS with the TidesDB LSM-tree storage engine plugin"
