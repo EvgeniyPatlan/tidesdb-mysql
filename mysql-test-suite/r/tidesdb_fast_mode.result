@@ -1,0 +1,11 @@
+# tidesdb_fast_mode is ON (from tidesdb_fast_mode-master.opt)
+# tidesdb_atomic_ddl_strict was forced OFF by fast_mode
+CREATE TABLE tdb_fast_t (id INT PRIMARY KEY, v VARCHAR(64)) ENGINE=TIDESDB;
+INSERT INTO tdb_fast_t VALUES (1,'a'), (2,'b');
+FLUSH TABLES tdb_fast_t;
+SELECT id, v FROM tdb_fast_t ORDER BY id;
+id	v
+1	a
+2	b
+DROP TABLE tdb_fast_t;
+# Done.

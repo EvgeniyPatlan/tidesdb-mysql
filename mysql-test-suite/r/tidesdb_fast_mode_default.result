@@ -1,0 +1,11 @@
+SELECT @@global.tidesdb_fast_mode AS fast_mode_default_off;
+fast_mode_default_off
+0
+SET @@global.tidesdb_fast_mode = ON;
+ERROR HY000: Variable 'tidesdb_fast_mode' is a read only variable
+SELECT @@global.tidesdb_fast_mode AS still_off;
+still_off
+0
+SET @@session.tidesdb_fast_mode = ON;
+ERROR HY000: Variable 'tidesdb_fast_mode' is a read only variable
+# Done.

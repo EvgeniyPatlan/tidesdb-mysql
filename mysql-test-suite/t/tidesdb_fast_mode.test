@@ -25,10 +25,31 @@ DROP TABLE IF EXISTS test.tdb_fast_t;
 --enable_warnings
 --enable_query_log
 
-SELECT @@global.tidesdb_fast_mode AS fast_mode_on;
+# The options live in tidesdb_fast_mode-master.opt, not tidesdb_fast_mode.opt.
+# A plain .opt does not apply a real plugin sysvar here -- the suite's other
+# .opt files (tidesdb_crud, tidesdb_json, tidesdb_analyze, tidesdb_online_ddl)
+# all carry deliberately fake variables whose only job is to force MTR to give
+# the test its own server. The one test that sets a real plugin sysvar,
+# tidesdb_encryption, uses -master.opt. Follow that.
+#
+# Guard: the option needs the loose- prefix (the variable is unknown during
+# the pre-plugin --initialize pass), and a silently-ignored .opt would make
+# every assertion below pass against a normally-started server -- proving
+# nothing. Fail loudly instead.
+--let $fm = `SELECT @@global.tidesdb_fast_mode`
+if ($fm != 1)
+{
+  --die tidesdb_fast_mode is OFF: the .opt file did not take effect, so this test would pass vacuously
+}
+--echo # tidesdb_fast_mode is ON (from tidesdb_fast_mode-master.opt)
 
-# Forced off at handlerton init despite its ON default.
-SELECT @@global.tidesdb_atomic_ddl_strict AS strict_forced_off;
+# Forced OFF at handlerton init despite its ON default. Same guard rationale.
+--let $strict = `SELECT @@global.tidesdb_atomic_ddl_strict`
+if ($strict != 0)
+{
+  --die tidesdb_atomic_ddl_strict is still ON: fast_mode did not force it off
+}
+--echo # tidesdb_atomic_ddl_strict was forced OFF by fast_mode
 
 CREATE TABLE tdb_fast_t (id INT PRIMARY KEY, v VARCHAR(64)) ENGINE=TIDESDB;
 
