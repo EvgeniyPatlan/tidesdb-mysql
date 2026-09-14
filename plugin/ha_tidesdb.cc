@@ -2731,7 +2731,7 @@ static void schema_cf_delete_db(const std::string &db_name)
     if (tidesdb_txn_begin(tdb_get_engine(), &txn) != TDB_SUCCESS) return;
 
     tidesdb_iter_t *it = NULL;
-    if (tidesdb_iter_new(txn, g_engine_ctx.schema_cf, &it) != TDB_SUCCESS)
+    if (tdb_iter_new_r(txn, g_engine_ctx.schema_cf, &it) != TDB_SUCCESS)
     {
         tidesdb_txn_rollback(txn);
         tidesdb_txn_free(txn);
@@ -2739,7 +2739,7 @@ static void schema_cf_delete_db(const std::string &db_name)
     }
 
     std::vector<std::string> to_delete;
-    tidesdb_iter_seek(it, (const uint8_t *)prefix.data(), prefix.size());
+    tdb_iter_seek_r(it, (const uint8_t *)prefix.data(), prefix.size());
     while (tidesdb_iter_valid(it))
     {
         uint8_t *k = NULL;
@@ -2747,7 +2747,7 @@ static void schema_cf_delete_db(const std::string &db_name)
         if (tidesdb_iter_key(it, &k, &klen) != TDB_SUCCESS) break;
         if (klen < prefix.size() || memcmp(k, prefix.data(), prefix.size()) != 0) break;
         to_delete.emplace_back((const char *)k, klen);
-        tidesdb_iter_next(it);
+        tdb_iter_next_r(it);
     }
     tidesdb_iter_free(it);
 
@@ -2778,7 +2778,7 @@ static void schema_cf_rename(const char *from, const char *to)
     /* We read existing .frm from old key */
     uint8_t *val = NULL;
     size_t val_len = 0;
-    int rc = tidesdb_txn_get(txn, g_engine_ctx.schema_cf, (const uint8_t *)old_key.data(), old_key.size(), &val,
+    int rc = tdb_txn_get_r(txn, g_engine_ctx.schema_cf, (const uint8_t *)old_key.data(), old_key.size(), &val,
                              &val_len);
     if (rc == TDB_SUCCESS && val)
     {
@@ -2829,7 +2829,7 @@ static void schema_cf_ensure_databases()
     if (tidesdb_txn_begin(tdb_get_engine(), &txn) != TDB_SUCCESS) return;
 
     tidesdb_iter_t *iter = NULL;
-    if (tidesdb_iter_new(txn, g_engine_ctx.schema_cf, &iter) != TDB_SUCCESS || !iter)
+    if (tdb_iter_new_r(txn, g_engine_ctx.schema_cf, &iter) != TDB_SUCCESS || !iter)
     {
         tidesdb_txn_rollback(txn);
         tidesdb_txn_free(txn);
@@ -2838,7 +2838,7 @@ static void schema_cf_ensure_databases()
 
     std::unordered_set<std::string> seen_dbs;
 
-    tidesdb_iter_seek_to_first(iter);
+    tdb_iter_seek_to_first_r(iter);
     while (tidesdb_iter_valid(iter))
     {
         uint8_t *kp = NULL;
@@ -2876,7 +2876,7 @@ static void schema_cf_ensure_databases()
             }
         }
 
-        tidesdb_iter_next(iter);
+        tdb_iter_next_r(iter);
     }
 
     tidesdb_iter_free(iter);
@@ -4107,9 +4107,9 @@ void ha_tidesdb::recover_counters()
     if (tidesdb_txn_begin(tdb_get_engine(), &txn) != TDB_SUCCESS) return;
 
     tidesdb_iter_t *iter = NULL;
-    if (tidesdb_iter_new(txn, share->cf, &iter) == TDB_SUCCESS)
+    if (tdb_iter_new_r(txn, share->cf, &iter) == TDB_SUCCESS)
     {
-        tidesdb_iter_seek_to_last(iter);
+        tdb_iter_seek_to_last_r(iter);
         if (tidesdb_iter_valid(iter))
         {
             uint8_t *key = NULL;
@@ -4957,7 +4957,7 @@ int ha_tidesdb::fetch_row_by_pk(tidesdb_txn_t *txn, const uchar *pk, uint pk_len
 
     uint8_t *value = NULL;
     size_t value_size = 0;
-    int rc = tidesdb_txn_get(txn, share->cf, dk, dk_len, &value, &value_size);
+    int rc = tdb_txn_get_r(txn, share->cf, dk, dk_len, &value, &value_size);
     if (rc == TDB_ERR_NOT_FOUND) return HA_ERR_KEY_NOT_FOUND;
     if (rc != TDB_SUCCESS) return tdb_rc_to_ha(rc, "fetch_row_by_pk");
 
@@ -5058,7 +5058,7 @@ int ha_tidesdb::iter_read_current(uchar *buf)
         /* We skip non-data keys (meta namespace) */
         if (!is_data_key(key, key_size))
         {
-            tidesdb_iter_next(scan_iter);
+            tdb_iter_next_r(scan_iter);
             continue;
         }
 
@@ -5214,7 +5214,7 @@ int ha_tidesdb::write_row(uchar *buf)
     {
         uint8_t *dup_val = NULL;
         size_t dup_len = 0;
-        int grc = tidesdb_txn_get(txn, share->cf, dk, dk_len, &dup_val, &dup_len);
+        int grc = tdb_txn_get_r(txn, share->cf, dk, dk_len, &dup_val, &dup_len);
         if (grc == TDB_SUCCESS)
         {
             tidesdb_free(dup_val);
@@ -5233,7 +5233,7 @@ int ha_tidesdb::write_row(uchar *buf)
 
     /* We check UNIQUE secondary index uniqueness.
        Cached dup-check iterators avoid the catastrophically expensive
-       tidesdb_iter_new() (O(num_sstables) merge-heap construction) on
+       tdb_iter_new_r() (O(num_sstables) merge-heap construction) on
        every single INSERT.  The iterator per unique index is created
        once and reused via seek() across rows within the same txn.
        Note: skip_unique (which includes pk_auto_generated) is intentionally
@@ -5271,7 +5271,7 @@ int ha_tidesdb::write_row(uchar *buf)
             if (!dup_iter)
             {
                 {
-                    int irc = tidesdb_iter_new(txn, share->idx_cfs[i], &dup_iter);
+                    int irc = tdb_iter_new_r(txn, share->idx_cfs[i], &dup_iter);
                     if (irc != TDB_SUCCESS || !dup_iter)
                     {
                         /* Iterator creation failed, thus cannot safely skip the
@@ -5287,7 +5287,7 @@ int ha_tidesdb::write_row(uchar *buf)
                 dup_iter_count_++;
             }
 
-            tidesdb_iter_seek(dup_iter, idx_prefix, idx_prefix_len);
+            tdb_iter_seek_r(dup_iter, idx_prefix, idx_prefix_len);
             if (tidesdb_iter_valid(dup_iter))
             {
                 uint8_t *fk = NULL;
@@ -5550,7 +5550,7 @@ int ha_tidesdb::rnd_init(bool scan)
 
     if (!scan_iter)
     {
-        int rc = tidesdb_iter_new(scan_txn, share->cf, &scan_iter);
+        int rc = tdb_iter_new_r(scan_txn, share->cf, &scan_iter);
         if (rc != TDB_SUCCESS)
         {
             scan_txn = NULL;
@@ -5563,7 +5563,7 @@ int ha_tidesdb::rnd_init(bool scan)
 
     /* We seek past meta keys to the first data key */
     uint8_t data_prefix = KEY_NS_DATA;
-    tidesdb_iter_seek(scan_iter, &data_prefix, 1);
+    tdb_iter_seek_r(scan_iter, &data_prefix, 1);
 
     DBUG_RETURN(0);
 }
@@ -5589,7 +5589,7 @@ int ha_tidesdb::rnd_next(uchar *buf)
     /* We advance past the last-read entry.  on the first call after rnd_init
      * the iterator is already positioned at the first data key by the seek
      * in rnd_init, so we skip the advance (scan_dir_ == DIR_NONE). */
-    if (scan_dir_ != DIR_NONE) tidesdb_iter_next(scan_iter);
+    if (scan_dir_ != DIR_NONE) tdb_iter_next_r(scan_iter);
 
     int ret = iter_read_current(buf);
     if (ret == 0) scan_dir_ = DIR_FORWARD;
@@ -5728,7 +5728,7 @@ int ha_tidesdb::ensure_scan_iter()
         scan_iter_last_err_txn_ = scan_txn;
         return HA_ERR_INTERNAL_ERROR;
     }
-    int rc = tidesdb_iter_new(scan_txn, scan_cf_, &scan_iter);
+    int rc = tdb_iter_new_r(scan_txn, scan_cf_, &scan_iter);
     if (rc == TDB_SUCCESS)
     {
         scan_iter_cf_ = scan_cf_;
@@ -5819,7 +5819,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
                 int irc = ensure_scan_iter();
                 if (irc) DBUG_RETURN(irc);
             }
-            tidesdb_iter_seek(scan_iter, seek_key, seek_len);
+            tdb_iter_seek_r(scan_iter, seek_key, seek_len);
             int ret = iter_read_current(buf);
             if (ret == 0) scan_dir_ = DIR_FORWARD;
             DBUG_RETURN(ret);
@@ -5833,7 +5833,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
 
         if (find_flag == HA_READ_KEY_OR_NEXT || find_flag == HA_READ_AFTER_KEY)
         {
-            tidesdb_iter_seek(scan_iter, seek_key, seek_len);
+            tdb_iter_seek_r(scan_iter, seek_key, seek_len);
 
             if (find_flag == HA_READ_AFTER_KEY && tidesdb_iter_valid(scan_iter))
             {
@@ -5842,7 +5842,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
                 size_t iks = 0;
                 if (tidesdb_iter_key(scan_iter, &ik, &iks) == TDB_SUCCESS && iks == seek_len &&
                     memcmp(ik, seek_key, iks) == 0)
-                    tidesdb_iter_next(scan_iter);
+                    tdb_iter_next_r(scan_iter);
             }
 
             int ret = iter_read_current(buf);
@@ -5870,7 +5870,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
                 memcpy(upper, seek_key, seek_len);
                 uint pad = full_pk_comp_len - comp_len;
                 memset(upper + seek_len, KEY_INF_HI_BYTE, pad);
-                tidesdb_iter_seek_for_prev(scan_iter, upper, seek_len + pad);
+                tdb_iter_seek_for_prev_r(scan_iter, upper, seek_len + pad);
 
                 /* HA_READ_PREFIX_LAST means "last row WITH this prefix,
                    else not found". If we landed outside the group
@@ -5888,14 +5888,14 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
             }
             else
             {
-                tidesdb_iter_seek_for_prev(scan_iter, seek_key, seek_len);
+                tdb_iter_seek_for_prev_r(scan_iter, seek_key, seek_len);
                 if (find_flag == HA_READ_BEFORE_KEY && tidesdb_iter_valid(scan_iter))
                 {
                     uint8_t *ik = NULL;
                     size_t iks = 0;
                     if (tidesdb_iter_key(scan_iter, &ik, &iks) == TDB_SUCCESS &&
                         iks == seek_len && memcmp(ik, seek_key, iks) == 0)
-                        tidesdb_iter_prev(scan_iter);
+                        tdb_iter_prev_r(scan_iter);
                 }
             }
 
@@ -5905,7 +5905,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
         }
 
         /* Fallback is to seek forward */
-        tidesdb_iter_seek(scan_iter, seek_key, seek_len);
+        tdb_iter_seek_r(scan_iter, seek_key, seek_len);
         int ret = iter_read_current(buf);
         if (ret == 0) scan_dir_ = DIR_FORWARD;
         DBUG_RETURN(ret);
@@ -5954,7 +5954,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
             {
                 uchar seek_key[SPATIAL_HILBERT_KEY_LEN];
                 encode_hilbert_be(spatial_ranges_[0].first, seek_key);
-                tidesdb_iter_seek(scan_iter, seek_key, SPATIAL_HILBERT_KEY_LEN);
+                tdb_iter_seek_r(scan_iter, seek_key, SPATIAL_HILBERT_KEY_LEN);
             }
 
             DBUG_RETURN(spatial_scan_next(buf));
@@ -5966,19 +5966,19 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
 
         if (find_flag == HA_READ_KEY_EXACT || find_flag == HA_READ_KEY_OR_NEXT)
         {
-            tidesdb_iter_seek(scan_iter, comp_key, comp_len);
+            tdb_iter_seek_r(scan_iter, comp_key, comp_len);
         }
         else if (find_flag == HA_READ_AFTER_KEY)
         {
             /* We seek, then skip past any exact prefix matches */
-            tidesdb_iter_seek(scan_iter, comp_key, comp_len);
+            tdb_iter_seek_r(scan_iter, comp_key, comp_len);
             while (tidesdb_iter_valid(scan_iter))
             {
                 uint8_t *ik = NULL;
                 size_t iks = 0;
                 if (tidesdb_iter_key(scan_iter, &ik, &iks) != TDB_SUCCESS) break;
                 if (iks < comp_len || memcmp(ik, comp_key, comp_len) != 0) break;
-                tidesdb_iter_next(scan_iter);
+                tdb_iter_next_r(scan_iter);
             }
         }
         else if (find_flag == HA_READ_KEY_OR_PREV || find_flag == HA_READ_BEFORE_KEY ||
@@ -5989,11 +5989,11 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
             memcpy(upper, comp_key, comp_len);
             memset(upper + comp_len, KEY_INF_HI_BYTE, share->pk_key_len);
             uint upper_len = comp_len + share->pk_key_len;
-            tidesdb_iter_seek_for_prev(scan_iter, upper, upper_len);
+            tdb_iter_seek_for_prev_r(scan_iter, upper, upper_len);
         }
         else
         {
-            tidesdb_iter_seek(scan_iter, comp_key, comp_len);
+            tdb_iter_seek_r(scan_iter, comp_key, comp_len);
         }
 
         /* We read the current entry from the secondary index.
@@ -6029,9 +6029,9 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
             if (icp == CHECK_NEG)
             {
                 if (is_backward)
-                    tidesdb_iter_prev(scan_iter);
+                    tdb_iter_prev_r(scan_iter);
                 else
-                    tidesdb_iter_next(scan_iter);
+                    tdb_iter_next_r(scan_iter);
                 continue; /* skip this entry */
             }
             if (icp == CHECK_OUT_OF_RANGE) DBUG_RETURN(HA_ERR_END_OF_FILE);
@@ -6084,7 +6084,7 @@ int ha_tidesdb::index_next(uchar *buf)
     {
         int irc = ensure_scan_iter();
         if (irc) DBUG_RETURN(irc);
-        if (scan_dir_ != DIR_NONE) tidesdb_iter_next(scan_iter);
+        if (scan_dir_ != DIR_NONE) tdb_iter_next_r(scan_iter);
         DBUG_RETURN(spatial_scan_next(buf));
     }
 
@@ -6095,8 +6095,8 @@ int ha_tidesdb::index_next(uchar *buf)
         if (irc) DBUG_RETURN(irc);
         uchar seek_key[DATA_KEY_BUF_LEN];
         uint seek_len = build_data_key(current_pk_buf_, current_pk_len_, seek_key);
-        tidesdb_iter_seek(scan_iter, seek_key, seek_len);
-        if (tidesdb_iter_valid(scan_iter)) tidesdb_iter_next(scan_iter);
+        tdb_iter_seek_r(scan_iter, seek_key, seek_len);
+        if (tidesdb_iter_valid(scan_iter)) tdb_iter_next_r(scan_iter);
         /* iterator is now past the PK exact match -- advance+read below */
     }
     else
@@ -6107,7 +6107,7 @@ int ha_tidesdb::index_next(uchar *buf)
          * with no pre-advance).  On the first call after index_first
          * sets DIR_NONE, the iterator is already at the correct position
          * so we must not advance. */
-        if (scan_dir_ != DIR_NONE) tidesdb_iter_next(scan_iter);
+        if (scan_dir_ != DIR_NONE) tdb_iter_next_r(scan_iter);
     }
 
     if (is_pk_)
@@ -6136,7 +6136,7 @@ int ha_tidesdb::index_next(uchar *buf)
             check_result_t icp = icp_check_secondary(ik, iks, active_index, buf);
             if (icp == CHECK_NEG)
             {
-                tidesdb_iter_next(scan_iter);
+                tdb_iter_next_r(scan_iter);
                 continue;
             }
             if (icp == CHECK_OUT_OF_RANGE) DBUG_RETURN(HA_ERR_END_OF_FILE);
@@ -6169,7 +6169,7 @@ int ha_tidesdb::index_prev(uchar *buf)
         if (irc) DBUG_RETURN(irc);
         uchar seek_key[DATA_KEY_BUF_LEN];
         uint seek_len = build_data_key(current_pk_buf_, current_pk_len_, seek_key);
-        tidesdb_iter_seek(scan_iter, seek_key, seek_len);
+        tdb_iter_seek_r(scan_iter, seek_key, seek_len);
         /* iterator is at the matched key -- fall through to prev() */
     }
     else
@@ -6179,7 +6179,7 @@ int ha_tidesdb::index_prev(uchar *buf)
     }
 
     /* We advance backward past the last-read entry */
-    tidesdb_iter_prev(scan_iter);
+    tdb_iter_prev_r(scan_iter);
 
     if (is_pk_)
     {
@@ -6191,7 +6191,7 @@ int ha_tidesdb::index_prev(uchar *buf)
             if (tidesdb_iter_key(scan_iter, &key, &ks) != TDB_SUCCESS)
                 DBUG_RETURN(HA_ERR_END_OF_FILE);
             if (is_data_key(key, ks)) break;
-            tidesdb_iter_prev(scan_iter);
+            tdb_iter_prev_r(scan_iter);
         }
         scan_dir_ = DIR_BACKWARD;
         DBUG_RETURN(iter_read_current(buf));
@@ -6215,7 +6215,7 @@ int ha_tidesdb::index_prev(uchar *buf)
             check_result_t icp = icp_check_secondary(ik, iks, active_index, buf);
             if (icp == CHECK_NEG)
             {
-                tidesdb_iter_prev(scan_iter);
+                tdb_iter_prev_r(scan_iter);
                 continue;
             }
             if (icp == CHECK_OUT_OF_RANGE) DBUG_RETURN(HA_ERR_END_OF_FILE);
@@ -6244,14 +6244,14 @@ int ha_tidesdb::index_first(uchar *buf)
     {
         /* We seek to first data key */
         uint8_t data_prefix = KEY_NS_DATA;
-        tidesdb_iter_seek(scan_iter, &data_prefix, 1);
+        tdb_iter_seek_r(scan_iter, &data_prefix, 1);
         int ret = iter_read_current(buf);
         if (ret == 0) scan_dir_ = DIR_FORWARD;
         DBUG_RETURN(ret);
     }
     else
     {
-        tidesdb_iter_seek_to_first(scan_iter);
+        tdb_iter_seek_to_first_r(scan_iter);
         scan_dir_ = DIR_NONE; /* index_next will set DIR_FORWARD */
         DBUG_RETURN(index_next(buf));
     }
@@ -6267,7 +6267,7 @@ int ha_tidesdb::index_last(uchar *buf)
 
     if (is_pk_)
     {
-        tidesdb_iter_seek_to_last(scan_iter);
+        tdb_iter_seek_to_last_r(scan_iter);
         /* The last key might be a data key already, but skip backwards
            past any non-data keys just in case. */
         while (tidesdb_iter_valid(scan_iter))
@@ -6277,14 +6277,14 @@ int ha_tidesdb::index_last(uchar *buf)
             if (tidesdb_iter_key(scan_iter, &key, &ks) != TDB_SUCCESS)
                 DBUG_RETURN(HA_ERR_END_OF_FILE);
             if (is_data_key(key, ks)) break;
-            tidesdb_iter_prev(scan_iter);
+            tdb_iter_prev_r(scan_iter);
         }
         scan_dir_ = DIR_BACKWARD;
         DBUG_RETURN(iter_read_current(buf));
     }
     else
     {
-        tidesdb_iter_seek_to_last(scan_iter);
+        tdb_iter_seek_to_last_r(scan_iter);
         if (!tidesdb_iter_valid(scan_iter)) DBUG_RETURN(HA_ERR_END_OF_FILE);
 
         uint8_t *ik = NULL;
@@ -6309,7 +6309,7 @@ int ha_tidesdb::index_next_same(uchar *buf, const uchar *key, uint keylen)
     if (spatial_scan_active_)
     {
         if (!scan_iter) DBUG_RETURN(HA_ERR_END_OF_FILE);
-        tidesdb_iter_next(scan_iter);
+        tdb_iter_next_r(scan_iter);
         DBUG_RETURN(spatial_scan_next(buf));
     }
 
@@ -6327,7 +6327,7 @@ int ha_tidesdb::index_next_same(uchar *buf, const uchar *key, uint keylen)
         if (!scan_iter) DBUG_RETURN(HA_ERR_END_OF_FILE);
 
         /* We advance past the last-read entry */
-        tidesdb_iter_next(scan_iter);
+        tdb_iter_next_r(scan_iter);
         if (!tidesdb_iter_valid(scan_iter)) DBUG_RETURN(HA_ERR_END_OF_FILE);
 
         uint8_t *ik = NULL;
@@ -6347,7 +6347,7 @@ int ha_tidesdb::index_next_same(uchar *buf, const uchar *key, uint keylen)
 
     /* Secondary index -- we advance past the last-read entry, then ICP loop */
     if (!scan_iter) DBUG_RETURN(HA_ERR_END_OF_FILE);
-    tidesdb_iter_next(scan_iter);
+    tdb_iter_next_r(scan_iter);
 
     uint idx_col_len = share->idx_comp_key_len[active_index];
     for (;;)
@@ -6369,7 +6369,7 @@ int ha_tidesdb::index_next_same(uchar *buf, const uchar *key, uint keylen)
         check_result_t icp = icp_check_secondary(ik, iks, active_index, buf);
         if (icp == CHECK_NEG)
         {
-            tidesdb_iter_next(scan_iter);
+            tdb_iter_next_r(scan_iter);
             continue;
         }
         if (icp == CHECK_OUT_OF_RANGE) DBUG_RETURN(HA_ERR_END_OF_FILE);
@@ -7483,7 +7483,7 @@ int ha_tidesdb::multi_range_read_next(range_id_t *range_info)
         int irc = ensure_scan_iter();
         if (irc) DBUG_RETURN(irc);
 
-        tidesdb_iter_seek(scan_iter, (const uint8_t *)e.comp_key.data(), (uint)e.comp_key.size());
+        tdb_iter_seek_r(scan_iter, (const uint8_t *)e.comp_key.data(), (uint)e.comp_key.size());
         if (!tidesdb_iter_valid(scan_iter)) continue;
 
         uint8_t *ik = NULL;
@@ -7769,9 +7769,9 @@ int ha_tidesdb::analyze(THD *thd, HA_CHECK_OPT *check_opt)
         if (idx_prefix_len == 0) continue;
 
         tidesdb_iter_t *ait = NULL;
-        if (tidesdb_iter_new(stmt_txn, share->idx_cfs[i], &ait) != TDB_SUCCESS || !ait) continue;
+        if (tdb_iter_new_r(stmt_txn, share->idx_cfs[i], &ait) != TDB_SUCCESS || !ait) continue;
 
-        tidesdb_iter_seek_to_first(ait);
+        tdb_iter_seek_to_first_r(ait);
 
         static constexpr uint64_t ANALYZE_SAMPLE_LIMIT = 100000;
         uint64_t sampled = 0, distinct = 0;
@@ -7792,7 +7792,7 @@ int ha_tidesdb::analyze(THD *thd, HA_CHECK_OPT *check_opt)
                 memcpy(prev_prefix, ik, cmp_len);
             }
             sampled++;
-            tidesdb_iter_next(ait);
+            tdb_iter_next_r(ait);
         }
         tidesdb_iter_free(ait);
 
@@ -8239,7 +8239,7 @@ int ha_tidesdb::spatial_scan_next(uchar *buf)
 
             if (iks <= SPATIAL_HILBERT_KEY_LEN)
             {
-                tidesdb_iter_next(scan_iter);
+                tdb_iter_next_r(scan_iter);
                 continue;
             }
 
@@ -8253,7 +8253,7 @@ int ha_tidesdb::spatial_scan_next(uchar *buf)
             if (tidesdb_iter_value(scan_iter, &val, &vlen) != TDB_SUCCESS ||
                 vlen < SPATIAL_MBR_VALUE_LEN)
             {
-                tidesdb_iter_next(scan_iter);
+                tdb_iter_next_r(scan_iter);
                 continue;
             }
 
@@ -8270,7 +8270,7 @@ int ha_tidesdb::spatial_scan_next(uchar *buf)
             /* We apply MBR predicate */
             if (!spatial_mbr_predicate(spatial_mode_, &query_mbr, &entry_mbr))
             {
-                tidesdb_iter_next(scan_iter);
+                tdb_iter_next_r(scan_iter);
                 continue;
             }
 
@@ -8281,7 +8281,7 @@ int ha_tidesdb::spatial_scan_next(uchar *buf)
             int ret = fetch_row_by_pk(scan_txn, pk, pk_len, buf);
             if (ret == HA_ERR_KEY_NOT_FOUND)
             {
-                tidesdb_iter_next(scan_iter);
+                tdb_iter_next_r(scan_iter);
                 continue;
             }
             if (ret)
@@ -8299,7 +8299,7 @@ int ha_tidesdb::spatial_scan_next(uchar *buf)
         {
             uchar seek_key[SPATIAL_HILBERT_KEY_LEN];
             encode_hilbert_be(spatial_ranges_[spatial_range_idx_].first, seek_key);
-            tidesdb_iter_seek(scan_iter, seek_key, SPATIAL_HILBERT_KEY_LEN);
+            tdb_iter_seek_r(scan_iter, seek_key, SPATIAL_HILBERT_KEY_LEN);
         }
     }
 
@@ -8421,7 +8421,7 @@ FT_INFO *ha_tidesdb::ft_init_ext(uint flags, uint inx, String *key)
         std::vector<posting_entry> postings;
 
         tidesdb_iter_t *it = NULL;
-        int rc = tidesdb_iter_new(stmt_txn, share->idx_cfs[inx], &it);
+        int rc = tdb_iter_new_r(stmt_txn, share->idx_cfs[inx], &it);
         if (rc != TDB_SUCCESS || !it) continue;
 
         if (qt.trunc)
@@ -8443,7 +8443,7 @@ FT_INFO *ha_tidesdb::ft_init_ext(uint flags, uint inx, String *key)
                 memcpy(seek + FTS_TERM_LEN_PREFIX, qt.term.data(), qt.term.size());
                 uint seek_len = FTS_TERM_LEN_PREFIX + (uint)qt.term.size();
 
-                tidesdb_iter_seek(it, seek, seek_len);
+                tdb_iter_seek_r(it, seek, seek_len);
                 while (tidesdb_iter_valid(it))
                 {
                     uint8_t *ik = NULL;
@@ -8464,7 +8464,7 @@ FT_INFO *ha_tidesdb::ft_init_ext(uint flags, uint inx, String *key)
                     uint pk_off = FTS_TERM_LEN_PREFIX + stored_len;
                     if (iks <= pk_off)
                     {
-                        tidesdb_iter_next(it);
+                        tdb_iter_next_r(it);
                         continue;
                     }
                     std::string pk((char *)(ik + pk_off), iks - pk_off);
@@ -8475,7 +8475,7 @@ FT_INFO *ha_tidesdb::ft_init_ext(uint flags, uint inx, String *key)
                         postings.push_back({pk, (uint16)uint2korr(iv),
                                             (uint32)uint4korr(iv + FTS_VALUE_DOC_LEN_OFFSET)});
 
-                    tidesdb_iter_next(it);
+                    tdb_iter_next_r(it);
                 }
             }
             tidesdb_iter_free(it);
@@ -8483,7 +8483,7 @@ FT_INFO *ha_tidesdb::ft_init_ext(uint flags, uint inx, String *key)
         }
         else
         {
-            tidesdb_iter_seek(it, prefix, prefix_len);
+            tdb_iter_seek_r(it, prefix, prefix_len);
         }
 
         if (it) /* exact-match path (non-truncated) */
@@ -8504,7 +8504,7 @@ FT_INFO *ha_tidesdb::ft_init_ext(uint flags, uint inx, String *key)
                         postings.push_back({pk, (uint16)uint2korr(iv),
                                             (uint32)uint4korr(iv + FTS_VALUE_DOC_LEN_OFFSET)});
                 }
-                tidesdb_iter_next(it);
+                tdb_iter_next_r(it);
             }
         if (it) tidesdb_iter_free(it);
 

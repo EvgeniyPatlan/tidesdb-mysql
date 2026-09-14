@@ -322,7 +322,7 @@ bool ha_tidesdb::inplace_alter_table(
     }
 
     tidesdb_iter_t *iter = NULL;
-    rc = tidesdb_iter_new(txn, share->cf, &iter);
+    rc = tdb_iter_new_r(txn, share->cf, &iter);
     if (rc != TDB_SUCCESS || !iter)
     {
         tidesdb_txn_free(txn);
@@ -331,7 +331,7 @@ bool ha_tidesdb::inplace_alter_table(
         tmp_restore_column_map(altered_table->read_set, old_map);
         DBUG_RETURN(true);
     }
-    tidesdb_iter_seek_to_first(iter);
+    tdb_iter_seek_to_first_r(iter);
 
     ha_rows rows_processed = 0;
 
@@ -386,14 +386,14 @@ bool ha_tidesdb::inplace_alter_table(
         if (tidesdb_iter_key(iter, &key_data, &key_size) != TDB_SUCCESS ||
             tidesdb_iter_value(iter, &val_data, &val_size) != TDB_SUCCESS)
         {
-            tidesdb_iter_next(iter);
+            tdb_iter_next_r(iter);
             continue;
         }
 
         /* We skip non-data keys (meta namespace) */
         if (key_size < KEY_NAMESPACE_LEN || key_data[0] != KEY_NS_DATA)
         {
-            tidesdb_iter_next(iter);
+            tdb_iter_next_r(iter);
             continue;
         }
 
@@ -582,7 +582,7 @@ bool ha_tidesdb::inplace_alter_table(
                 }
             }
             iter = NULL;
-            rc = tidesdb_iter_new(txn, share->cf, &iter);
+            rc = tdb_iter_new_r(txn, share->cf, &iter);
             if (rc != TDB_SUCCESS || !iter)
             {
                 tidesdb_txn_free(txn);
@@ -592,17 +592,17 @@ bool ha_tidesdb::inplace_alter_table(
                 DBUG_RETURN(true);
             }
             /* We seek directly to the last processed key and advance past it */
-            int src = tidesdb_iter_seek(iter, last_data_key, last_data_key_len);
+            int src = tdb_iter_seek_r(iter, last_data_key, last_data_key_len);
             if (src != TDB_SUCCESS)
             {
                 sql_print_warning("[TIDESDB] inplace ADD INDEX: iter_seek failed rc=%d", src);
                 break; /* end scan gracefully */
             }
-            if (tidesdb_iter_valid(iter)) tidesdb_iter_next(iter);
+            if (tidesdb_iter_valid(iter)) tdb_iter_next_r(iter);
             continue; /* Don't call iter_next again */
         }
 
-        tidesdb_iter_next(iter);
+        tdb_iter_next_r(iter);
     }
 
     tidesdb_iter_free(iter);

@@ -39,6 +39,8 @@ extern "C"
 #include <tidesdb/db.h>
 }
 
+#include "storage/tidesdb/tidesdb_retry.h" /* tdb_*_r read wrappers */
+
 /* Per-table / per-index / per-field engine options. Definitions live
    here (promoted from ha_tidesdb.cc in the A-7 pass) so the inplace-
    alter TU can construct ha_table_option_struct and dereference

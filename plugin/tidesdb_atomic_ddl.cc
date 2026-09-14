@@ -19,6 +19,7 @@
 */
 
 #include "tidesdb_atomic_ddl.h"
+#include "tidesdb_retry.h"  /* tdb_*_r read wrappers */
 
 #include <atomic>
 #include <cstdint>
@@ -210,7 +211,7 @@ bool SdiStore::get(const sdi_key_t &k, void *out, uint64_t *len) {
     }
     uint8_t *val = nullptr;
     size_t val_len = 0;
-    rc = tidesdb_txn_get(txn, cf_, reinterpret_cast<const uint8_t *>(key.data()), key.size(), &val,
+    rc = tdb_txn_get_r(txn, cf_, reinterpret_cast<const uint8_t *>(key.data()), key.size(), &val,
                          &val_len);
     /* Reads do not need to be committed; rollback discards txn state cheaply. */
     tidesdb_txn_rollback(txn);
@@ -295,14 +296,14 @@ bool SdiStore::list_keys(sdi_vector_t &out) {
         return false;
     }
     tidesdb_iter_t *it = nullptr;
-    rc = tidesdb_iter_new(txn, cf_, &it);
+    rc = tdb_iter_new_r(txn, cf_, &it);
     if (rc != TDB_SUCCESS || !it) {
         sql_print_error("[TIDESDB] SdiStore::list_keys: iter_new rc=%d", rc);
         tidesdb_txn_rollback(txn);
         tidesdb_txn_free(txn);
         return false;
     }
-    tidesdb_iter_seek_to_first(it);
+    tdb_iter_seek_to_first_r(it);
     while (tidesdb_iter_valid(it)) {
         uint8_t *k = nullptr;
         size_t klen = 0;
@@ -319,7 +320,7 @@ bool SdiStore::list_keys(sdi_vector_t &out) {
         }
         /* Skip rows whose key isn't our fixed-length format. Defensive: should
            never happen unless something else wrote into this CF. */
-        tidesdb_iter_next(it);
+        tdb_iter_next_r(it);
     }
     tidesdb_iter_free(it);
     tidesdb_txn_rollback(txn);
