@@ -35,10 +35,8 @@ SET SESSION DEBUG = '+d,tidesdb_crash_mid_inplace_alter';
 --error 0,2013,CR_SERVER_LOST,CR_SERVER_GONE_ERROR
 ALTER TABLE tdb_ddl_t ADD INDEX idx_v (v);
 
---enable_reconnect
 --exec echo "restart" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --source include/wait_until_connected_again.inc
---disable_reconnect
 
 # After restart: original two-column schema preserved, the new index
 # is NOT present (the ALTER DD txn rolled back). Data intact.

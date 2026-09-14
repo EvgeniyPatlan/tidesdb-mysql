@@ -26,10 +26,8 @@ SET SESSION DEBUG = '+d,tidesdb_crash_after_dd_commit_before_cf_drop';
 --error 0,2013,CR_SERVER_LOST,CR_SERVER_GONE_ERROR
 DROP TABLE tdb_ddl_t;
 
---enable_reconnect
 --exec echo "restart" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --source include/wait_until_connected_again.inc
---disable_reconnect
 
 SET GLOBAL log_error_verbosity = 3;
 SET GLOBAL tidesdb_orphan_action = 'quarantine';
