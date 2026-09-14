@@ -1,4 +1,5 @@
 --source suite/tidesdb/include/tidesdb_perf_helpers.inc
+--source suite/tidesdb/include/have_tidesdb_perf.inc
 
 SET @save_output_dir = @@global.tidesdb_perf_output_dir;
 SET GLOBAL tidesdb_perf_output_dir = '/tmp/perf-test-growth';

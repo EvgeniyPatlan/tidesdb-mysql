@@ -23,7 +23,13 @@ CREATE TABLE tdb_ddl_t (id INT PRIMARY KEY) ENGINE=TIDESDB;
 SET @@global.DEBUG = '+d,tidesdb_fail_after_sdi_del';
 SELECT @@global.DEBUG LIKE '%tidesdb_fail_after_sdi_del%' AS armed;
 
---error ER_GET_ERRNO,ER_UNKNOWN_ERROR
+# MySQL 9.7 surfaces a handler-refused DROP as ER_ENGINE_CANT_DROP_TABLE
+# (3604) from sql_table.cc, which is more specific than the generic
+# wrappers this list originally carried. Keep the older codes: which one
+# reaches the client depends on the path the SQL layer takes, and all
+# three prove the same thing -- prepare_drop returned false and the DROP
+# was refused.
+--error ER_GET_ERRNO,ER_UNKNOWN_ERROR,ER_ENGINE_CANT_DROP_TABLE
 DROP TABLE tdb_ddl_t;
 
 SET @@global.DEBUG = '';

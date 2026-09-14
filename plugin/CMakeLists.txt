@@ -19,8 +19,16 @@
 # the TIDESDB_PERF environment variable (the latter is what scripts/build-plugin.sh
 # forwards via -e TIDESDB_PERF=1).
 OPTION(TIDESDB_PERF "Compile in TidesDB perf instrumentation" OFF)
-IF(DEFINED ENV{TIDESDB_PERF} AND NOT "$ENV{TIDESDB_PERF}" STREQUAL "0")
-    SET(TIDESDB_PERF ON CACHE BOOL "" FORCE)
+# TIDESDB_PERF=0 must be able to turn the option back OFF, not just fail to
+# turn it ON. OPTION() does not override an existing cache entry, so a tree
+# once configured with TIDESDB_PERF=1 stayed perf-instrumented on every later
+# build -- including one intended to produce a default artifact.
+IF(DEFINED ENV{TIDESDB_PERF})
+    IF("$ENV{TIDESDB_PERF}" STREQUAL "0")
+        SET(TIDESDB_PERF OFF CACHE BOOL "" FORCE)
+    ELSE()
+        SET(TIDESDB_PERF ON CACHE BOOL "" FORCE)
+    ENDIF()
 ENDIF()
 IF(TIDESDB_PERF)
     ADD_COMPILE_DEFINITIONS(TIDESDB_PERF=1)

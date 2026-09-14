@@ -127,13 +127,17 @@ DROP TABLE t_auto;
 SELECT IF(VARIABLE_VALUE >= 0, 'ok', 'bad') AS total
 FROM performance_schema.global_status WHERE VARIABLE_NAME='TIDESDB_TOTAL_TOMBSTONES';
 total
+ok
 SELECT IF(VARIABLE_VALUE >= 0, 'ok', 'bad') AS ratio
 FROM performance_schema.global_status WHERE VARIABLE_NAME='TIDESDB_TOMBSTONE_RATIO';
 ratio
+ok
 SELECT IF(VARIABLE_VALUE >= 0, 'ok', 'bad') AS density
 FROM performance_schema.global_status WHERE VARIABLE_NAME='TIDESDB_MAX_SST_TOMBSTONE_DENSITY';
 density
+ok
 SELECT IF(VARIABLE_VALUE >= 0, 'ok', 'bad') AS density_level
 FROM performance_schema.global_status WHERE VARIABLE_NAME='TIDESDB_MAX_SST_TOMBSTONE_DENSITY_LEVEL';
 density_level
+ok
 # Done.

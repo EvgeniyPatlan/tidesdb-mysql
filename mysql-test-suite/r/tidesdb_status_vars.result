@@ -4,7 +4,7 @@
 SELECT COUNT(*) >= 19 AS has_all_vars FROM performance_schema.global_status
 WHERE VARIABLE_NAME LIKE 'TIDESDB%';
 has_all_vars
-0
+1
 #
 # TEST 2: Variables have reasonable values after table operations
 #
@@ -18,18 +18,47 @@ SHOW ENGINE TIDESDB STATUS;
 SELECT VARIABLE_VALUE > 0 AS cf_positive FROM performance_schema.global_status
 WHERE VARIABLE_NAME = 'TIDESDB_COLUMN_FAMILIES';
 cf_positive
+1
 SELECT VARIABLE_VALUE > 0 AS mem_positive FROM performance_schema.global_status
 WHERE VARIABLE_NAME = 'TIDESDB_MEMORY_LIMIT';
 mem_positive
+1
 SELECT VARIABLE_VALUE > 0 AS parts_positive FROM performance_schema.global_status
 WHERE VARIABLE_NAME = 'TIDESDB_CACHE_PARTITIONS';
 parts_positive
+1
 #
 # TEST 3: All variable names are correct
 #
 SELECT VARIABLE_NAME FROM performance_schema.global_status
 WHERE VARIABLE_NAME LIKE 'TIDESDB%' ORDER BY VARIABLE_NAME;
 VARIABLE_NAME
+tidesdb_cache_bytes
+tidesdb_cache_entries
+tidesdb_cache_hit_rate
+tidesdb_cache_hits
+tidesdb_cache_misses
+tidesdb_cache_partitions
+tidesdb_column_families
+tidesdb_compaction_queue
+tidesdb_data_size_bytes
+tidesdb_flush_pending
+tidesdb_flush_queue
+tidesdb_global_sequence
+tidesdb_immutable_memtables
+tidesdb_max_sst_tombstone_density
+tidesdb_max_sst_tombstone_density_level
+tidesdb_memory_limit
+tidesdb_memory_pressure
+tidesdb_memtable_bytes
+tidesdb_open_sstables
+tidesdb_perf_compiled
+tidesdb_tombstone_ratio
+tidesdb_total_sstables
+tidesdb_total_tombstones
+tidesdb_txn_memory_bytes
+tidesdb_version
+tidesdb_version_hex
 #
 # Cleanup
 #

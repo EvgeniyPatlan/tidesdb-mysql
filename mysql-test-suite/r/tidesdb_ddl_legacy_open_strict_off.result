@@ -6,6 +6,7 @@ FLUSH TABLES tdb_ddl_t;
 SELECT COUNT(*) AS rows_ok FROM tdb_ddl_t;
 rows_ok
 0
+SHOW WARNINGS;
 SET @@global.DEBUG = '';
 SET GLOBAL tidesdb_atomic_ddl_strict = @save_strict;
 DROP TABLE tdb_ddl_t;

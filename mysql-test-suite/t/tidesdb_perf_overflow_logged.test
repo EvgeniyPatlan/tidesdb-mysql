@@ -11,6 +11,7 @@ if (!$perf_present) {
 # it. ring_capacity_pow2 is read-only at runtime so a restart is required.
 let $restart_parameters = restart: --tidesdb_perf_ring_capacity_pow2=8;
 --source include/restart_mysqld.inc
+--source suite/tidesdb/include/have_tidesdb_perf.inc
 
 # Session vars are lost across restart -- re-establish the helper state.
 SET @save_capture = @@global.tidesdb_perf_capture;

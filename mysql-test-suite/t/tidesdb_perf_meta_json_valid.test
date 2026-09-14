@@ -1,4 +1,5 @@
 --source suite/tidesdb/include/tidesdb_perf_helpers.inc
+--source suite/tidesdb/include/have_tidesdb_perf.inc
 
 SET @save_output_dir = @@global.tidesdb_perf_output_dir;
 SET GLOBAL tidesdb_perf_output_dir = '/tmp/perf-test-meta';
@@ -14,8 +15,33 @@ SET GLOBAL tidesdb_perf_capture = OFF;
 
 # Validate meta.json schema + value ranges. tsc_ghz parsed as float in
 # [0.5, 6.0]; capacity matches the runtime sysvar (default pow2=16 -> 65536);
-# method_count is the compile-time constant 32; format_version is 1.
---exec python3 -c "import json,glob; d=json.load(open(glob.glob('/tmp/perf-test-meta/*-meta.json')[0])); assert 0.5 <= d['tsc_ghz'] <= 6.0, d; assert d['capacity'] == 65536, d; assert d['method_count'] == 32, d; assert d['format_version'] == 1, d; print('meta OK')"
+# method_count is the compile-time constant kMethodCount (32,
+# plugin/tidesdb_perf_scope.h); format_version is 1.
+#
+# Done in perl, not python3. mysqltest guarantees perl -- mysql-test-run is
+# itself perl -- whereas python3 is installed in neither tides-builder nor
+# the tidesdb/mysql-mtr image, so the previous --exec python3 line exited
+# 127 (command not found) and failed the test everywhere it could run. The
+# fields are flat scalars, so matching them does not need a JSON module.
+--perl
+use strict;
+use warnings;
+my ($f) = glob("/tmp/perf-test-meta/*-meta.json");
+die "no *-meta.json in /tmp/perf-test-meta\n" unless defined $f;
+open(my $fh, "<", $f) or die "cannot open $f: $!\n";
+my $j = do { local $/; <$fh> };
+close $fh;
+my ($tsc) = $j =~ /"tsc_ghz"\s*:\s*([0-9.]+)/;
+my ($cap) = $j =~ /"capacity"\s*:\s*(\d+)/;
+my ($mc)  = $j =~ /"method_count"\s*:\s*(\d+)/;
+my ($fv)  = $j =~ /"format_version"\s*:\s*(\d+)/;
+die "tsc_ghz missing or out of range [0.5,6.0]: $j\n"
+    unless defined $tsc && $tsc >= 0.5 && $tsc <= 6.0;
+die "capacity != 65536: $j\n"        unless defined $cap && $cap == 65536;
+die "method_count != 32: $j\n"       unless defined $mc  && $mc  == 32;
+die "format_version != 1: $j\n"      unless defined $fv  && $fv  == 1;
+print "meta OK\n";
+EOF
 
 DROP TABLE t;
 SET GLOBAL tidesdb_perf_output_dir = @save_output_dir;

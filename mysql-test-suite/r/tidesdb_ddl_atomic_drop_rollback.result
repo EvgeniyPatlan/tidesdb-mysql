@@ -4,7 +4,7 @@ SELECT @@global.DEBUG LIKE '%tidesdb_fail_after_sdi_del%' AS armed;
 armed
 1
 DROP TABLE tdb_ddl_t;
-ERROR HY000: Got error 168 - 'Unknown (generic) error from engine' from storage engine
+Got one of the listed errors
 SET @@global.DEBUG = '';
 SELECT COUNT(*) AS dd_rows FROM information_schema.TABLES
 WHERE TABLE_SCHEMA='test' AND TABLE_NAME='tdb_ddl_t';
