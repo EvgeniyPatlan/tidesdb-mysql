@@ -19,6 +19,7 @@
 */
 
 #include "tidesdb_atomic_ddl.h"
+#include "storage/tidesdb/tidesdb_owned_buf.h"
 #include "tidesdb_retry.h"  /* tdb_*_r read wrappers */
 
 #include <atomic>
@@ -309,6 +310,7 @@ bool SdiStore::list_keys(sdi_vector_t &out) {
     tdb_iter_seek_to_first_r(it);
     while (tidesdb_iter_valid(it)) {
         uint8_t *k = nullptr;
+        TdbFreeGuard k_guard(&k);
         size_t klen = 0;
         if (tidesdb_iter_key(it, &k, &klen) != TDB_SUCCESS || !k) break;
         if (klen == kSdiPackedKeyLen) {

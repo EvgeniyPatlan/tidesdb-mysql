@@ -1,0 +1,51 @@
+#
+# The configuration surface still exists, so an old my.cnf gets an
+# explanation rather than an unknown-variable error
+#
+SELECT VARIABLE_NAME FROM performance_schema.global_variables
+WHERE VARIABLE_NAME IN (
+'tidesdb_object_store_backend',
+'tidesdb_s3_endpoint',
+'tidesdb_s3_bucket',
+'tidesdb_s3_prefix',
+'tidesdb_s3_access_key',
+'tidesdb_s3_region',
+'tidesdb_s3_path_style',
+'tidesdb_objstore_wal_sync_on_commit',
+'tidesdb_replica_mode',
+'tidesdb_promote_primary')
+ORDER BY VARIABLE_NAME;
+VARIABLE_NAME
+tidesdb_object_store_backend
+tidesdb_objstore_wal_sync_on_commit
+tidesdb_promote_primary
+tidesdb_replica_mode
+tidesdb_s3_bucket
+tidesdb_s3_endpoint
+tidesdb_s3_path_style
+tidesdb_s3_prefix
+tidesdb_s3_region
+#
+# They are start-time only, so a runtime SET is refused by the server
+#
+SET GLOBAL tidesdb_s3_bucket = 'anything';
+ERROR HY000: Variable 'tidesdb_s3_bucket' is a read only variable
+SET GLOBAL tidesdb_object_store_backend = 'S3';
+ERROR HY000: Variable 'tidesdb_object_store_backend' is a read only variable
+#
+# tidesdb_promote_primary is settable, and refused with the reason
+#
+SET GLOBAL tidesdb_promote_primary = ON;
+ERROR HY000: [TIDESDB] tidesdb_promote_primary is no longer supported: object-store replication was removed from the engine in TidesDB 10
+#
+# A table behaves normally -- there is no object-store path left to take
+#
+CREATE TABLE t_obj (id INT NOT NULL PRIMARY KEY, name VARCHAR(100)) ENGINE=TidesDB;
+INSERT INTO t_obj VALUES (1,'alpha'), (2,'beta'), (3,'gamma');
+SELECT id, name FROM t_obj ORDER BY id;
+id	name
+1	alpha
+2	beta
+3	gamma
+DROP TABLE t_obj;
+# Done.

@@ -35,6 +35,16 @@ OUT="$BENCH/results/hammerdb-$TS"; mkdir -p "$OUT"
 NET="hdbnet-$$"; DB="hdb-db-$$"; CLI="hdb-cli-$$"
 
 cleanup(){ docker rm -f "$CLI" >/dev/null 2>&1 || true
+           # Save the server's own log before the container goes. When a run
+           # ends with "Lost connection to MySQL server", this is the only
+           # place the reason exists -- and discarding it meant a crash under
+           # load looked identical to a throughput miss.
+           docker logs "$DB" > "$OUT/db-server.log" 2>&1 || true
+           if grep -qE "signal [0-9]+|Assertion .* failed|mysqld got signal" "$OUT/db-server.log" 2>/dev/null; then
+             echo "[hdb] *** the database server CRASHED during this run ***" >&2
+             echo "[hdb]     see $OUT/db-server.log" >&2
+             grep -nE "signal [0-9]+|Assertion .* failed|TIDESDB.*(ERROR|error)" "$OUT/db-server.log" 2>/dev/null | tail -5 >&2
+           fi
            if [ "${KEEP_DB:-0}" = 1 ]; then
              echo "[hdb] KEEP_DB=1 -- leaving DB container '$DB' (net '$NET') up for manual inspection" >&2
              echo "[hdb]   docker exec -i $DB mysql -uroot   then: USE tpcc; ..." >&2

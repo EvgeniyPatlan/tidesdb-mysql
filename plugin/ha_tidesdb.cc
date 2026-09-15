@@ -18,6 +18,7 @@
 #include "storage/tidesdb/tidesdb_legacy_options.h"
 #include "storage/tidesdb/tidesdb_xid.h"
 #include "storage/tidesdb/tidesdb_datadir_version.h"
+#include "storage/tidesdb/tidesdb_owned_buf.h"
 
 extern "C"
 {
@@ -3142,6 +3143,7 @@ static void schema_cf_delete_db(const std::string &db_name)
     while (tidesdb_iter_valid(it))
     {
         uint8_t *k = NULL;
+        TdbFreeGuard k_guard(&k);
         size_t klen = 0;
         if (tidesdb_iter_key(it, &k, &klen) != TDB_SUCCESS) break;
         if (klen < prefix.size() || memcmp(k, prefix.data(), prefix.size()) != 0) break;
@@ -3241,6 +3243,7 @@ static void schema_cf_ensure_databases()
     while (tidesdb_iter_valid(iter))
     {
         uint8_t *kp = NULL;
+        TdbFreeGuard kp_guard(&kp);
         size_t klen = 0;
         if (tidesdb_iter_key(iter, &kp, &klen) != TDB_SUCCESS || !kp) break;
 
@@ -4553,6 +4556,7 @@ void ha_tidesdb::recover_counters()
         if (tidesdb_iter_valid(iter))
         {
             uint8_t *key = NULL;
+            TdbFreeGuard key_guard(&key);
             size_t key_size = 0;
             if (tidesdb_iter_key(iter, &key, &key_size) == TDB_SUCCESS &&
                 is_data_key(key, key_size))
@@ -4569,6 +4573,7 @@ void ha_tidesdb::recover_counters()
                     /* User PK with AUTO_INCREMENT -- we read the last row to seed
                        the in-memory counter from the max PK value. */
                     uint8_t *val = NULL;
+                    TdbFreeGuard val_guard(&val);
                     size_t val_size = 0;
                     if (tidesdb_iter_value(iter, &val, &val_size) == TDB_SUCCESS)
                     {
@@ -5490,8 +5495,10 @@ int ha_tidesdb::iter_read_current(uchar *buf)
     while (scan_iter && tidesdb_iter_valid(scan_iter))
     {
         uint8_t *key = NULL;
+        TdbFreeGuard key_guard(&key);
         size_t key_size = 0;
         uint8_t *value = NULL;
+        TdbFreeGuard value_guard(&value);
         size_t value_size = 0;
         if (tidesdb_iter_key_value(scan_iter, &key, &key_size, &value, &value_size) != TDB_SUCCESS)
             return HA_ERR_END_OF_FILE;
@@ -5732,6 +5739,7 @@ int ha_tidesdb::write_row(uchar *buf)
             if (tidesdb_iter_valid(dup_iter))
             {
                 uint8_t *fk = NULL;
+                TdbFreeGuard fk_guard(&fk);
                 size_t fks = 0;
                 if (tidesdb_iter_key(dup_iter, &fk, &fks) == TDB_SUCCESS && fks >= idx_prefix_len &&
                     memcmp(fk, idx_prefix, idx_prefix_len) == 0)
@@ -6280,6 +6288,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
             {
                 /* We skip exact match if present */
                 uint8_t *ik = NULL;
+                TdbFreeGuard ik_guard(&ik);
                 size_t iks = 0;
                 if (tidesdb_iter_key(scan_iter, &ik, &iks) == TDB_SUCCESS && iks == seek_len &&
                     memcmp(ik, seek_key, iks) == 0)
@@ -6321,6 +6330,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
                 if (find_flag == HA_READ_PREFIX_LAST && tidesdb_iter_valid(scan_iter))
                 {
                     uint8_t *ik = NULL;
+                    TdbFreeGuard ik_guard(&ik);
                     size_t iks = 0;
                     if (tidesdb_iter_key(scan_iter, &ik, &iks) != TDB_SUCCESS ||
                         iks < seek_len || memcmp(ik, seek_key, seek_len) != 0)
@@ -6333,6 +6343,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
                 if (find_flag == HA_READ_BEFORE_KEY && tidesdb_iter_valid(scan_iter))
                 {
                     uint8_t *ik = NULL;
+                    TdbFreeGuard ik_guard(&ik);
                     size_t iks = 0;
                     if (tidesdb_iter_key(scan_iter, &ik, &iks) == TDB_SUCCESS &&
                         iks == seek_len && memcmp(ik, seek_key, iks) == 0)
@@ -6416,6 +6427,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
             while (tidesdb_iter_valid(scan_iter))
             {
                 uint8_t *ik = NULL;
+                TdbFreeGuard ik_guard(&ik);
                 size_t iks = 0;
                 if (tidesdb_iter_key(scan_iter, &ik, &iks) != TDB_SUCCESS) break;
                 if (iks < comp_len || memcmp(ik, comp_key, comp_len) != 0) break;
@@ -6452,6 +6464,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
             if (!tidesdb_iter_valid(scan_iter)) DBUG_RETURN(HA_ERR_KEY_NOT_FOUND);
 
             uint8_t *ik = NULL;
+            TdbFreeGuard ik_guard(&ik);
             size_t iks = 0;
             if (tidesdb_iter_key(scan_iter, &ik, &iks) != TDB_SUCCESS)
                 DBUG_RETURN(HA_ERR_KEY_NOT_FOUND);
@@ -6567,6 +6580,7 @@ int ha_tidesdb::index_next(uchar *buf)
             if (!tidesdb_iter_valid(scan_iter)) DBUG_RETURN(HA_ERR_END_OF_FILE);
 
             uint8_t *ik = NULL;
+            TdbFreeGuard ik_guard(&ik);
             size_t iks = 0;
             if (tidesdb_iter_key(scan_iter, &ik, &iks) != TDB_SUCCESS)
                 DBUG_RETURN(HA_ERR_END_OF_FILE);
@@ -6628,6 +6642,7 @@ int ha_tidesdb::index_prev(uchar *buf)
         while (tidesdb_iter_valid(scan_iter))
         {
             uint8_t *key = NULL;
+            TdbFreeGuard key_guard(&key);
             size_t ks = 0;
             if (tidesdb_iter_key(scan_iter, &key, &ks) != TDB_SUCCESS)
                 DBUG_RETURN(HA_ERR_END_OF_FILE);
@@ -6646,6 +6661,7 @@ int ha_tidesdb::index_prev(uchar *buf)
             if (!tidesdb_iter_valid(scan_iter)) DBUG_RETURN(HA_ERR_END_OF_FILE);
 
             uint8_t *ik = NULL;
+            TdbFreeGuard ik_guard(&ik);
             size_t iks = 0;
             if (tidesdb_iter_key(scan_iter, &ik, &iks) != TDB_SUCCESS)
                 DBUG_RETURN(HA_ERR_END_OF_FILE);
@@ -6714,6 +6730,7 @@ int ha_tidesdb::index_last(uchar *buf)
         while (tidesdb_iter_valid(scan_iter))
         {
             uint8_t *key = NULL;
+            TdbFreeGuard key_guard(&key);
             size_t ks = 0;
             if (tidesdb_iter_key(scan_iter, &key, &ks) != TDB_SUCCESS)
                 DBUG_RETURN(HA_ERR_END_OF_FILE);
@@ -6729,6 +6746,7 @@ int ha_tidesdb::index_last(uchar *buf)
         if (!tidesdb_iter_valid(scan_iter)) DBUG_RETURN(HA_ERR_END_OF_FILE);
 
         uint8_t *ik = NULL;
+        TdbFreeGuard ik_guard(&ik);
         size_t iks = 0;
         if (tidesdb_iter_key(scan_iter, &ik, &iks) != TDB_SUCCESS) DBUG_RETURN(HA_ERR_END_OF_FILE);
 
@@ -6772,6 +6790,7 @@ int ha_tidesdb::index_next_same(uchar *buf, const uchar *key, uint keylen)
         if (!tidesdb_iter_valid(scan_iter)) DBUG_RETURN(HA_ERR_END_OF_FILE);
 
         uint8_t *ik = NULL;
+        TdbFreeGuard ik_guard(&ik);
         size_t iks = 0;
         if (tidesdb_iter_key(scan_iter, &ik, &iks) != TDB_SUCCESS) DBUG_RETURN(HA_ERR_END_OF_FILE);
 
@@ -6796,6 +6815,7 @@ int ha_tidesdb::index_next_same(uchar *buf, const uchar *key, uint keylen)
         if (!tidesdb_iter_valid(scan_iter)) DBUG_RETURN(HA_ERR_END_OF_FILE);
 
         uint8_t *ik = NULL;
+        TdbFreeGuard ik_guard(&ik);
         size_t iks = 0;
         if (tidesdb_iter_key(scan_iter, &ik, &iks) != TDB_SUCCESS) DBUG_RETURN(HA_ERR_END_OF_FILE);
 
@@ -7925,6 +7945,7 @@ int ha_tidesdb::multi_range_read_next(range_id_t *range_info)
         if (!tidesdb_iter_valid(scan_iter)) continue;
 
         uint8_t *ik = NULL;
+        TdbFreeGuard ik_guard(&ik);
         size_t iks = 0;
         if (tidesdb_iter_key(scan_iter, &ik, &iks) != TDB_SUCCESS) continue;
         if (iks < e.comp_key.size() || memcmp(ik, e.comp_key.data(), e.comp_key.size()) != 0)
@@ -8243,6 +8264,7 @@ int ha_tidesdb::analyze(THD *thd, HA_CHECK_OPT *check_opt)
         while (tidesdb_iter_valid(ait) && sampled < ANALYZE_SAMPLE_LIMIT)
         {
             uint8_t *ik = NULL;
+            TdbFreeGuard ik_guard(&ik);
             size_t iks = 0;
             if (tidesdb_iter_key(ait, &ik, &iks) != TDB_SUCCESS) break;
 
@@ -8677,6 +8699,7 @@ int ha_tidesdb::spatial_scan_next(uchar *buf)
             if (cached_thd_ && thd_killed(cached_thd_)) DBUG_RETURN(HA_ERR_ABORTED_BY_USER);
 
             uint8_t *ik = NULL;
+            TdbFreeGuard ik_guard(&ik);
             size_t iks = 0;
             if (tidesdb_iter_key(scan_iter, &ik, &iks) != TDB_SUCCESS) break;
 
@@ -8692,6 +8715,7 @@ int ha_tidesdb::spatial_scan_next(uchar *buf)
 
             /* We read stored MBR from value */
             uint8_t *val = NULL;
+            TdbFreeGuard val_guard(&val);
             size_t vlen = 0;
             if (tidesdb_iter_value(scan_iter, &val, &vlen) != TDB_SUCCESS ||
                 vlen < SPATIAL_MBR_VALUE_LEN)
@@ -8890,6 +8914,7 @@ FT_INFO *ha_tidesdb::ft_init_ext(uint flags, uint inx, String *key)
                 while (tidesdb_iter_valid(it))
                 {
                     uint8_t *ik = NULL;
+                    TdbFreeGuard ik_guard(&ik);
                     size_t iks = 0;
                     if (tidesdb_iter_key(it, &ik, &iks) != TDB_SUCCESS) break;
 
@@ -8913,6 +8938,7 @@ FT_INFO *ha_tidesdb::ft_init_ext(uint flags, uint inx, String *key)
                     std::string pk((char *)(ik + pk_off), iks - pk_off);
 
                     uint8_t *iv = NULL;
+                    TdbFreeGuard iv_guard(&iv);
                     size_t ivs = 0;
                     if (tidesdb_iter_value(it, &iv, &ivs) == TDB_SUCCESS && ivs >= FTS_VALUE_LEN)
                         postings.push_back({pk, (uint16)uint2korr(iv),
@@ -8933,6 +8959,7 @@ FT_INFO *ha_tidesdb::ft_init_ext(uint flags, uint inx, String *key)
             while (tidesdb_iter_valid(it))
             {
                 uint8_t *ik = NULL;
+                TdbFreeGuard ik_guard(&ik);
                 size_t iks = 0;
                 if (tidesdb_iter_key(it, &ik, &iks) != TDB_SUCCESS) break;
 
@@ -8942,6 +8969,7 @@ FT_INFO *ha_tidesdb::ft_init_ext(uint flags, uint inx, String *key)
                     std::string pk((char *)(ik + prefix_len), iks - prefix_len);
 
                     uint8_t *iv = NULL;
+                    TdbFreeGuard iv_guard(&iv);
                     size_t ivs = 0;
                     if (tidesdb_iter_value(it, &iv, &ivs) == TDB_SUCCESS && ivs >= FTS_VALUE_LEN)
                         postings.push_back({pk, (uint16)uint2korr(iv),

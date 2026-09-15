@@ -36,6 +36,7 @@
  */
 
 #include "ha_tidesdb.h"
+#include "storage/tidesdb/tidesdb_owned_buf.h"
 
 #include <mysql/plugin.h>
 
@@ -394,8 +395,10 @@ bool ha_tidesdb::inplace_alter_table(
     while (tidesdb_iter_valid(iter))
     {
         uint8_t *key_data = NULL;
+        TdbFreeGuard key_data_guard(&key_data);
         size_t key_size = 0;
         uint8_t *val_data = NULL;
+        TdbFreeGuard val_data_guard(&val_data);
         size_t val_size = 0;
 
         if (tidesdb_iter_key(iter, &key_data, &key_size) != TDB_SUCCESS ||
