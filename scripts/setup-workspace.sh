@@ -38,7 +38,18 @@ mkdir -p vendor
 # that shows up as test failures with no visible cause. Patches already
 # present are skipped rather than reapplied, so this is safe to re-run.
 apply_engine_patches() {
-    local tree="$1" p
+    local tree="$1" p have
+    # Patches are written against the pinned tag. A tree at some other version
+    # is not a broken workspace -- TIDESDB_SRC_DIR exists precisely so a second
+    # engine version can sit beside the pinned one -- so say what is being
+    # skipped and why rather than failing on a patch that was never meant for
+    # this source.
+    have=$(git -C "$tree" describe --tags --exact-match 2>/dev/null \
+           || git -C "$tree" describe --tags 2>/dev/null || echo "")
+    if [ -n "$have" ] && [ "$have" != "$TIDESDB_TAG" ]; then
+        echo "[setup] $tree is $have, not the pinned $TIDESDB_TAG -- skipping engine patches"
+        return 0
+    fi
     shopt -s nullglob
     local patches=("$REPO"/docker/patches/tidesdb/*.patch)
     shopt -u nullglob
