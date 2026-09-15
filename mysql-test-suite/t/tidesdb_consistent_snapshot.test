@@ -65,6 +65,47 @@ SELECT * FROM t_snap64 ORDER BY a;
 
 COMMIT;
 
+--echo # ---- TEST 4: the snapshot survives compaction of the versions it reads ----
+#
+# The interesting part of a consistent snapshot is not only that later writes
+# stay invisible, but that the versions it still needs are not reclaimed out
+# from under it. A transaction at snapshot isolation joins the engine's live
+# transaction registry, and the compaction scheduler takes its gc floor from
+# the oldest snapshot in that registry -- so an open transaction holds the
+# floor down by itself, which is what a separately named snapshot object would
+# otherwise be for.
+#
+# This drives it as far as SQL can: the reader opens a snapshot and the writer
+# then deletes every row the reader can see and replaces them. If the versions
+# were reclaimed the reader would see the wrong answer -- most likely rows
+# missing -- rather than the four it started with.
+#
+# Forcing a compaction here is not possible from SQL: OPTIMIZE TABLE needs a
+# metadata lock the reader's open transaction holds, so it blocks until the
+# reader commits, by which point there is nothing left to prove. The
+# reclamation half of the property is argued from where the scheduler reads
+# its floor (engine_compaction.c takes gc_floor from
+# tidesdb_txn_registry_min_snapshot) rather than driven from here.
+
+connection default;
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION WITH CONSISTENT SNAPSHOT;
+--echo # reader sees the four rows written so far
+SELECT COUNT(*) AS rows_at_snapshot FROM t_snap64;
+
+connection con2;
+DELETE FROM t_snap64;
+INSERT INTO t_snap64 (a, b) VALUES (90, 900), (91, 910), (92, 920);
+
+connection default;
+--echo # still the snapshot's four rows, not the writer's three
+SELECT COUNT(*) AS rows_after_writer FROM t_snap64;
+SELECT * FROM t_snap64 ORDER BY a;
+COMMIT;
+
+--echo # after COMMIT the writer's rows are what is there
+SELECT * FROM t_snap64 ORDER BY a;
+
 --echo # Cleanup
 connection con2;
 disconnect con2;
