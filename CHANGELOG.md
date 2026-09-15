@@ -62,8 +62,10 @@ All notable changes to this project will be documented in this file.
   because the engine's reservation table refuses a hash collision as a conflict
   whenever the colliding slot is newer than the oldest live snapshot — routine
   once several writers are running. A client that does not retry the statement
-  stops there. Ordinary OLTP is unaffected. Load with one connection, or retry
-  on error 1213 / 1180. Full write-up and reproducer in
+  stops there. Concurrent OLTP also takes a large volume of spurious conflicts
+  (measured: 4380 in a 3-minute 8-connection TPC-C run, against 1 on v0.4.1);
+  clients that retry absorb them. Load with one connection, and retry on error
+  1213 / 1180. Full write-up and reproducer in
   [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
 ### Fixed

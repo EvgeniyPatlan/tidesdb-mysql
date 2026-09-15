@@ -117,14 +117,28 @@ caught it immediately.
 
 **What this means in practice.**
 
-- Ordinary OLTP is unaffected. Reservations only fire at `SNAPSHOT` isolation
-  and above, and a single connection committing in a loop no longer takes
-  false conflicts at all since the patch above.
-- Multi-threaded bulk loading is affected: `mysqlslap --concurrency`, a
-  parallel `mysqldump` restore, a TPC-C loader, any `LOAD DATA` fan-out.
-- **Mitigation:** load with a single connection, or use a client that retries
-  a statement on `ER_LOCK_DEADLOCK` (1213) / error 1180. The data is never
-  wrong -- the transaction is aborted cleanly and nothing partial is kept.
+- **Single-connection work is unaffected.** Reservations only fire at
+  `SNAPSHOT` isolation and above, and one connection committing in a loop no
+  longer takes false conflicts at all since the patch above.
+- **Concurrent OLTP takes a large volume of spurious conflicts.** Measured on
+  a TPC-C mix, 8 connections, 10 warehouses, three minutes: **4380** conflicts
+  on v0.5.0 against **1** on v0.4.1 for the identical workload. They are spread
+  evenly across every connection and sustained for the whole run, which is the
+  signature of hash collisions rather than genuine row contention -- real
+  contention would concentrate on the hot per-warehouse rows.
+
+  A client that retries makes progress regardless: that run completed and
+  posted higher throughput than the v0.4.1 baseline. But the retries are
+  wasted work, and an application that treats a deadlock error as fatal will
+  see failures where v0.4.1 saw none.
+- **Multi-threaded bulk loading can fail outright**, because a bulk statement
+  that takes a conflict mid-commit cannot be replayed: `mysqlslap
+  --concurrency`, a parallel `mysqldump` restore, a TPC-C loader, any `LOAD
+  DATA` fan-out.
+- **Mitigation:** load with a single connection -- verified, a 10-warehouse
+  TPC-C schema build completes with one loader where four hang -- and use a
+  client that retries on `ER_LOCK_DEADLOCK` (1213) / error 1180. The data is
+  never wrong: the transaction aborts cleanly and nothing partial is kept.
 
 **Reproducer.** `IMG=<image> WARE=10 BUILDVU=4 RUNVU=8 RAMP=1 DUR=3
 ./bench/hammerdb/run-hammerdb.sh`. Compare against the previous release with
