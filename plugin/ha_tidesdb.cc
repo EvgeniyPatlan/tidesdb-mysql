@@ -1578,7 +1578,9 @@ bool tidesdb_check_legacy_engine_attribute(THD *thd, LEX_CSTRING attr)
 
         if (srv_legacy_compat == 0) /* strict */
         {
-            my_error(ER_WRONG_ARGUMENTS, MYF(0), msg);
+            /* Not ER_WRONG_ARGUMENTS: its format is "Incorrect arguments to %s",
+               which prefixes a full sentence and reads as a run-on. */
+            my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), msg);
             ok = false;
             break; /* first offender is enough; the operator fixes and retries */
         }
@@ -2563,15 +2565,11 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
         snprintf(buf + pos, sizeof(buf) - pos, "Column families: %d\n", db_st.num_column_families);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "Global sequence: %lu\n",
                     (unsigned long)db_st.global_seq);
+    /* v10 reports no system-memory total, resolved ceiling or pressure level:
+       it derives its own budget rather than exposing one to tune against. */
     pos += snprintf(buf + pos, sizeof(buf) - pos, "\n--- Memory ---\n");
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "Total system memory: %lu MB\n",
-                    (unsigned long)(db_st.total_memory / (1024 * 1024)));
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "Resolved memory limit: %lu MB\n",
-                    (unsigned long)(db_st.resolved_memory_limit / (1024 * 1024)));
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "Memory pressure level: %d\n",
-                    db_st.memory_pressure_level);
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "Total memtable bytes: %ld\n",
-                    (long)db_st.total_memtable_bytes);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "Memtable bytes: %ld\n",
+                    (long)db_st.memtable_bytes);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "Transaction memory bytes: %ld\n",
                     (long)db_st.txn_memory_bytes);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "\n--- Storage ---\n");
@@ -2582,13 +2580,35 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
     pos += snprintf(buf + pos, sizeof(buf) - pos, "Total data size: %lu bytes\n",
                     (unsigned long)db_st.total_data_size_bytes);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "Immutable memtables: %d\n",
-                    db_st.total_immutable_count);
+                    db_st.immutable_memtable_count);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "\n--- Background ---\n");
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "Flush pending: %d\n", db_st.flush_pending_count);
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "Flush queue size: %lu\n",
-                    (unsigned long)db_st.flush_queue_size);
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "Compaction queue size: %lu\n",
-                    (unsigned long)db_st.compaction_queue_size);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "Flushing now: %s\n",
+                    db_st.is_flushing ? "YES" : "NO");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "Compaction pending: %d\n",
+                    db_st.compaction_pending_count);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "Flushes / compactions: %lu / %lu\n",
+                    (unsigned long)db_st.flush_count, (unsigned long)db_st.compaction_count);
+
+    /* Write stalls, reported by the engine in v10 instead of being inferred
+       from write latency. writes_blocked is the one that matters: a writer
+       that waited rather than merely being slowed. */
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n--- Write Stalls ---\n");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "Throttled / blocked: %lu / %lu\n",
+                    (unsigned long)db_st.writes_throttled,
+                    (unsigned long)db_st.writes_blocked);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "Total stall: %lu us (ceiling hits: %lu)\n",
+                    (unsigned long)db_st.write_stall_us,
+                    (unsigned long)db_st.write_stall_ceiling_hits);
+
+    /* Value log. dead against live is what says whether reclaim keeps up;
+       drainable segments are those reclaim could retire next. */
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n--- Value Log ---\n");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "Live / dead bytes: %lu / %lu\n",
+                    (unsigned long)db_st.vlog_live_bytes,
+                    (unsigned long)db_st.vlog_dead_bytes);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "Segments: %lu (drainable: %lu)\n",
+                    (unsigned long)db_st.vlog_segment_count,
+                    (unsigned long)db_st.vlog_segments_drainable);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "\n--- Block Cache ---\n");
     pos += snprintf(buf + pos, sizeof(buf) - pos, "Enabled: %s\n", cache_st.enabled ? "YES" : "NO");
     pos += snprintf(buf + pos, sizeof(buf) - pos, "Entries: %lu\n",
@@ -3302,22 +3322,12 @@ static bool tidesdb_hton_flush_logs(handlerton *)
 {
     if (!tdb_get_engine()) return false;
 
-    tidesdb_column_family_t *target = g_engine_ctx.schema_cf;
-    if (!target)
-    {
-        char **names = NULL;
-        int count = 0;
-        if (tidesdb_list_column_families(tdb_get_engine(), &names, &count) == TDB_SUCCESS && names)
-        {
-            if (count > 0 && names[0]) target = tidesdb_get_column_family(tdb_get_engine(), names[0]);
-            for (int i = 0; i < count; i++)
-                if (names[i]) free(names[i]);
-            free(names);
-        }
-    }
-    if (!target) return false; /* empty database -- nothing to sync */
-
-    int rc = tidesdb_sync_wal(target);
+    /* v10 syncs the write-ahead log at the database level. Through TidesDB 9
+       the WAL was reached through a column family, so this had to pick one --
+       the schema CF if object-store mode had made it, else the first
+       registered family -- and an empty database had nothing to sync at all.
+       None of that applies now. */
+    int rc = tidesdb_sync_wal(tdb_get_engine());
     if (rc != TDB_SUCCESS)
     {
         sql_print_warning("[TIDESDB] flush_logs: tidesdb_sync_wal failed (rc=%d)", rc);
@@ -7342,7 +7352,7 @@ int ha_tidesdb::end_bulk_delete()
         bulk_delete_min_pk_len_ > 0 && bulk_delete_max_pk_len_ > 0)
     {
         int crc = tidesdb_compact_range(
-            share->cf, bulk_delete_min_pk_, bulk_delete_min_pk_len_,
+            tdb_get_engine(), share->cf, bulk_delete_min_pk_, bulk_delete_min_pk_len_,
             bulk_delete_max_pk_, bulk_delete_max_pk_len_);
         if (crc != TDB_SUCCESS)
         {
@@ -7591,24 +7601,33 @@ int ha_tidesdb::info(uint flag)
         if (now - last > TIDESDB_STATS_REFRESH_US &&
             share->stats_refresh_us.compare_exchange_weak(last, now, std::memory_order_relaxed))
         {
-            tidesdb_stats_t *st = NULL;
-            if (tidesdb_get_stats(share->cf, &st) == TDB_SUCCESS && st)
+            /* v10 fills a caller-owned struct instead of allocating one, so
+               there is no free step and no way to leak on an early return. */
+            tidesdb_cf_stats_t st;
+            memset(&st, 0, sizeof(st));
+            if (tidesdb_get_cf_stats(share->cf, &st) == TDB_SUCCESS)
             {
-                share->cached_records.store(st->total_keys, std::memory_order_relaxed);
+                share->cached_records.store(st.total_keys, std::memory_order_relaxed);
 
                 /* total_data_size only counts SSTable klog+vlog; memtable_size
                    holds the active memtable footprint.  Sum both so that
                    DATA_LENGTH in information_schema.TABLES is non-zero even
                    before the first flush.  When both are 0 (library gap),
                    fall back to total_keys * avg entry size. */
-                uint64_t data_sz = st->total_data_size + (uint64_t)st->memtable_size;
-                if (data_sz == 0 && st->total_keys > 0)
-                    data_sz = (uint64_t)(st->total_keys * (st->avg_key_size + st->avg_value_size));
+                /* v10 reports no memtable byte count per family; it reports
+                   unflushed_key_count instead. Estimate the unflushed footprint
+                   from it so DATA_LENGTH is non-zero before the first flush,
+                   which is what this fallback has always been for. */
+                const double avg_row = st.avg_key_size + st.avg_value_size;
+                uint64_t data_sz =
+                    st.total_data_size + (uint64_t)(st.unflushed_key_count * avg_row);
+                if (data_sz == 0 && st.total_keys > 0)
+                    data_sz = (uint64_t)(st.total_keys * avg_row);
                 share->cached_data_size.store(data_sz, std::memory_order_relaxed);
-                uint32_t mrl = (uint32_t)(st->avg_key_size + st->avg_value_size);
+                uint32_t mrl = (uint32_t)avg_row;
                 if (mrl == 0) mrl = table->s->reclength;
                 share->cached_mean_rec_len.store(mrl, std::memory_order_relaxed);
-                share->cached_read_amp.store(st->read_amp > 0 ? st->read_amp : READ_AMP_NONE,
+                share->cached_read_amp.store(st.read_amp > 0 ? st.read_amp : READ_AMP_NONE,
                                              std::memory_order_relaxed);
 
                 /* We sum secondary index CF sizes for index_file_length */
@@ -7616,20 +7635,19 @@ int ha_tidesdb::info(uint flag)
                 for (uint i = 0; i < share->idx_cfs.size(); i++)
                 {
                     if (!share->idx_cfs[i]) continue;
-                    tidesdb_stats_t *ist = NULL;
-                    if (tidesdb_get_stats(share->idx_cfs[i], &ist) == TDB_SUCCESS && ist)
+                    tidesdb_cf_stats_t ist;
+                    memset(&ist, 0, sizeof(ist));
+                    if (tidesdb_get_cf_stats(share->idx_cfs[i], &ist) == TDB_SUCCESS)
                     {
-                        uint64_t isz = ist->total_data_size + (uint64_t)ist->memtable_size;
-                        if (isz == 0 && ist->total_keys > 0)
-                            isz = (uint64_t)(ist->total_keys *
-                                             (ist->avg_key_size + ist->avg_value_size));
+                        const double iavg = ist.avg_key_size + ist.avg_value_size;
+                        uint64_t isz =
+                            ist.total_data_size + (uint64_t)(ist.unflushed_key_count * iavg);
+                        if (isz == 0 && ist.total_keys > 0)
+                            isz = (uint64_t)(ist.total_keys * iavg);
                         idx_total += isz;
-                        tidesdb_free_stats(ist);
                     }
                 }
                 share->cached_idx_data_size.store(idx_total, std::memory_order_relaxed);
-
-                tidesdb_free_stats(st);
             }
             share->stats_refresh_us.store(now, std::memory_order_relaxed);
 
@@ -7743,8 +7761,9 @@ int ha_tidesdb::analyze(THD *thd, HA_CHECK_OPT *check_opt)
     share->stats_refresh_us.store(0, std::memory_order_relaxed);
     info(HA_STATUS_VARIABLE | HA_STATUS_CONST);
 
-    tidesdb_stats_t *st = NULL;
-    if (tidesdb_get_stats(share->cf, &st) != TDB_SUCCESS || !st)
+    tidesdb_cf_stats_t st;
+    memset(&st, 0, sizeof(st));
+    if (tidesdb_get_cf_stats(share->cf, &st) != TDB_SUCCESS)
     {
         push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE, ER_UNKNOWN_ERROR,
                             "[TIDESDB] unable to retrieve column family stats");
@@ -7754,38 +7773,36 @@ int ha_tidesdb::analyze(THD *thd, HA_CHECK_OPT *check_opt)
     /* Summary line */
     push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE, ER_UNKNOWN_ERROR,
                         "[TIDESDB] CF '%s'  total_keys=%llu  data_size=%llu bytes"
-                        "  memtable=%zu bytes  levels=%d  read_amp=%.2f"
-                        "  cache_hit=%.1f%%",
-                        share->cf_name.c_str(), (unsigned long long)st->total_keys,
-                        (unsigned long long)st->total_data_size, st->memtable_size, st->num_levels,
-                        st->read_amp, st->hit_rate * PERCENT_SCALE);
+                        "  unflushed_keys=%llu  levels=%d  read_amp=%.2f",
+                        share->cf_name.c_str(), (unsigned long long)st.total_keys,
+                        (unsigned long long)st.total_data_size,
+                        (unsigned long long)st.unflushed_key_count, st.num_levels,
+                        st.read_amp);
 
-    /* Average sizes */
+    /* Average sizes. Cache hit rate is a database-level figure in v10
+       (tidesdb_get_cache_stats) rather than a per-family one, so it is
+       reported by SHOW ENGINE TIDESDB STATUS instead of here. */
     push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE, ER_UNKNOWN_ERROR,
-                        "[TIDESDB] avg_key=%.1f bytes  avg_value=%.1f bytes", st->avg_key_size,
-                        st->avg_value_size);
+                        "[TIDESDB] avg_key=%.1f bytes  avg_value=%.1f bytes", st.avg_key_size,
+                        st.avg_value_size);
 
     /* Per-level detail */
-    for (int i = 0; i < st->num_levels; i++)
+    for (int i = 0; i < st.num_levels; i++)
     {
         push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE, ER_UNKNOWN_ERROR,
                             "[TIDESDB] level %d  sstables=%d  size=%zu bytes"
                             "  keys=%llu",
-                            i + 1, st->level_num_sstables[i], st->level_sizes[i],
-                            (unsigned long long)st->level_key_counts[i]);
+                            i + 1, st.level_num_sstables[i], st.level_sizes[i],
+                            (unsigned long long)st.level_key_counts[i]);
     }
 
-    /* B+tree stats (only when use_btree=1) */
-    if (st->use_btree)
-    {
-        push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE, ER_UNKNOWN_ERROR,
-                            "[TIDESDB] btree  nodes=%llu  max_height=%u"
-                            "  avg_height=%.2f",
-                            (unsigned long long)st->btree_total_nodes, st->btree_max_height,
-                            st->btree_avg_height);
-    }
-
-    tidesdb_free_stats(st);
+    /* Btree stats are unconditional now: every key log is a btree in v10, so
+       there is no use_btree flag left to gate on. */
+    push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE, ER_UNKNOWN_ERROR,
+                        "[TIDESDB] btree  nodes=%llu  max_height=%u"
+                        "  avg_height=%.2f",
+                        (unsigned long long)st.btree_total_nodes, st.btree_max_height,
+                        st.btree_avg_height);
 
     /* Secondary index CF stats + cardinality sampling.
        We iterate each secondary index CF, counting distinct index-column
@@ -7803,17 +7820,17 @@ int ha_tidesdb::analyze(THD *thd, HA_CHECK_OPT *check_opt)
         if (i >= share->idx_cfs.size() || !share->idx_cfs[i]) continue;
         KEY *ki = &table->key_info[i];
 
-        tidesdb_stats_t *ist = NULL;
+        tidesdb_cf_stats_t ist;
+        memset(&ist, 0, sizeof(ist));
         uint64_t idx_total_keys = 0;
-        if (tidesdb_get_stats(share->idx_cfs[i], &ist) == TDB_SUCCESS && ist)
+        if (tidesdb_get_cf_stats(share->idx_cfs[i], &ist) == TDB_SUCCESS)
         {
-            idx_total_keys = ist->total_keys;
+            idx_total_keys = ist.total_keys;
             push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE, ER_UNKNOWN_ERROR,
                                 "[TIDESDB] idx CF '%s'  keys=%llu  data_size=%llu bytes"
                                 "  levels=%d",
-                                share->idx_cf_names[i].c_str(), (unsigned long long)ist->total_keys,
-                                (unsigned long long)ist->total_data_size, ist->num_levels);
-            tidesdb_free_stats(ist);
+                                share->idx_cf_names[i].c_str(), (unsigned long long)ist.total_keys,
+                                (unsigned long long)ist.total_data_size, ist.num_levels);
         }
 
         /* We sample the index to estimate distinct prefix count.
@@ -7907,11 +7924,15 @@ int ha_tidesdb::optimize(THD *thd, HA_CHECK_OPT *check_opt)
 
     if (!share || !share->cf) DBUG_RETURN(HA_ADMIN_FAILED);
 
-    /* tidesdb_purge_cf() is synchronous -- flushes memtable to disk, then
-       runs a full compaction inline, blocking until complete.  This is
-       the right semantic for OPTIMIZE TABLE -- the caller expects the
-       table to be fully compacted when the statement returns. */
-    int rc = tidesdb_purge_cf(share->cf);
+    /* tidesdb_compact() runs one forced compaction pass synchronously, merging
+       even when no trigger is due, and blocks until it finishes. That is the
+       semantic OPTIMIZE TABLE wants: the caller expects a compacted table when
+       the statement returns. It replaces tidesdb_purge_cf, which v10 removed.
+
+       TDB_ERR_LOCKED here means a compaction was already running -- the work is
+       happening, just not on this thread -- so it is warned about like any
+       other non-success rather than failing the statement. */
+    int rc = tidesdb_compact(tdb_get_engine(), share->cf);
     if (rc != TDB_SUCCESS)
         sql_print_warning("[TIDESDB] optimize: purge data CF '%s' failed (err=%d)",
                           share->cf_name.c_str(), rc);
@@ -7919,7 +7940,7 @@ int ha_tidesdb::optimize(THD *thd, HA_CHECK_OPT *check_opt)
     for (uint i = 0; i < share->idx_cfs.size(); i++)
     {
         if (!share->idx_cfs[i]) continue;
-        rc = tidesdb_purge_cf(share->idx_cfs[i]);
+        rc = tidesdb_compact(tdb_get_engine(), share->idx_cfs[i]);
         if (rc != TDB_SUCCESS)
             sql_print_warning("[TIDESDB] optimize: purge idx CF '%s' failed (err=%d)",
                               share->idx_cf_names[i].c_str(), rc);
@@ -7942,28 +7963,28 @@ int ha_tidesdb::check(THD *thd, HA_CHECK_OPT *check_opt)
        that manifests, block indexes, bloom filters, and metadata blocks
        are intact. For a deeper check, users can run REPAIR TABLE which
        does a full compaction pass that reads and re-checksums every block. */
-    tidesdb_stats_t *st = NULL;
-    int rc = tidesdb_get_stats(share->cf, &st);
+    tidesdb_cf_stats_t st;
+    memset(&st, 0, sizeof(st));
+    int rc = tidesdb_get_cf_stats(share->cf, &st);
     if (rc != TDB_SUCCESS)
     {
         sql_print_error("[TIDESDB] CHECK TABLE '%s': data CF check failed (err=%d)",
                         share->cf_name.c_str(), rc);
         DBUG_RETURN(HA_ADMIN_CORRUPT);
     }
-    tidesdb_free_stats(st);
 
     for (uint i = 0; i < share->idx_cfs.size(); i++)
     {
         if (!share->idx_cfs[i]) continue;
-        tidesdb_stats_t *ist = NULL;
-        rc = tidesdb_get_stats(share->idx_cfs[i], &ist);
+        tidesdb_cf_stats_t ist;
+        memset(&ist, 0, sizeof(ist));
+        rc = tidesdb_get_cf_stats(share->idx_cfs[i], &ist);
         if (rc != TDB_SUCCESS)
         {
             sql_print_error("[TIDESDB] CHECK TABLE '%s': index CF '%s' check failed (err=%d)",
                             share->cf_name.c_str(), share->idx_cf_names[i].c_str(), rc);
             DBUG_RETURN(HA_ADMIN_CORRUPT);
         }
-        tidesdb_free_stats(ist);
     }
 
     DBUG_RETURN(HA_ADMIN_OK);
@@ -7981,7 +8002,7 @@ int ha_tidesdb::repair(THD *thd, HA_CHECK_OPT *check_opt)
        purge_cf calls on index CFs skip the rotation (already done) and
        just run per-CF compaction. tidesdb_purge_cf is unified-mode aware
        and handles this idempotently. */
-    int rc = tidesdb_purge_cf(share->cf);
+    int rc = tidesdb_compact(tdb_get_engine(), share->cf);
     if (rc != TDB_SUCCESS)
     {
         sql_print_error("[TIDESDB] REPAIR TABLE '%s': purge data CF failed (err=%d)",
@@ -7992,7 +8013,7 @@ int ha_tidesdb::repair(THD *thd, HA_CHECK_OPT *check_opt)
     for (uint i = 0; i < share->idx_cfs.size(); i++)
     {
         if (!share->idx_cfs[i]) continue;
-        rc = tidesdb_purge_cf(share->idx_cfs[i]);
+        rc = tidesdb_compact(tdb_get_engine(), share->idx_cfs[i]);
         if (rc != TDB_SUCCESS)
             sql_print_warning("[TIDESDB] REPAIR TABLE '%s': purge idx CF '%s' failed (err=%d)",
                               share->cf_name.c_str(), share->idx_cf_names[i].c_str(), rc);
@@ -8024,11 +8045,11 @@ double ha_tidesdb::scan_time()
 
     if (!share || !share->cf) return cost;
 
-    /* Cache the range_cost result on the share with the same refresh
-       interval as stats (TIDESDB_STATS_REFRESH_US = 2 seconds).
-       tidesdb_range_cost examines in-memory metadata (block indexes,
-       SSTable min/max keys) without disk I/O, but the computation
-       still costs ~0.17% of TPC-C CPU when called per query plan. */
+    /* Cache the scan cost on the share with the same refresh interval as stats
+       (TIDESDB_STATS_REFRESH_US = 2 seconds). tidesdb_range_stats reads
+       in-memory layout metadata without disk I/O, but the computation still
+       cost ~0.17% of TPC-C CPU per query plan when this was measured against
+       the v9 equivalent, so the caching stays. */
     auto now = std::chrono::steady_clock::now();
     auto cached_time = share->scan_cost_time.load(std::memory_order_relaxed);
     double cached_cost = share->cached_scan_cost.load(std::memory_order_relaxed);
@@ -8047,12 +8068,18 @@ double ha_tidesdb::scan_time()
         uint hi_len = KEY_NAMESPACE_LEN + share->pk_key_len;
         if (hi_len > sizeof(hi)) hi_len = sizeof(hi);
 
-        double full_cost = 0.0;
-        if (tidesdb_range_cost(share->cf, lo, KEY_NAMESPACE_LEN, hi, hi_len, &full_cost) ==
-                TDB_SUCCESS &&
-            full_cost > 0.0)
+        /* sstables_overlapping is the shape of a scan's cost: the number of
+           sorted runs the scan would have to merge. v10 offers no opaque cost
+           scalar, and this is the figure the header names as standing in for
+           one. Scaled by the existing per-run weights below, so the cost model
+           keeps the same units it was tuned in. */
+        tidesdb_range_stats_t rs;
+        memset(&rs, 0, sizeof(rs));
+        if (tidesdb_range_stats(tdb_get_engine(), share->cf, lo, KEY_NAMESPACE_LEN, hi, hi_len,
+                                &rs) == TDB_SUCCESS &&
+            rs.sstables_overlapping > 0)
         {
-            cached_cost = full_cost;
+            cached_cost = (double)rs.sstables_overlapping;
             share->cached_scan_cost.store(cached_cost, std::memory_order_relaxed);
             share->scan_cost_time.store(
                 std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch())
@@ -8174,69 +8201,40 @@ ha_rows ha_tidesdb::records_in_range(uint inx, key_range *min_key, key_range *ma
         return REC_PER_KEY_FLOOR;
     }
 
-    /* We ask TidesDB for the range cost (no disk I/O -- uses in-memory
-       block indexes, SSTable min/max keys, and entry counts). */
-    double range_cost = 0.0;
-    int rc = tidesdb_range_cost(cf, lo_buf, lo_len, hi_buf, hi_len, &range_cost);
-    if (rc != TDB_SUCCESS || range_cost <= 0.0)
+    /* v10 answers the planner's question directly. tidesdb_range_stats reports
+       the live keys a range holds -- tombstoned and superseded versions
+       excluded, memtable-aware, and counted exactly for a range small enough
+       to walk -- so there is no ratio to normalise and no full-range probe to
+       take.
+
+       That removes the estimator this code used to need. Through TidesDB 9 the
+       only figure available was an opaque scan cost, so a range's cardinality
+       had to be inferred by taking its cost against the cost of the whole key
+       space and scaling the row count by the ratio. It also removes that
+       approach's worst failure: unflushed data made a narrow range cost about
+       the same as a full scan, which is why a fraction above
+       TIDESDB_RIR_FRACTION_UNRELIABLE used to be discarded in favour of a
+       rec_per_key guess. estimated_keys is memtable-aware, so the case that
+       fallback existed for does not arise. */
+    tidesdb_range_stats_t rs;
+    memset(&rs, 0, sizeof(rs));
+    int rc = tidesdb_range_stats(tdb_get_engine(), cf, lo_buf, lo_len, hi_buf, hi_len, &rs);
+    if (rc != TDB_SUCCESS)
         return (total / TIDESDB_RIR_UNKNOWN_DENOM) + REC_PER_KEY_FLOOR; /* fallback */
 
-    /* We get full-range cost for normalization.  We use the natural boundaries
-       of the key space so that range_cost / full_cost ≈ fraction of data. */
-    double full_cost = 0.0;
-    {
-        uchar full_lo[KEY_NAMESPACE_LEN] = {(uchar)(is_pk ? KEY_NS_DATA : KEY_INF_LO_BYTE)};
-        uchar full_hi[DATA_KEY_BUF_LEN];
-        memset(full_hi, KEY_INF_HI_BYTE, sizeof(full_hi));
-        uint full_hi_len = hi_len; /* same width as hi_buf */
-        tidesdb_range_cost(cf, full_lo, KEY_NAMESPACE_LEN, full_hi, full_hi_len, &full_cost);
-    }
+    ha_rows est = (ha_rows)rs.estimated_keys;
 
-    if (full_cost <= 0.0)
-        return (total / TIDESDB_RIR_UNKNOWN_DENOM) + REC_PER_KEY_FLOOR; /* fallback */
+    /* Never report 0: the optimizer reads it as "range is empty" and can pick a
+       plan on that basis. An exact count of 0 is still a real answer, but
+       records_in_range is documented to return a positive estimate, and the
+       cost of one extra row here is far smaller than the cost of a plan built
+       on a false emptiness claim. */
+    if (est == 0) est = REC_PER_KEY_FLOOR;
 
-    /* We estimate records proportionally -- narrower range -> fewer records */
-    double fraction = range_cost / full_cost;
-    if (fraction > FRACTION_MAX) fraction = FRACTION_MAX;
-    if (fraction < FRACTION_MIN) fraction = FRACTION_MIN;
-
-    ha_rows est = (ha_rows)(total * fraction);
-    if (est == 0) est = REC_PER_KEY_FLOOR; /* never return 0 -- optimizer treats it as "empty" */
-
-    /* When both bounds are provided but the estimated fraction is very
-       high (>TIDESDB_RIR_FRACTION_UNRELIABLE), tidesdb_range_cost is
-       likely unreliable -- this happens with memtable-only data where
-       the cost function cannot distinguish a narrow range from a full
-       scan.  Fall back to a rec_per_key-based estimate for the prefix. */
-    if (min_key && max_key && fraction > TIDESDB_RIR_FRACTION_UNRELIABLE)
-    {
-        KEY *ki = &table->key_info[inx];
-        uint parts = my_count_bits(min_key->keypart_map);
-        if (parts > 0 && parts <= ki->user_defined_key_parts)
-        {
-            ulong rpk = ki->rec_per_key[parts - 1];
-            if (rpk > 0)
-            {
-                ha_rows capped;
-                if (lo_len == hi_len && memcmp(lo_buf, hi_buf, lo_len) == 0)
-                {
-                    /* Point equality, we use rec_per_key directly */
-                    capped = (ha_rows)rpk;
-                }
-                else
-                {
-                    /* With range scans we multiply rec_per_key by a conservative
-                       range-width factor.  Typical OLTP ranges span tens of
-                       key values; the multiplier keeps the estimate tight while
-                       still being vastly better than the unreliable full ratio. */
-                    capped = (ha_rows)rpk * TIDESDB_RIR_RANGE_RPK_MULTIPLIER;
-                    const ha_rows cap = total / TIDESDB_RIR_RANGE_CAP_DENOM;
-                    if (capped > cap) capped = cap;
-                }
-                if (capped < est) est = MY_MAX(capped, REC_PER_KEY_FLOOR);
-            }
-        }
-    }
+    /* An estimate cannot exceed what the table holds. keys_exact counts are
+       trusted as-is; an estimate derived from sstable metadata can overshoot
+       when a range spans files whose key spans overlap heavily. */
+    if (!rs.keys_exact && est > total) est = total;
 
     return est;
 }
@@ -8267,11 +8265,11 @@ const char *ha_tidesdb::index_type(uint key_number)
     {
         if (table->key_info[key_number].algorithm == HA_KEY_ALG_FULLTEXT) return "FULLTEXT";
         if (is_spatial_index(&table->key_info[key_number])) return "RTREE";
-        ha_index_option_struct *iopts = TDB_INDEX_OPTIONS(&table->key_info[key_number]);
-        if (iopts && iopts->use_btree) return "BTREE";
+        (void)key_number;
     }
-    ha_table_option_struct *opts = TDB_TABLE_OPTIONS(table);
-    return (opts && opts->use_btree) ? "BTREE" : "LSM";
+    /* Every key log is a btree in TidesDB 10 and that btree is the index, so
+       there is no LSM-versus-BTREE distinction left to report. */
+    return "BTREE";
 }
 
 /* ******************** Spatial scan continuation ******************** */
@@ -9336,15 +9334,22 @@ static long long srv_stat_column_families;
 static long long srv_stat_global_seq;
 static long long srv_stat_memtable_bytes;
 static long long srv_stat_txn_memory_bytes;
-static long long srv_stat_memory_limit;
-static long long srv_stat_memory_pressure;
 static long long srv_stat_total_sstables;
 static long long srv_stat_open_sstables;
 static long long srv_stat_data_size_bytes;
 static long long srv_stat_immutable_memtables;
-static long long srv_stat_flush_pending;
-static long long srv_stat_flush_queue;
 static long long srv_stat_compaction_queue;
+/* v10 write-stall and value-log accounting. Reported by the engine directly
+   rather than inferred from latency, which is what the previous perf work had
+   to do. */
+static long long srv_stat_writes_throttled;
+static long long srv_stat_writes_blocked;
+static long long srv_stat_write_stall_us;
+static long long srv_stat_write_stall_ceiling_hits;
+static long long srv_stat_vlog_live_bytes;
+static long long srv_stat_vlog_dead_bytes;
+static long long srv_stat_vlog_segments;
+static long long srv_stat_vlog_segments_drainable;
 static long long srv_stat_cache_entries;
 static long long srv_stat_cache_bytes;
 static long long srv_stat_cache_hits;
@@ -9386,15 +9391,19 @@ static SHOW_VAR tidesdb_status_variables[] = {
     {"tidesdb_global_sequence", (char *)&srv_stat_global_seq, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
     {"tidesdb_memtable_bytes", (char *)&srv_stat_memtable_bytes, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
     {"tidesdb_txn_memory_bytes", (char *)&srv_stat_txn_memory_bytes, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
-    {"tidesdb_memory_limit", (char *)&srv_stat_memory_limit, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
-    {"tidesdb_memory_pressure", (char *)&srv_stat_memory_pressure, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
     {"tidesdb_total_sstables", (char *)&srv_stat_total_sstables, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
     {"tidesdb_open_sstables", (char *)&srv_stat_open_sstables, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
     {"tidesdb_data_size_bytes", (char *)&srv_stat_data_size_bytes, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
     {"tidesdb_immutable_memtables", (char *)&srv_stat_immutable_memtables, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
-    {"tidesdb_flush_pending", (char *)&srv_stat_flush_pending, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
-    {"tidesdb_flush_queue", (char *)&srv_stat_flush_queue, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
     {"tidesdb_compaction_queue", (char *)&srv_stat_compaction_queue, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_writes_throttled", (char *)&srv_stat_writes_throttled, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_writes_blocked", (char *)&srv_stat_writes_blocked, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_write_stall_us", (char *)&srv_stat_write_stall_us, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_write_stall_ceiling_hits", (char *)&srv_stat_write_stall_ceiling_hits, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_vlog_live_bytes", (char *)&srv_stat_vlog_live_bytes, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_vlog_dead_bytes", (char *)&srv_stat_vlog_dead_bytes, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_vlog_segments", (char *)&srv_stat_vlog_segments, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"tidesdb_vlog_segments_drainable", (char *)&srv_stat_vlog_segments_drainable, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
     {"tidesdb_cache_entries", (char *)&srv_stat_cache_entries, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
     {"tidesdb_cache_bytes", (char *)&srv_stat_cache_bytes, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
     {"tidesdb_cache_hits", (char *)&srv_stat_cache_hits, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
@@ -9423,17 +9432,13 @@ static void tidesdb_refresh_status_vars()
 
     srv_stat_column_families = db_st.num_column_families;
     srv_stat_global_seq = (long long)db_st.global_seq;
-    srv_stat_memtable_bytes = (long long)db_st.total_memtable_bytes;
+    srv_stat_memtable_bytes = (long long)db_st.memtable_bytes;
     srv_stat_txn_memory_bytes = (long long)db_st.txn_memory_bytes;
-    srv_stat_memory_limit = (long long)db_st.resolved_memory_limit;
-    srv_stat_memory_pressure = db_st.memory_pressure_level;
     srv_stat_total_sstables = db_st.total_sstable_count;
     srv_stat_open_sstables = db_st.num_open_sstables;
     srv_stat_data_size_bytes = (long long)db_st.total_data_size_bytes;
-    srv_stat_immutable_memtables = db_st.total_immutable_count;
-    srv_stat_flush_pending = db_st.flush_pending_count;
-    srv_stat_flush_queue = (long long)db_st.flush_queue_size;
-    srv_stat_compaction_queue = (long long)db_st.compaction_queue_size;
+    srv_stat_immutable_memtables = db_st.immutable_memtable_count;
+    srv_stat_compaction_queue = (long long)db_st.compaction_pending_count;
     srv_stat_cache_entries = (long long)cache_st.total_entries;
     srv_stat_cache_bytes = (long long)cache_st.total_bytes;
     srv_stat_cache_hits = (long long)cache_st.hits;
@@ -9441,12 +9446,29 @@ static void tidesdb_refresh_status_vars()
     srv_stat_cache_hit_rate = cache_st.hit_rate * PERCENT_SCALE;
     srv_stat_cache_partitions = (long long)cache_st.num_partitions;
 
-    /* Tombstone aggregates in which we walk all CFs once, sum total_tombstones and
-       track the worst single-SSTable density.  tidesdb_db_stats_t does not
-       expose tombstone aggregates, so we iterate the CF list ourselves.
-       SHOW GLOBAL STATUS reads the static atomics, so the cost is paid in
-       SHOW ENGINE STATUS / SHOW GLOBAL STATUS callers, not on the write
-       path. */
+    /* Write-stall accounting, new in v10 and reported directly rather than
+       inferred. The v0.4.1 perf work had to read stall behaviour out of
+       write_row tail latency because the engine exposed no counter for it. */
+    srv_stat_writes_throttled = (long long)db_st.writes_throttled;
+    srv_stat_writes_blocked = (long long)db_st.writes_blocked;
+    srv_stat_write_stall_us = (long long)db_st.write_stall_us;
+    srv_stat_write_stall_ceiling_hits = (long long)db_st.write_stall_ceiling_hits;
+
+    /* Value-log occupancy, also new. vlog_dead_bytes against vlog_live_bytes
+       is what says whether reclaim is keeping up. */
+    srv_stat_vlog_live_bytes = (long long)db_st.vlog_live_bytes;
+    srv_stat_vlog_dead_bytes = (long long)db_st.vlog_dead_bytes;
+    srv_stat_vlog_segments = (long long)db_st.vlog_segment_count;
+    srv_stat_vlog_segments_drainable = (long long)db_st.vlog_segments_drainable;
+
+    /* Tombstone aggregates: walk every CF once, sum total_tombstones and track
+       the worst single-SSTable density. tidesdb_db_stats_t exposes no
+       tombstone aggregate, so we iterate the CF list ourselves. SHOW GLOBAL
+       STATUS reads the static cells, so the cost lands on the reader rather
+       than the write path.
+
+       v10 fills a caller-owned tidesdb_cf_stats_t instead of allocating one,
+       so there is no free step and no way to leak on an early return. */
     char **cf_names = NULL;
     int cf_count = 0;
     if (tidesdb_list_column_families(tdb_get_engine(), &cf_names, &cf_count) == TDB_SUCCESS && cf_names)
@@ -9459,17 +9481,18 @@ static void tidesdb_refresh_status_vars()
             if (!cf_names[i]) continue;
             tidesdb_column_family_t *cf = tidesdb_get_column_family(tdb_get_engine(), cf_names[i]);
             if (!cf) continue;
-            tidesdb_stats_t *st = NULL;
-            if (tidesdb_get_stats(cf, &st) == TDB_SUCCESS && st)
+
+            tidesdb_cf_stats_t cf_st;
+            memset(&cf_st, 0, sizeof(cf_st));
+            if (tidesdb_get_cf_stats(cf, &cf_st) == TDB_SUCCESS)
             {
-                total_tomb += st->total_tombstones;
-                total_keys += st->total_keys;
-                if (st->max_sst_density > max_density)
+                total_tomb += cf_st.total_tombstones;
+                total_keys += cf_st.total_keys;
+                if (cf_st.max_sst_density > max_density)
                 {
-                    max_density = st->max_sst_density;
-                    max_density_level = st->max_sst_density_level;
+                    max_density = cf_st.max_sst_density;
+                    max_density_level = cf_st.max_sst_density_level;
                 }
-                tidesdb_free_stats(st);
             }
         }
         for (int i = 0; i < cf_count; i++) free(cf_names[i]);
