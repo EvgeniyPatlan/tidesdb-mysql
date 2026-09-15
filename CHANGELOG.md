@@ -2,6 +2,84 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] — TidesDB 10
+
+### Breaking
+
+- **On-disk format changed. A v0.4.x data directory cannot be read.** TidesDB 10
+  replaced the per-column-family directory layout with a flat one, and there is
+  no in-place conversion. Upgrading means dumping from the old server and
+  loading into a new one — see [docs/upgrade-v0.5.0.md](docs/upgrade-v0.5.0.md).
+
+  Pointing v0.5.0 at a v0.4.x directory does **not** corrupt it. The engine
+  refuses to start and says what to do; your files are left untouched and the
+  previous release still reads them. Without that check the open would have
+  *succeeded*, treating the directory as a brand-new database and starting
+  cleanly with every table present and empty.
+
+- **Object-store mode is gone**, removed from the engine upstream. Ten sysvars
+  (`tidesdb_object_store_backend`, the `tidesdb_s3_*` family,
+  `tidesdb_objstore_wal_sync_on_commit`, `tidesdb_replica_mode`) stay registered
+  so an existing `my.cnf` gets an explanation rather than "unknown variable",
+  but the server refuses to start if any is set. Set
+  `tidesdb_legacy_compat=warn` to start anyway with a warning per variable.
+  `tidesdb_promote_primary` is refused outright.
+
+- **`tidesdb_checkpoint_dir` is refused** whatever it is set to. TidesDB 10
+  checkpoints in place and produces no snapshot directory. Use
+  `tidesdb_backup_dir`, noting it makes a full copy rather than a hard-link
+  snapshot.
+
+- **Fourteen `ENGINE_ATTRIBUTE` keys retired** — three moved to server
+  variables, eleven describe behaviour that no longer exists. Under the default
+  `tidesdb_legacy_compat=strict` a `CREATE TABLE` carrying one is refused with a
+  message naming the replacement or the reason; under `warn` it is ignored with
+  that message as a warning, which is what lets a `mysqldump` from v0.4.x
+  reload.
+
+### Added
+
+- **Durable two-phase commit.** Transactions prepare durably in the engine under
+  the server's XID and stay invisible until phase two. Transactions left in
+  doubt by a crash are resolved against the binlog at startup via the `recover`,
+  `commit_by_xid` and `rollback_by_xid` hooks.
+- **`scripts/test-cross-version.sh`** — asserts the v9 data directory is refused
+  rather than opened empty, that the detector stays quiet on v10, empty and
+  missing directories, and that the old data survives a v10 open.
+- **Value-log and write-stall statistics**: `tidesdb_vlog_live_bytes`,
+  `tidesdb_vlog_dead_bytes`, `tidesdb_vlog_segments`,
+  `tidesdb_vlog_segments_drainable`, `tidesdb_writes_throttled`,
+  `tidesdb_writes_blocked`, `tidesdb_write_stall_us`,
+  `tidesdb_write_stall_ceiling_hits`.
+- `scripts/setup-workspace.sh` now applies the engine patches under
+  `docker/patches/tidesdb/`, so a local build and the shipped image run the same
+  engine.
+
+### Fixed
+
+- **TTL was a no-op.** TidesDB 10 takes a lifetime in seconds where 9 took an
+  absolute deadline. The old argument is in range, so nothing complained — an
+  absolute timestamp simply read as a ~56-year lifetime and no row ever expired.
+- **`DATA_LENGTH` reported 0** for tables holding rows, because the average key
+  and value sizes are sstable-derived and therefore zero before the first flush.
+- **Row counts excluded unflushed keys**, which reported `TABLE_ROWS` as 0 and
+  pushed the optimizer onto full scans where a range scan was right.
+- **READ COMMITTED could miss a committed row.** A scan iterator was cached
+  across statements inside a transaction and only re-seeked; an iterator carries
+  the view it was created with. Correct for repeatable read and above, wrong for
+  read committed.
+- **Engine patch: conflict-free commits were refused.** The bound deciding
+  whether a reservation slot could be retired counted the committing transaction
+  itself and read a value maintained for the compaction GC floor, whose safe
+  direction is the opposite. A single connection committing in a loop aborted
+  against itself — 2 spurious conflicts per 1000 transactions, 0 after. Carried
+  as `docker/patches/tidesdb/0001-reservation-retirement-floor.patch` and sent
+  upstream.
+- **CI upstream-release detection had been failing silently since 2026-07-29.**
+  The workflow passed `--label` values that did not exist, `gh` refused them,
+  and `set -euo pipefail` failed the step *after* it had correctly detected the
+  release — a red run with no issue and nothing saying a release was missed.
+
 ## [Unreleased] — initial publication
 
 First public snapshot. The work is summarized below as the four phases it was developed in.

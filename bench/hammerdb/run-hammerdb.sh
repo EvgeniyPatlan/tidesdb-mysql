@@ -23,6 +23,9 @@ else
     RAMP=${RAMP:-1};  DUR=${DUR:-3}
 fi
 CPUS=${CPUS:-4}; MEM=${MEM:-12g}
+# The image under test. Overridable because comparing two engine versions is
+# the point of a baseline run, and a hardcoded tag makes that impossible.
+IMG=${IMG:-tidesdb/mysql:9.7}
 RUNTIMER=$(( (RAMP + DUR) * 60 + 90 ))
 USER=bench; PASS='Bench_9xQ!z'
 ENGINE=${ENGINE:-tidesdb}        # ENGINE=innodb for the head-to-head baseline
@@ -44,7 +47,7 @@ trap cleanup EXIT
 echo "[hdb] profile: WARE=$WARE BUILDVU=$BUILDVU RUNVU=$RUNVU RAMP=${RAMP}m DUR=${DUR}m caps=${CPUS}cpu/${MEM}"
 docker network create "$NET" >/dev/null 2>&1 || true
 
-echo "[hdb] starting DB (tidesdb/mysql:9.7 @ main HEAD)"
+echo "[hdb] starting DB ($IMG)"
 # DB_EXTRA_ARGS: extra mysqld flags appended last (e.g. plugin sysvars).
 # tidesdb_unified_memtable is PLUGIN_VAR_READONLY -- only settable at
 # server start, and needs the loose_ prefix (the var is unknown during
@@ -53,7 +56,7 @@ echo "[hdb] starting DB (tidesdb/mysql:9.7 @ main HEAD)"
 # read -a so multi-flag strings split correctly; empty -> no-op.
 read -r -a _db_extra <<< "${DB_EXTRA_ARGS:-}"
 docker run -d --name "$DB" --network "$NET" --cpus "$CPUS" --memory "$MEM" \
-  -e MYSQL_ALLOW_EMPTY_PASSWORD=1 tidesdb/mysql:9.7 \
+  -e MYSQL_ALLOW_EMPTY_PASSWORD=1 "$IMG" \
   --max-connections=512 --max-connect-errors=1000000 --connect-timeout=30 \
   --net-read-timeout=120 --net-write-timeout=120 "${_db_extra[@]}" >/dev/null
 
@@ -244,7 +247,7 @@ CONFLICTS=$(grep -aciE '1213|1205| 1180|deadlock|Lock wait timeout' "$OUT/run.lo
 
 {
   echo "HammerDB 5.0 TPROC-C verification -- $TS"
-  echo "DB image: tidesdb/mysql:9.7 (main HEAD, reverse-ref fix)"
+  echo "DB image: $IMG"
   echo "profile : WARE=$WARE BUILDVU=$BUILDVU RUNVU=$RUNVU RAMP=${RAMP}m DUR=${DUR}m"
   echo "engine  : $ENGINE"
   echo "tidesdb_unified_memtable = ${UNIFIED_MT:-?}"

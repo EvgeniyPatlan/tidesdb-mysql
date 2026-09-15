@@ -73,13 +73,19 @@ Handled plugin-side (see [CHANGELOG.md](CHANGELOG.md)):
   validation; the plugin's `default_l0_queue_stall_threshold` default was
   lowered 20 -> 10 to match upstream now that this is the gating surface.
 
-## Known limitations introduced or formalised in v0.4.0
+## Known limitations (carried into v0.5.0)
 
 These are atomic-DDL participation limitations. They are not engine bugs — they are deliberate scope boundaries of the v0.4.0 contract, tracked here so operators know what to expect. Full write-up: [docs/v0.4.0-validation-report.md](docs/v0.4.0-validation-report.md) (*Known limitations*).
 
-### 1. DD-commit / engine-commit two-phase-commit gap
+### 1. DDL: DD-commit / engine-commit two-phase-commit gap
 
-A narrow window exists between the DD-side commit and the engine-side commit where the two can momentarily diverge. The same window exists in InnoDB. If the engine commit hook fails after the DD has already committed, the next-startup `DdSyncReconciler` sweep reconciles per the `tidesdb_orphan_action` sysvar (default `quarantine`). Full closure requires server-side XA-style 2PC, which is **not** in MySQL 9.7's atomic-DDL contract. No code-side mitigation is possible from a storage-engine plugin alone.
+**Narrowed in v0.5.0, and worth separating into two halves that used to be described as one.**
+
+**DML is closed.** Through v0.4.x the engine had no durable prepare, so the plugin ran the whole commit inside the prepare hook. A crash between prepare and commit left writes durable in the engine and absent from the binlog with no way to find them, and a binlog flush that failed after a successful prepare left the engine holding data the server had discarded. TidesDB 10 has a real prepare: transactions prepare durably, stay invisible until phase two, and any left in doubt by a crash are resolved against the binlog at startup through the `recover` / `commit_by_xid` / `rollback_by_xid` hooks. `tidesdb_v10_prepared_recovery` covers both directions.
+
+**DDL is not.** Creating, dropping and renaming a column family are not transactional engine operations — they are direct calls, not writes inside a transaction — so they cannot be carried by the prepare above. The window between the DD-side commit and the engine-side CF mutation therefore remains, and the next-startup `DdSyncReconciler` sweep is still what reconciles it, per the `tidesdb_orphan_action` sysvar (default `quarantine`). Closing this needs the SE-private DDL journal described in §6, not more 2PC.
+
+Note also that the sweep this section relies on runs on a **manual trigger**, not at startup. See §5a.
 
 ### 2. DDSE callback stubs are inert
 
@@ -89,17 +95,33 @@ All eight DDSE entry points (`ddse_dict_init`, `dict_init`, `dict_recover`, `dic
 
 Pre-v0.4.0 tables have no `se_private_data` and no SDI blob in `__tidesdb_sdi`. The supported upgrade path is **`ALTER TABLE t ENGINE=TIDESDB`** per user table, which populates `se_private_data` and emits the SDI blob. Strict mode (`tidesdb_atomic_ddl_strict=ON`, the default) refuses to open legacy tables; setting it to `OFF` temporarily during upgrade allows opens with a warning. Auto-retrofit on open was considered and rejected — it would silently rewrite metadata for tables the operator may not have intended to touch.
 
+**Interaction with the v0.5.0 format break.** This retrofit has to happen on the **old** server, before dumping. v0.5.0 cannot open a v0.4.x data directory at all — it refuses to start the engine (see [docs/upgrade-v0.5.0.md](docs/upgrade-v0.5.0.md)) — so there is no v0.5.0 server on which to run the `ALTER`. A v0.3.x user upgrading to v0.5.0 does the retrofit on v0.4.x, dumps, then loads into v0.5.0.
+
 ### 4. `mysqldump --tab` round-trip is smoke-tested only
 
 The four SDI MTR tests exercise round-trip on the `__tidesdb_sdi` metadata CF, but a full `mysqldump --tab` end-to-end integration test is deferred to **v0.5.0**.
 
-### 5. Twelve crash-injection MTR tests skip on the Release `mysql-mtr` image
+### 5. Run the suite against a Debug build; the Release image is reduced coverage
 
-The atomic-DDL test suite includes 12 tests that use `DBUG_SUICIDE` for controlled crash injection. These require a Debug `mysqld` (gated by `have_debug.inc`) and so skip on the Release-mode `tidesdb/mysql-mtr:9.7` image used for CI. They were validated locally on a one-off Debug image (`tidesdb/mysql-mtr:9.7-dbg4`, preserved locally) during root-cause analysis of the COPY-ALTER 2PC SIGSEGV. Producing a steady-state Debug MTR image for CI is a follow-up.
+The crash-injection tests use `DBUG_SUICIDE` and are gated by `have_debug.inc`, so they do not execute on a Release build. This used to be written down as twelve tests that "skip on the Release image", with a Debug CI image listed as a follow-up.
+
+That framing was the problem. Tests that quietly skip read as passes, and four real plugin defects accumulated behind them — including a reconciler whose engine-name comparison never matched, which made the whole subsystem inert, and status variables that were invisible because every one of them was missing its scope field.
+
+**The expected way to run the suite is the local Debug tree** (`scripts/setup-workspace.sh` then `./mtr --suite=tidesdb`), where the crash-injection tests actually execute. The Release `tidesdb/mysql-mtr:9.7` image is the reduced-coverage path, not the default.
+
+Two further gates only a Debug build reaches: `tidesdb_v10_prepared_recovery`, which crashes the server between prepare and binlog and again between binlog and engine commit, and the perf-instrumented build (`-DTIDESDB_PERF=1`), which runs four tests and seven unit tests the default build skips. Check for `[ skipped ]` in the MTR summary rather than reading the pass count alone.
+
+### 5a. The reconciler sweep does not run at startup
+
+`DdSyncReconciler::apply_delta` is gated off at plugin init and driven by a DBUG hook instead. The reason is DD warm-up timing: on the bootstrap thread the data dictionary's table cache may not yet list user tables, and an init-time sweep then classifies live tables as orphan CFs and quarantines them — observed, not theorised.
+
+This matters because §1 and §6 both name that sweep as the recovery mechanism for their window. It is available, but an operator has to run it; it is not automatic. The principled fix is the `post_recover` handlerton hook, which runs after recovery with a warm DD.
 
 ### 6. COPY-ALTER fix is tactical
 
-The v0.4.0 fix for the COPY-ALTER 2PC use-after-free (`tidesdb_flush_engine_txn_before_cf_mutation`, commit `0d7fe2c`) flushes the engine session txn at the top of `ha_tidesdb::rename_table` and `ha_tidesdb::delete_table`. This restores pre-flag-flip engine-layer ordering and preserves the atomic-DDL contract at the server / DD layer, but it gives up a narrow window (engine has committed; DD has not) — the startup sweep recovers it. The architecturally correct fix — a SE-private DDL journal so CF rename / drop is itself transactional alongside user data writes — is deferred to **v0.5.0**.
+The v0.4.0 fix for the COPY-ALTER 2PC use-after-free (`tidesdb_flush_engine_txn_before_cf_mutation`, commit `0d7fe2c`) flushes the engine session txn at the top of `ha_tidesdb::rename_table` and `ha_tidesdb::delete_table`. This restores pre-flag-flip engine-layer ordering and preserves the atomic-DDL contract at the server / DD layer, but it gives up a narrow window (engine has committed; DD has not) — the sweep in §5a recovers it.
+
+**Still open after v0.5.0, and the durable prepare does not close it.** The architecturally correct fix is an SE-private DDL journal, so CF rename and drop are themselves transactional alongside user data writes. TidesDB 10's prepare covers transactions, and CF create / drop / rename are not transaction operations, so they cannot ride on it. Deferred again.
 
 ## Verified fixed upstream in v9.3.0 (formerly our bloomfix patch)
 

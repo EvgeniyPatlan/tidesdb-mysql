@@ -171,7 +171,7 @@ If you want to develop the plugin (run tests, edit code, rebuild fast):
 
 `build-all.sh` runs three steps:
 
-1. **`setup-workspace.sh`** — clones `mysql-server@mysql-9.7.0` and `tidesdb@v9.3.2` into `vendor/`, then installs `plugin/` and `mysql-test-suite/` into the MySQL tree.
+1. **`setup-workspace.sh`** — clones `mysql-server@mysql-9.7.0` and `tidesdb@v10.0.1` into `vendor/`, applies the engine patches under `docker/patches/tidesdb/`, then installs `plugin/` and `mysql-test-suite/` into the MySQL tree.
 2. **`build-tidesdb.sh`** — builds `libtidesdb.a` (Debug, with symbols) into `vendor/tidesdb-prefix/`.
 3. **`build-plugin.sh`** — configures MySQL with `WITH_TIDESDB_STORAGE_ENGINE=DYNAMIC`, builds `ha_tidesdb.so`.
 
@@ -219,7 +219,9 @@ pre-v0.4.0 tables.
 |  `test-plugin.sh` (hand-rolled CRUD, 37 cases)        | **37/37 ✓** |
 | `test-persistence.sh` (cross-restart durability)     | **PASS** |
 | `smoke-test.sh` (end-to-end pipeline)                | **all phases ✓** |
-| MTR suite (lifted from TideSQL + post-review additions) | **58/58 executed pass, 2 skipped** |
+| MTR suite (lifted from TideSQL + post-review additions) | **87/87 ✓** (6 skipped: 4 perf-gated, native partitioning, MariaDB VECTOR) |
+| `test-cross-version.sh` (v9 data directory refused, not opened empty) | **PASS** |
+| Engine test suite (`ctest` against the bundled TidesDB) | **54/54 ✓** |
 
 What works:
 
@@ -233,12 +235,12 @@ What works:
 - **`ALGORITHM=INSTANT DROP COLUMN`** when the dropped column is at the end of the table — no row rewrite. Mid-column drops fall back to `ALGORITHM=COPY` (still correct, just slower).
 - **At-rest encryption (AES-256-CBC)** via a master-key file pointed to by `--tidesdb-master-key-file=<path>` (32 bytes raw key); per-table opt-in with `ENGINE_ATTRIBUTE='{"encrypted":true}'`
 - **Pessimistic row locking** (opt-in via `--tidesdb-pessimistic-locking=ON`) — InnoDB-style row-level locks for write workloads; engine-level OCC is automatically downgraded to TidesDB `READ_COMMITTED` so the SQL-layer lock manager handles serialization without false-positive commit conflicts.
-- 2-phase commit via `prepare` hook → `ER_LOCK_DEADLOCK` surfaces cleanly to user code
+- **Durable two-phase commit.** Transactions prepare durably in the engine and stay invisible until the server decides them; a crash between prepare and commit is resolved from the binlog at startup. Conflicts still surface as `ER_LOCK_DEADLOCK` before binlog ordering.
 - Cross-restart persistence
 - `ALTER TABLE x ENGINE=TIDESDB` (engine conversion from InnoDB)
 - Per-table compression (`NONE | SNAPPY | LZ4 | ZSTD | LZ4_FAST`) via `ENGINE_ATTRIBUTE`
 - Bloom filters via `ENGINE_ATTRIBUTE`
-- Per-row TTL, server-level TidesDB tuning system variables, online backup / checkpoint
+- Per-row TTL, server-level TidesDB tuning system variables, online backup (`tidesdb_backup_dir`)
 - Mixed-engine transactions (TidesDB + InnoDB in the same `BEGIN…COMMIT`)
 - Full-text search, spatial / R-tree indexes, generated columns
 
@@ -250,7 +252,7 @@ Skipped MTR tests (specific feature gaps, each documented inline):
 Not yet, but in-scope for follow-up work:
 
 - **`ALGORITHM=INSTANT DROP COLUMN` for non-trailing columns** — currently falls back to `ALGORITHM=COPY` for middle-of-table drops. Lifting this requires per-row schema versioning (à la InnoDB's INSTANT DROP) so old rows can be remapped to the new layout. Trailing drops already work as INSTANT.
-- **Atomic DDL via SDI** — handlerton callbacks are registered but not exercised end-to-end; restart-safe DDL is the next big follow-up.
+- **Transactional DDL.** Creating, dropping and renaming a column family are direct engine calls rather than transaction operations, so they cannot ride on the durable prepare above. The DD-commit / engine-commit window they leave is reconciled by a sweep that currently needs a manual trigger. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md) §1, §5a and §6.
 - **Replication, FK constraints, savepoint nesting** — not in scope yet.
 
 ## Layout
