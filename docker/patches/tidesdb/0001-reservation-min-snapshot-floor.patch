@@ -1,0 +1,43 @@
+diff --git a/src/txn/txn_commit.c b/src/txn/txn_commit.c
+index 809aeb9..7c7b10c 100644
+--- a/src/txn/txn_commit.c
++++ b/src/txn/txn_commit.c
+@@ -482,7 +482,37 @@ static int txn_reserve_writes(tdb_txn_t *txn, const tidesdb_wal_entry_t *entries
+      * scheduler already runs, read here as one relaxed load -- running the scan on this path would
+      * mean every registry shard, once per written key. it is only ever stale low, and low is the
+      * conservative direction */
+-    const uint64_t min_snapshot = tidesdb_txn_registry_published_min_snapshot(txn->registry);
++    uint64_t min_snapshot = tidesdb_txn_registry_published_min_snapshot(txn->registry);
++
++    /* The published value is zero in two different situations, and this
++       consumer must not treat them alike. publish_min_snapshot stores zero
++       when the registry is empty -- "nothing constrains you" -- and zero is
++       also what the field holds before any scan has published at all, which is
++       the state a database stays in until its first compaction runs.
++       tidesdb_txn_registry_publish_min_snapshot is called from exactly one
++       place, the compaction scheduler, so a workload that has not compacted
++       yet reads zero here on every commit.
++       Zero read as a bound means no committed occupant of a reservation slot
++       is ever old enough to retire: the cseq > min_snapshot arm of the test in
++       tidesdb_mvcc_reserve is then true for every occupant, the fingerprint
++       comparison that tells a real same-key writer from a hash collision
++       stops deciding anything, and a commit with no conflict is refused as
++       soon as one of its keys collides with any slot still holding a
++       committed entry. That is the outcome the comment above warns about,
++       reached without any concurrency at all -- a single connection running
++       delete-plus-insert transactions hits it after a few hundred commits.
++       So when the published value is zero, take the exact minimum once for
++       the whole write set. An empty registry answers UINT64_MAX, and the
++       honest bound for it here is this commit's own sequence: no live
++       snapshot depends on anything below it, so every committed occupant
++       beneath it is retirable. The cost is one registry scan on a path that
++       would otherwise be guaranteed to refuse wrongly, and only while
++       nothing has published. */
++    if (min_snapshot == 0)
++    {
++        const uint64_t exact = tidesdb_txn_registry_min_snapshot(txn->registry);
++        min_snapshot = (exact == UINT64_MAX) ? seq : exact;
++    }
+ 
+     /* the intervals this batch writes are claimed first, so a point write that arrives afterwards
+      * meets them. an interval cannot be claimed as a key hash -- there is no one key to hash -- so
