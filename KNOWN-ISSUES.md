@@ -3,52 +3,75 @@
 This document tracks defects we've confirmed in the bundled TidesDB engine
 that affect `tidesdb-mysql` users.
 
-## Current: bundled on TidesDB v9.3.2 — shipped unpatched
+## Current: bundled on TidesDB v10.0.1 — one patch carried
 
-As of release **v0.3.1** the engine is pinned to **TidesDB v9.3.2** and we
-continue to ship it **with zero patches**. Both fixes we used to carry are
-upstream:
+The engine is pinned to **TidesDB v10.0.1** and we carry **one** patch,
+`docker/patches/tidesdb/0001-reservation-retirement-floor.patch`. It is applied
+by both `docker/Dockerfile.mysql` and `scripts/setup-workspace.sh`, so a local
+build and the shipped image run the same engine.
 
-- `0001-walfix.patch` (four durability bugs) — fixed in **v9.2.5**, retired then.
+### `0001-reservation-retirement-floor.patch` — conflict-free commits refused
+
+**Severity:** high — aborts transactions that have no conflict, on workloads
+with no concurrency at all.
+
+TidesDB 10 added a first-committer-wins reservation table: 2^20 slots indexed
+by the low bits of a key hash, each packing a 16-bit fingerprint with a commit
+sequence. When two unrelated keys land in one slot, the fingerprint is what
+distinguishes a real same-key writer from the collision. It only gets to decide
+if the slot's current occupant can be retired, and the bound deciding that was
+wrong in two ways:
+
+- It counted the committing transaction itself. That transaction has already
+  weighed its whole write set against its own read versions, so it is never the
+  reader the bound is protecting; counting itself only barred it from evicting
+  records nothing else wanted. Snapshots are drawn one below the highest
+  assigned sequence, so the previous commit on the same connection always sat
+  above the next transaction's snapshot — permanently unretirable.
+- It read `published_min_snapshot`, which is maintained for the compaction GC
+  floor. That consumer wants the value to err low; this one needs the opposite,
+  because low makes occupants look unretirable and refuses good commits. It is
+  also stale between compaction scans and zero before the first one, since the
+  publishing call has a single caller.
+
+**Symptom:** `ERROR 1180 ... Got error 149 - 'Lock deadlock; Retry transaction'`
+on `COMMIT`, on a single connection, with no other writer on the server. A
+1000-transaction single-connection loop (4 UPDATEs + 1 DELETE + 1 INSERT over
+5000 rows with a secondary index) produced 2 such aborts; with the patch, 0
+over 5000 transactions.
+
+**Fix:** take the exact minimum over the *other* live transactions. The
+registry also gained a live count so the common single-writer case answers
+without walking all 32 shards, which keeps single-threaded commit throughput
+where it was.
+
+Sent upstream; drop the patch once it lands.
+
+### Retired patches
+
+Both patches we used to carry are upstream and no longer applied:
+
+- `0001-walfix.patch` (four durability bugs) — fixed in **v9.2.5**.
 - `0001-bloomfix.patch` (the `bloom_filter_new` UAF, TidesDB **PR #626**) —
-  landed upstream **verbatim in v9.3.0**, retired with that bump.
+  landed upstream verbatim in **v9.3.0**.
 
-The `docker/patches/` directory has no engine patches; no Dockerfile or script
-applies one. The per-bug write-ups below are kept as a record and as a
-regression checklist for future upgrades.
+The per-bug write-ups below are kept as a record and as a regression checklist
+for future upgrades.
 
-What's new since v9.3.0 (v9.3.1 + v9.3.2, no plugin change needed):
+Handled plugin-side (see [CHANGELOG.md](CHANGELOG.md)):
 
-- **Concurrency / memory-safety hardening (v9.3.1).** Clock-cache reader-pin
-  wraparound at 128 readers (would corrupt zero-copy buffers), flush-cleanup
-  use-after-free over the sixteen-immutable threshold, transaction-reset
-  dangling pointer (repeatable-read / snapshot), duplicate column-family
-  registration race, 32-bit MSVC atomics.
-- **Reader FD starvation fix (v9.3.1).** Engine-side counterpart to the
-  fd-pressure behaviour the v0.3.0 100 GiB stress run documented: a flush-path
-  descriptor leak (a bare `close` skipping the counted-open decrement) is fixed,
-  and reader/reaper budgets are unified so the reserve always stays available.
-- **Backpressure simplification (v9.3.1).** L1 hard-stop removed; admission is
-  governed by L0 stall + the active-memtable ceiling.
-- **Parallel compaction within a round (v9.3.1).** Per-CF rounds borrow
-  ephemeral helper threads with work-stealing and shard merge output across
-  key-range subcompactions; ~25 % higher ingest throughput in upstream's tests.
-- **Large bloom filters / block indexes (v9.3.2).** Auxiliary klog blocks are
-  chunked when they exceed the 4 GB block-manager size; **backwards-compatible**.
-- **`_tidesdb_cancel_background_work_` (v9.3.2).** Quick-shutdown helper for
-  large flush/compaction queues.
-
-Carried over from v9.3.0 and still handled plugin-side
-(see [CHANGELOG.md](CHANGELOG.md)):
-
-- **`TDB_ERR_BUSY` (-14)** is returned from backpressure-stall timeouts that
-  previously surfaced as `TDB_ERR_IO`. `tdb_rc_to_ha` maps it to
-  `HA_ERR_LOCK_WAIT_TIMEOUT` (retriable), so a transient stall no longer looks
-  like `HA_ERR_CRASHED` (corruption).
-- The new **active-memtable backpressure ceiling** (2× `write_buffer_size`)
-  bounds the unbounded memtable growth that produced the WARE=100 OOM during
-  v0.2.5 validation; the plugin's `default_l0_queue_stall_threshold` default
-  was lowered 20 → 10 to match upstream now that this is the gating surface.
+- **Error code -14 changed meaning in v10.** It was `TDB_ERR_BUSY`
+  (backpressure-stall timeout) through the 9.x line; it is now
+  `TDB_ERR_TXN_EXPIRED`. The number is the same, so nothing fails to compile --
+  `tdb_rc_to_ha` was updated by hand. v10 also adds `TDB_ERR_NO_SPACE` (-15),
+  `TDB_ERR_TXN_ABORTED` (-16) and `TDB_ERR_TOO_OLD` (-17).
+- **`TDB_ERR_LOCKED`** marks a read left unservable by contention, which the
+  caller is expected to retry rather than surface. The plugin wraps the
+  affected engine reads in a bounded retry (`plugin/tidesdb_retry.h`).
+- The **active-memtable backpressure ceiling** (2x `write_buffer_size`) bounds
+  the unbounded memtable growth that produced the WARE=100 OOM during v0.2.5
+  validation; the plugin's `default_l0_queue_stall_threshold` default was
+  lowered 20 -> 10 to match upstream now that this is the gating surface.
 
 ## Known limitations introduced or formalised in v0.4.0
 

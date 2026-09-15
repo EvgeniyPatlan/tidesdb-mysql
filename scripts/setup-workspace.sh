@@ -3,7 +3,9 @@
 #
 # What it does:
 #   1. Clones MySQL Server 9.7 into vendor/mysql-server (shallow, ~1 GB)
-#   2. Clones TidesDB into vendor/tidesdb (shallow, ~10 MB)
+#   2. Clones TidesDB into vendor/tidesdb (shallow, ~10 MB) and applies
+#      docker/patches/tidesdb/*.patch, the same set the Docker image build
+#      applies
 #   3. (Optional) Clones TideSQL reference into vendor/tidesql (only if you
 #      want to re-run scripts/replay-port-edits.sh; not needed for normal use)
 #   4. Copies the plugin source into vendor/mysql-server/storage/tidesdb/
@@ -30,6 +32,34 @@ WITH_TIDESQL_REFERENCE="${WITH_TIDESQL_REFERENCE:-0}"
 
 mkdir -p vendor
 
+# Apply docker/patches/tidesdb/*.patch to an engine tree, the same set and the
+# same order docker/Dockerfile.mysql applies. Keeping the two in step is what
+# stops a local build from differing from the shipped image -- a difference
+# that shows up as test failures with no visible cause. Patches already
+# present are skipped rather than reapplied, so this is safe to re-run.
+apply_engine_patches() {
+    local tree="$1" p
+    shopt -s nullglob
+    local patches=("$REPO"/docker/patches/tidesdb/*.patch)
+    shopt -u nullglob
+    if [ ${#patches[@]} -eq 0 ]; then
+        echo "[setup] no engine patches to apply"
+        return 0
+    fi
+    for p in "${patches[@]}"; do
+        if git -C "$tree" apply --check "$p" 2>/dev/null; then
+            echo "[setup] applying $(basename "$p")"
+            git -C "$tree" apply "$p"
+        elif git -C "$tree" apply --reverse --check "$p" 2>/dev/null; then
+            echo "[setup] already applied: $(basename "$p")"
+        else
+            echo "[setup] ERROR: $(basename "$p") neither applies nor is applied to $tree" >&2
+            return 1
+        fi
+    done
+}
+
+
 # ---------- 1) MySQL Server ----------
 if [ ! -d vendor/mysql-server/.git ]; then
     echo "[setup] Cloning MySQL Server $MYSQL_TAG (shallow, ~10 min)"
@@ -44,10 +74,14 @@ if [ ! -d "$TIDESDB_SRC_DIR/.git" ]; then
     echo "[setup] Cloning TidesDB $TIDESDB_TAG -> $TIDESDB_SRC_DIR"
     git clone --depth=1 --branch "$TIDESDB_TAG" \
         https://github.com/tidesdb/tidesdb.git "$TIDESDB_SRC_DIR"
-    # Engine shipped unpatched as of v9.3.0: walfix landed in v9.2.5, the
-    # bloom_filter_new UAF (PR #626) in v9.3.0. No patches/ step required.
+    apply_engine_patches "$TIDESDB_SRC_DIR"
 else
     echo "[setup] $TIDESDB_SRC_DIR already present — skipping clone"
+    # A tree cloned before a patch was added, or reset since, is the case worth
+    # catching: the build would be silently unpatched and the failures it
+    # causes look nothing like a missing patch. Applying is idempotent because
+    # an already-applied patch fails --check and is skipped.
+    apply_engine_patches "$TIDESDB_SRC_DIR"
 fi
 
 # ---------- 3) TideSQL reference (optional) ----------
