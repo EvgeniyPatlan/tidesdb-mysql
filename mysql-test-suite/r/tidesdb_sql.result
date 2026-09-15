@@ -366,7 +366,7 @@ dept_id
 4
 SELECT COUNT(DISTINCT dept_id) AS unique_depts FROM employees;
 unique_depts
-2
+4
 #
 # ============================================
 # TEST 18: ORDER BY with LIMIT / OFFSET

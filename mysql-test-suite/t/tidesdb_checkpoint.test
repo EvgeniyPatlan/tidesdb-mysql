@@ -1,42 +1,48 @@
 --source suite/tidesdb/include/have_tidesdb.inc
 #
-# Test: Hard-link checkpoint via tidesdb_checkpoint_dir
+# Test: tidesdb_checkpoint_dir is refused, and clearing it still works.
+#
+# Through TidesDB 9 this variable took a destination and produced a
+# near-instant hard-link snapshot there. v10 split the two ideas apart:
+# tidesdb_checkpoint(db) is a durability barrier taken in place -- flush the
+# memtable to L1, then force the value log, WAL and manifest to disk whatever
+# the sync mode -- and it writes no directory at all. Nothing in the v10 API
+# produces a hard-link snapshot, so the variable cannot do what it promised
+# and is refused rather than quietly repurposed onto a full backup.
 #
 
---echo #
---echo # TEST 1: Create checkpoint
---echo #
-
 CREATE TABLE t_ckpt (id INT PRIMARY KEY, val VARCHAR(100)) ENGINE=TidesDB;
-INSERT INTO t_ckpt VALUES (1, 'before_checkpoint'), (2, 'data_two'), (3, 'data_three');
+INSERT INTO t_ckpt VALUES (1, 'before'), (2, 'data_two'), (3, 'data_three');
+
+--echo #
+--echo # TEST 1: setting a path is refused, and says what to use instead
+--echo #
 
 --let $ckpt_dir=$MYSQLTEST_VARDIR/tmp/tidesdb_checkpoint_test
---error 0
---exec rm -rf $MYSQLTEST_VARDIR/tmp/tidesdb_checkpoint_test
-
---disable_query_log
+--replace_result $MYSQLTEST_VARDIR MYSQLTEST_VARDIR
+--error ER_UNKNOWN_ERROR
 --eval SET GLOBAL tidesdb_checkpoint_dir = '$ckpt_dir'
---enable_query_log
+
+--echo # No directory is produced by the refused statement.
+--error 1
+--exec test -d $ckpt_dir
 
 --echo #
---echo # TEST 3: Data survives after checkpoint
---echo #
-
-INSERT INTO t_ckpt VALUES (4, 'after_checkpoint');
-SELECT * FROM t_ckpt ORDER BY id;
-
---echo #
---echo # TEST 4: Clear checkpoint dir variable
+--echo # TEST 2: clearing it stays legal
+--echo #   An operator upgrading a server whose my.cnf still carries this must
+--echo #   be able to unset it without the server refusing them.
 --echo #
 
 SET GLOBAL tidesdb_checkpoint_dir = '';
+SELECT @@GLOBAL.tidesdb_checkpoint_dir IS NULL AS checkpoint_dir_cleared;
 
 --echo #
---echo # Cleanup
+--echo # TEST 3: the table is unaffected by the refusal
 --echo #
+
+INSERT INTO t_ckpt VALUES (4, 'after');
+SELECT * FROM t_ckpt ORDER BY id;
 
 DROP TABLE t_ckpt;
---exec rm -rf $MYSQLTEST_VARDIR/tmp/tidesdb_checkpoint_test
-
 --source suite/tidesdb/include/cleanup_tidesdb.inc
 --echo # Done.

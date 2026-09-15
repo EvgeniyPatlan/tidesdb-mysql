@@ -1,15 +1,22 @@
 # Relative paths must be rejected.
 SET GLOBAL tidesdb_backup_dir = 'relative/path';
 ERROR HY000: [TIDESDB] Backup path must be absolute and free of '..' / NUL components: 'relative/path' rejected
-SET GLOBAL tidesdb_checkpoint_dir = 'rel/path';
-ERROR HY000: [TIDESDB] Checkpoint path must be absolute and free of '..' / NUL components: 'rel/path' rejected
 # Absolute paths containing '..' must be rejected.
 SET GLOBAL tidesdb_backup_dir = '/var/lib/mysql/../etc/sneaky';
 ERROR HY000: [TIDESDB] Backup path must be absolute and free of '..' / NUL components: '/var/lib/mysql/../etc/sneaky' rejected
-SET GLOBAL tidesdb_checkpoint_dir = '/../etc/sneaky';
-ERROR HY000: [TIDESDB] Checkpoint path must be absolute and free of '..' / NUL components: '/../etc/sneaky' rejected
 SET GLOBAL tidesdb_backup_dir = '/var/../etc';
 ERROR HY000: [TIDESDB] Backup path must be absolute and free of '..' / NUL components: '/var/../etc' rejected
+# checkpoint_dir no longer reaches a path at all: TidesDB 10 checkpoints
+# in place, so the variable is refused whatever it is set to. Asserting
+# that directly is the honest test -- feeding it traversal paths would
+# pass on the rejection it now always gives and prove nothing about
+# path validation.
+SET GLOBAL tidesdb_checkpoint_dir = 'rel/path';
+ERROR HY000: [TIDESDB] tidesdb_checkpoint_dir is no longer supported: TidesDB 10 takes checkpoints in place and produces no snapshot directory. Use tidesdb_backup_dir for a copy on disk -- note it is a full backup, not a hard-link snapshot
+SET GLOBAL tidesdb_checkpoint_dir = '/../etc/sneaky';
+ERROR HY000: [TIDESDB] tidesdb_checkpoint_dir is no longer supported: TidesDB 10 takes checkpoints in place and produces no snapshot directory. Use tidesdb_backup_dir for a copy on disk -- note it is a full backup, not a hard-link snapshot
+SET GLOBAL tidesdb_checkpoint_dir = '/var/lib/mysql/perfectly-fine';
+ERROR HY000: [TIDESDB] tidesdb_checkpoint_dir is no longer supported: TidesDB 10 takes checkpoints in place and produces no snapshot directory. Use tidesdb_backup_dir for a copy on disk -- note it is a full backup, not a hard-link snapshot
 # Absolute path with a '..' substring inside a legitimate name is fine.
 # (e.g. /var/lib/...backups should not match the '..' boundary rule)
 # Setting to a non-existent absolute path will still fail at the

@@ -1,24 +1,29 @@
-#
-# TEST 1: Create checkpoint
-#
 CREATE TABLE t_ckpt (id INT PRIMARY KEY, val VARCHAR(100)) ENGINE=TidesDB;
-INSERT INTO t_ckpt VALUES (1, 'before_checkpoint'), (2, 'data_two'), (3, 'data_three');
+INSERT INTO t_ckpt VALUES (1, 'before'), (2, 'data_two'), (3, 'data_three');
 #
-# TEST 3: Data survives after checkpoint
+# TEST 1: setting a path is refused, and says what to use instead
 #
-INSERT INTO t_ckpt VALUES (4, 'after_checkpoint');
-SELECT * FROM t_ckpt ORDER BY id;
-id	val
-1	before_checkpoint
-2	data_two
-3	data_three
-4	after_checkpoint
+SET GLOBAL tidesdb_checkpoint_dir = 'MYSQLTEST_VARDIR/tmp/tidesdb_checkpoint_test';
+ERROR HY000: [TIDESDB] tidesdb_checkpoint_dir is no longer supported: TidesDB 10 takes checkpoints in place and produces no snapshot directory. Use tidesdb_backup_dir for a copy on disk -- note it is a full backup, not a hard-link snapshot
+# No directory is produced by the refused statement.
 #
-# TEST 4: Clear checkpoint dir variable
+# TEST 2: clearing it stays legal
+#   An operator upgrading a server whose my.cnf still carries this must
+#   be able to unset it without the server refusing them.
 #
 SET GLOBAL tidesdb_checkpoint_dir = '';
+SELECT @@GLOBAL.tidesdb_checkpoint_dir IS NULL AS checkpoint_dir_cleared;
+checkpoint_dir_cleared
+1
 #
-# Cleanup
+# TEST 3: the table is unaffected by the refusal
 #
+INSERT INTO t_ckpt VALUES (4, 'after');
+SELECT * FROM t_ckpt ORDER BY id;
+id	val
+1	before
+2	data_two
+3	data_three
+4	after
 DROP TABLE t_ckpt;
 # Done.

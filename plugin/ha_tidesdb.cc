@@ -25,6 +25,7 @@ extern "C"
    mode from the engine, so there is no such entry point to declare. */
 }
 
+#include <dirent.h>
 #include <ft_global.h>
 #include <mysql/plugin.h>
 
@@ -1296,6 +1297,38 @@ static int tidesdb_backup_dir_check(THD *thd, SYS_VAR *, void *save,
        update-based version did to dodge flush-thread deadlock. Copy the
        path because val_str's buffer is stack-local. */
     std::string backup_path(new_dir);
+
+    /* Refuse a destination that already holds files. TidesDB 9 enforced this
+       itself; v10 documents the directory only as "created if absent" and
+       writes into whatever is there. Backing a second snapshot over a first
+       interleaves two manifests' worth of sstables in one directory and still
+       reports success, so the damage is only discovered when the copy is
+       opened. Checking here keeps the property the engine dropped, and costs
+       one readdir on a path an operator triggers by hand. */
+    {
+        DIR *d = opendir(backup_path.c_str());
+        if (d)
+        {
+            bool has_entries = false;
+            const struct dirent *ent;
+            while ((ent = readdir(d)) != nullptr)
+            {
+                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+                has_entries = true;
+                break;
+            }
+            closedir(d);
+            if (has_entries)
+            {
+                my_printf_error(ER_UNKNOWN_ERROR,
+                                "[TIDESDB] Backup destination '%s' is not empty; "
+                                "backing up into it would mix this snapshot with "
+                                "what is already there",
+                                MYF(0), sanitized_path);
+                return 1;
+            }
+        }
+    }
 
     int rc = tidesdb_backup(tdb_get_engine(), const_cast<char *>(backup_path.c_str()));
 
@@ -5068,9 +5101,14 @@ int ha_tidesdb::fetch_row_by_pk(tidesdb_txn_t *txn, const uchar *pk, uint pk_len
 /* ******************** compute_row_ttl ******************** */
 
 /*
-  Compute the absolute TTL timestamp for a row being written.
+  Compute the lifetime, in seconds, of a row being written.
   Priority -- per-row TTL_COL value > table-level TTL option > no expiration.
-  Returns -1 (no expiration) or a future absolute Unix timestamp.
+  Returns TIDESDB_TTL_NONE (no expiration) or a positive second count.
+
+  TidesDB 10 takes a lifetime here and converts it to a deadline itself, at
+  the call boundary; TidesDB 9 took the deadline. Handing the newer engine an
+  absolute timestamp is not rejected -- it reads as a lifetime of however many
+  seconds have elapsed since 1970, so every row simply outlives the server.
 */
 time_t ha_tidesdb::compute_row_ttl(const uchar *buf)
 {
@@ -5100,15 +5138,7 @@ time_t ha_tidesdb::compute_row_ttl(const uchar *buf)
 
     if (ttl_seconds <= 0) return TIDESDB_TTL_NONE;
 
-    /* We use cached time(NULL) to avoid the vDSO/syscall per row.
-       n-second granularity is more than sufficient for TTL. */
-    if (!cached_time_valid_)
-    {
-        cached_time_ = time(NULL);
-        cached_time_valid_ = true;
-    }
-
-    return (time_t)(cached_time_ + ttl_seconds);
+    return (time_t)ttl_seconds;
 }
 
 /* ******************** iter_read_current ******************** */
@@ -7607,7 +7637,15 @@ int ha_tidesdb::info(uint flag)
             memset(&st, 0, sizeof(st));
             if (tidesdb_get_cf_stats(share->cf, &st) == TDB_SUCCESS)
             {
-                share->cached_records.store(st.total_keys, std::memory_order_relaxed);
+                /* total_keys counts only what is in sstables; keys still in the
+                   memtable are reported separately as unflushed_key_count. A
+                   table that has not flushed yet therefore has total_keys == 0,
+                   and reporting that as the row count tells the optimizer the
+                   table is empty -- which makes it choose a full scan over any
+                   index, and makes information_schema report TABLE_ROWS 0 and
+                   DATA_LENGTH 0 for a table plainly holding rows. */
+                share->cached_records.store(st.total_keys + st.unflushed_key_count,
+                                            std::memory_order_relaxed);
 
                 /* total_data_size only counts SSTable klog+vlog; memtable_size
                    holds the active memtable footprint.  Sum both so that
@@ -7618,13 +7656,21 @@ int ha_tidesdb::info(uint flag)
                    unflushed_key_count instead. Estimate the unflushed footprint
                    from it so DATA_LENGTH is non-zero before the first flush,
                    which is what this fallback has always been for. */
-                const double avg_row = st.avg_key_size + st.avg_value_size;
+                /* The averages come from sstable content, so they are zero until
+                   something has flushed -- and multiplying the unflushed key
+                   count by zero is how DATA_LENGTH ended up at 0 for a table
+                   plainly holding rows. Fall back to the declared record length,
+                   which is what the mean-record-length figure below has always
+                   done for the same reason. */
+                double row_bytes = st.avg_key_size + st.avg_value_size;
+                if (row_bytes <= 0.0) row_bytes = (double)table->s->reclength;
+
                 uint64_t data_sz =
-                    st.total_data_size + (uint64_t)(st.unflushed_key_count * avg_row);
-                if (data_sz == 0 && st.total_keys > 0)
-                    data_sz = (uint64_t)(st.total_keys * avg_row);
+                    st.total_data_size + (uint64_t)(st.unflushed_key_count * row_bytes);
+                if (data_sz == 0 && (st.total_keys + st.unflushed_key_count) > 0)
+                    data_sz = (uint64_t)((st.total_keys + st.unflushed_key_count) * row_bytes);
                 share->cached_data_size.store(data_sz, std::memory_order_relaxed);
-                uint32_t mrl = (uint32_t)avg_row;
+                uint32_t mrl = (uint32_t)row_bytes;
                 if (mrl == 0) mrl = table->s->reclength;
                 share->cached_mean_rec_len.store(mrl, std::memory_order_relaxed);
                 share->cached_read_amp.store(st.read_amp > 0 ? st.read_amp : READ_AMP_NONE,
@@ -7639,11 +7685,12 @@ int ha_tidesdb::info(uint flag)
                     memset(&ist, 0, sizeof(ist));
                     if (tidesdb_get_cf_stats(share->idx_cfs[i], &ist) == TDB_SUCCESS)
                     {
-                        const double iavg = ist.avg_key_size + ist.avg_value_size;
+                        double iavg = ist.avg_key_size + ist.avg_value_size;
+                        if (iavg <= 0.0) iavg = (double)table->key_info[i].key_length;
                         uint64_t isz =
                             ist.total_data_size + (uint64_t)(ist.unflushed_key_count * iavg);
-                        if (isz == 0 && ist.total_keys > 0)
-                            isz = (uint64_t)(ist.total_keys * iavg);
+                        if (isz == 0 && (ist.total_keys + ist.unflushed_key_count) > 0)
+                            isz = (uint64_t)((ist.total_keys + ist.unflushed_key_count) * iavg);
                         idx_total += isz;
                     }
                 }

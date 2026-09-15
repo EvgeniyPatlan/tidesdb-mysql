@@ -12,10 +12,7 @@ Column families: N
 Global sequence: N
 
 --- Memory ---
-Total system memory: N MB
-Resolved memory limit: N MB
-Memory pressure level: N
-Total memtable bytes: N
+Memtable bytes: N
 Transaction memory bytes: N
 
 --- Storage ---
@@ -25,9 +22,17 @@ Total data size: N bytes
 Immutable memtables: N
 
 --- Background ---
-Flush pending: N
-Flush queue size: N
-Compaction queue size: N
+Flushing now: NO
+Compaction pending: N
+Flushes / compactions: N / N
+
+--- Write Stalls ---
+Throttled / blocked: N / N
+Total stall: N us (ceiling hits: N)
+
+--- Value Log ---
+Live / dead bytes: N / N
+Segments: N (drainable: N)
 
 --- Block Cache ---
 Enabled: YES
