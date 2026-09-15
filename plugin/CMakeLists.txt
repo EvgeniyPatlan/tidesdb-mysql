@@ -176,14 +176,9 @@ IF(WIN32)
   ENDIF()
 ENDIF()
 
-############# Optional S3 object store connector #############
-OPTION(TIDESDB_WITH_S3 "Enable S3-compatible object store connector" OFF)
-IF(TIDESDB_WITH_S3)
-  FIND_PACKAGE(CURL REQUIRED)
-  FIND_PACKAGE(OpenSSL REQUIRED)
-  LIST(APPEND TIDESDB_LIBS CURL::libcurl OpenSSL::SSL OpenSSL::Crypto)
-  MESSAGE(STATUS "TidesDB: S3 object store connector enabled")
-ENDIF()
+############# S3 object store connector: removed upstream #############
+# TidesDB 10 removed object-store mode and the S3 connector with it, so there
+# is nothing left to opt into and no curl/OpenSSL dependency to pull in for it.
 
 ############# Define the storage engine using MySQL's MYSQL_ADD_PLUGIN macro #############
 MYSQL_ADD_PLUGIN(tidesdb ha_tidesdb.cc tidesdb_master_key.cc tidesdb_row_lock.cc
@@ -193,12 +188,7 @@ MYSQL_ADD_PLUGIN(tidesdb ha_tidesdb.cc tidesdb_master_key.cc tidesdb_row_lock.cc
                  tidesdb_perf_ring.cc
                  STORAGE_ENGINE MODULE_ONLY LINK_LIBRARIES ${TIDESDB_LIBS})
 
-############# S3 compile definition for the plugin #############
-IF(TIDESDB_WITH_S3)
-  IF(TARGET tidesdb)
-    TARGET_COMPILE_DEFINITIONS(tidesdb PRIVATE TIDESDB_WITH_S3)
-  ENDIF()
-ENDIF()
+
 
 ############# Soften strictness for the plugin target.                     #############
 ############# Tracked work item -- run scripts/check-strict-build.sh        #############

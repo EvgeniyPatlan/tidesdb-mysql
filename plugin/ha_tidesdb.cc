@@ -21,12 +21,8 @@ extern "C"
 {
 #define XXH_INLINE_ALL
 #include <tidesdb/xxhash.h>
-#ifdef TIDESDB_WITH_S3
-    tidesdb_objstore_t *tidesdb_objstore_s3_create(const char *endpoint, const char *bucket,
-                                                   const char *prefix, const char *access_key,
-                                                   const char *secret_key, const char *region,
-                                                   int use_ssl, int use_path_style);
-#endif
+/* The S3 connector declaration lived here. TidesDB 10 removed object-store
+   mode from the engine, so there is no such entry point to declare. */
 }
 
 #include <ft_global.h>
@@ -1040,30 +1036,22 @@ static MYSQL_SYSVAR_ULONGLONG(
 
 /* Promote replica to primary -- trigger variable (like backup_dir) */
 static my_bool srv_promote_primary = 0;
-static void tidesdb_promote_primary_update(THD *thd, SYS_VAR *, void *var_ptr,
+static void tidesdb_promote_primary_update(THD *, SYS_VAR *, void *var_ptr,
                                            const void *save)
 {
     my_bool val = *static_cast<const my_bool *>(save);
-    if (!val) return; /* only act on SET ... = ON */
+    *static_cast<my_bool *>(var_ptr) = 0; /* trigger semantics: always resets */
+    if (!val) return;                     /* only ON means anything */
 
-    if (!tdb_get_engine())
-    {
-        my_error(ER_UNKNOWN_ERROR, MYF(0));
-        return;
-    }
-
-    int rc = tidesdb_promote_to_primary(tdb_get_engine());
-    if (rc == TDB_SUCCESS)
-    {
-        sql_print_information("[TIDESDB] Replica promoted to primary successfully");
-    }
-    else
-    {
-        sql_print_error("[TIDESDB] Failed to promote replica (err=%d)", rc);
-    }
-
-    /* reset to OFF so it can be triggered again */
-    *static_cast<my_bool *>(var_ptr) = 0;
+    /* Replica promotion belonged to object-store mode, which TidesDB 10
+       removed along with the tidesdb_promote_to_primary entry point. There is
+       no replica to promote and no call to make, so say that rather than
+       silently accepting a trigger that now does nothing. */
+    my_printf_error(ER_UNKNOWN_ERROR,
+                    "[TIDESDB] tidesdb_promote_primary is no longer supported: "
+                    "object-store replication was removed from the engine in "
+                    "TidesDB 10",
+                    MYF(0));
 }
 
 static MYSQL_SYSVAR_BOOL(promote_primary, srv_promote_primary, PLUGIN_VAR_RQCMDARG,
@@ -2625,24 +2613,9 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
     pos += snprintf(buf + pos, sizeof(buf) - pos, "Worst SSTable density: %.2f%% at level %ld\n",
                     srv_stat_max_sst_density * PERCENT_SCALE, (long)srv_stat_max_sst_density_level);
 
-    /* Object store stats */
-    if (db_st.object_store_enabled)
-    {
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "\n--- Object Store ---\n");
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "Connector: %s\n",
-                        db_st.object_store_connector ? db_st.object_store_connector : "unknown");
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "Total uploads: %lu\n",
-                        (unsigned long)db_st.total_uploads);
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "Upload failures: %lu\n",
-                        (unsigned long)db_st.total_upload_failures);
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "Upload queue depth: %lu\n",
-                        (unsigned long)db_st.upload_queue_depth);
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "Local cache: %lu / %lu bytes (%d files)\n",
-                        (unsigned long)db_st.local_cache_bytes_used,
-                        (unsigned long)db_st.local_cache_bytes_max, db_st.local_cache_num_files);
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "Replica mode: %s\n",
-                        db_st.replica_mode ? "ON" : "OFF");
-    }
+    /* No object-store section: TidesDB 10 removed the subsystem, so
+       tidesdb_db_stats_t carries no upload, cache or replica counters to
+       report. */
 
     /* Last conflict info */
     mysql_mutex_lock(&g_engine_ctx.last_conflict_mutex);
@@ -3158,67 +3131,61 @@ static int tidesdb_init_func(void *p)
     cfg.memtable_skip_list_max_level = 0;      /* 0 = library default */
     cfg.memtable_skip_list_probability = 0.0f; /* 0 = library default */
 
-    /* Object store connector setup */
-    tidesdb_objstore_t *objstore_connector = NULL;
-    static tidesdb_objstore_config_t objstore_cfg;
+    /* An existing my.cnf may still carry object-store settings. They are all
+       PLUGIN_VAR_READONLY, so the server applies them here at init rather than
+       through a check function, and nothing else would notice them.
 
-    if (srv_object_store_backend == OBJSTORE_BACKEND_S3)
+       Deleting the variables instead would make mysqld refuse to start with
+       "unknown variable" and no indication of what replaced what -- the
+       outcome tidesdb_legacy_compat exists to avoid. They stay registered,
+       inert, and report themselves. */
     {
-#ifdef TIDESDB_WITH_S3
-        if (!srv_s3_endpoint || !srv_s3_bucket || !srv_s3_access_key || !srv_s3_secret_key)
+        struct
         {
-            sql_print_error(
-                "[TIDESDB] S3 backend requires s3_endpoint, s3_bucket, "
-                "s3_access_key, and s3_secret_key");
-            DBUG_RETURN(1);
-        }
-
-        /* L-4 + MF-2: redact endpoint/bucket in BOTH success and
-           failure logs. The original L-4 fix only covered the success
-           log; the follow-up review flagged that the failure path at
-           the error site below still leaked the raw values. Hoist the
-           redactor here so both sites use it. */
-        auto redact = [](const char *s) -> const char * {
-            if (!s || !s[0]) return "(unset)";
-            return "***";
+            const char *name;
+            bool set;
+        } objstore_vars[] = {
+            {"tidesdb_object_store_backend", srv_object_store_backend != OBJSTORE_BACKEND_LOCAL},
+            {"tidesdb_s3_endpoint", srv_s3_endpoint != NULL && srv_s3_endpoint[0] != '\0'},
+            {"tidesdb_s3_bucket", srv_s3_bucket != NULL && srv_s3_bucket[0] != '\0'},
+            {"tidesdb_s3_prefix", srv_s3_prefix != NULL && srv_s3_prefix[0] != '\0'},
+            {"tidesdb_s3_access_key", srv_s3_access_key != NULL && srv_s3_access_key[0] != '\0'},
+            {"tidesdb_s3_secret_key", srv_s3_secret_key != NULL && srv_s3_secret_key[0] != '\0'},
+            {"tidesdb_s3_region", srv_s3_region != NULL && srv_s3_region[0] != '\0'},
+            {"tidesdb_s3_path_style", srv_s3_path_style != 0},
+            {"tidesdb_objstore_wal_sync_on_commit", srv_objstore_wal_sync_on_commit != 0},
+            {"tidesdb_replica_mode", srv_replica_mode != 0},
         };
 
-        objstore_connector = tidesdb_objstore_s3_create(
-            srv_s3_endpoint, srv_s3_bucket, srv_s3_prefix, srv_s3_access_key, srv_s3_secret_key,
-            srv_s3_region, srv_s3_use_ssl ? 1 : 0, srv_s3_path_style ? 1 : 0);
-
-        if (!objstore_connector)
+        bool any = false;
+        for (const auto &v : objstore_vars)
         {
-            sql_print_error("[TIDESDB] Failed to create S3 connector for %s/%s",
-                            redact(srv_s3_endpoint), redact(srv_s3_bucket));
-            DBUG_RETURN(1);
+            if (!v.set) continue;
+            any = true;
+            if (srv_legacy_compat == 0) /* strict */
+                sql_print_error(
+                    "[TIDESDB] %s is set, but object-store mode was removed from "
+                    "the engine in TidesDB 10. Remove it from the configuration, "
+                    "or set tidesdb_legacy_compat=warn to start anyway.",
+                    v.name);
+            else
+                sql_print_warning(
+                    "[TIDESDB] %s is set but ignored: object-store mode was "
+                    "removed from the engine in TidesDB 10",
+                    v.name);
         }
-
-        sql_print_information("[TIDESDB] S3 connector created (endpoint=%s, bucket=%s, ssl=%s)",
-                              redact(srv_s3_endpoint), redact(srv_s3_bucket),
-                              srv_s3_use_ssl ? "yes" : "no");
-#else
-        sql_print_error(
-            "[TIDESDB] S3 backend requested but TidesDB was not built with "
-            "-DTIDESDB_WITH_S3=ON");
-        DBUG_RETURN(1);
-#endif
+        if (any && srv_legacy_compat == 0) DBUG_RETURN(1);
     }
 
-    if (objstore_connector)
-    {
-        objstore_cfg = tidesdb_objstore_default_config();
-        objstore_cfg.local_cache_max_bytes = (size_t)srv_objstore_local_cache_max;
-        objstore_cfg.wal_sync_threshold_bytes = (size_t)srv_objstore_wal_sync_threshold;
-        objstore_cfg.wal_sync_on_commit = srv_objstore_wal_sync_on_commit ? 1 : 0;
-        objstore_cfg.replicate_wal = 1; /* upload WAL segments for replica recovery */
-        objstore_cfg.replica_mode = srv_replica_mode ? 1 : 0;
-        objstore_cfg.replica_sync_interval_us = (uint64_t)srv_replica_sync_interval;
-        objstore_cfg.replica_replay_wal = 1;
+    /* Object-store mode is gone from the engine as of TidesDB 10, which
+       removed the S3 connector outright in favour of the engine participating
+       in distributed transactions and carrying a smaller dependency
+       footprint. There is no connector to build and nothing on
+       tidesdb_config_t to attach it to.
 
-        cfg.object_store = objstore_connector;
-        cfg.object_store_config = &objstore_cfg;
-    }
+       The sysvars that configured it stay registered as rejecting stubs so an
+       existing my.cnf gets an explanation rather than "unknown variable" --
+       see the tidesdb_objstore_removed_check family below. */
 
     tidesdb_t *opened = nullptr;
     int rc = tidesdb_open(&cfg, &opened);
@@ -3276,31 +3243,18 @@ static int tidesdb_init_func(void *p)
 
     sql_print_information("[TIDESDB] TidesDB opened at %s", g_engine_ctx.path.c_str());
 
-    /* Schema discovery CF -- created when object store is active so that
-       replicas can discover table definitions from the shared storage. */
-    if (objstore_connector)
-    {
-        tidesdb_column_family_config_t schema_cfg = tidesdb_default_column_family_config();
-        if (!tidesdb_get_column_family(tdb_get_engine(), SCHEMA_CF_NAME))
-            tidesdb_create_column_family(tdb_get_engine(), SCHEMA_CF_NAME, &schema_cfg);
+    /* The __tidesql_schema discovery CF was created only in object-store mode,
+       so replicas could read table definitions out of shared storage. With
+       object-store mode removed from the engine there is no replica to serve
+       and nothing to create.
 
-        g_engine_ctx.schema_cf = tidesdb_get_column_family(tdb_get_engine(), SCHEMA_CF_NAME);
-
-        if (g_engine_ctx.schema_cf)
-        {
-            /* MariaDB-only discover_* hooks for engine-driven table discovery
-             * (used with object-store mode). MySQL's Data Dictionary handles
-             * table discovery centrally — no engine hook needed. TODO: add
-             * object-store-driven discovery via MySQL SDI when adding replica
-             * support. The underlying discover_* functions are #if 0'd. */
-
-            /* Ensure database directories exist for all tables in the schema
-               CF so the server can open them on replicas. */
-            schema_cf_ensure_databases();
-
-            sql_print_information("[TIDESDB] Schema discovery enabled (object store mode)");
-        }
-    }
+       g_engine_ctx.schema_cf therefore stays NULL for the life of the process.
+       Every consumer -- schema_cf_store_frm, _delete, _delete_db, _rename,
+       _ensure_databases -- already returns early on a NULL schema_cf, which is
+       the path they took whenever object-store mode was off. They are left in
+       place and inert rather than unpicked from twenty call sites in the
+       middle of an engine migration; removing them is dead-code cleanup that
+       can be done on a green build. */
 
     /* Atomic-DDL (A-5) Task 11: reconciliation sweep wiring.
 
