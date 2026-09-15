@@ -78,14 +78,14 @@ t_alter	CREATE TABLE `t_alter` (
   `val` varchar(100) DEFAULT NULL,
   PRIMARY KEY (`id`)
 ) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
-ALTER TABLE t_alter ENGINE_ATTRIBUTE='{"sync_mode":"NONE"}';
+ALTER TABLE t_alter ENGINE_ATTRIBUTE='{"bloom_fpr":200}';
 SHOW CREATE TABLE t_alter;
 Table	Create Table
 t_alter	CREATE TABLE `t_alter` (
   `id` int NOT NULL,
   `val` varchar(100) DEFAULT NULL,
   PRIMARY KEY (`id`)
-) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci /*!80021 ENGINE_ATTRIBUTE='{"sync_mode": "NONE"}' */
+) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci /*!80021 ENGINE_ATTRIBUTE='{"bloom_fpr": 200}' */
 SELECT * FROM t_alter ORDER BY id;
 id	val
 1	before
@@ -141,7 +141,7 @@ INSERT INTO t_altidx VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie');
 SELECT id FROM t_altidx WHERE name = 'bob';
 id
 2
-ALTER TABLE t_altidx ENGINE_ATTRIBUTE='{"sync_mode":"NONE"}';
+ALTER TABLE t_altidx ENGINE_ATTRIBUTE='{"bloom_fpr":200}';
 SELECT id FROM t_altidx WHERE name = 'bob';
 id
 2
@@ -193,7 +193,7 @@ val
 row1
 row2
 row3
-ALTER TABLE t_nopk ENGINE_ATTRIBUTE='{"sync_mode":"NONE"}';
+ALTER TABLE t_nopk ENGINE_ATTRIBUTE='{"bloom_fpr":200}';
 SELECT * FROM t_nopk;
 val
 row1
