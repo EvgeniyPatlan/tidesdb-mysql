@@ -4,11 +4,11 @@
 # engine version is treated. 'strict' (default) refuses the DDL and names the
 # replacement; 'warn' accepts it with a warning and ignores the key.
 #
-# The retired-key table (plugin/tidesdb_legacy_options.h) is empty while the
-# engine retires nothing, so there is no key to reject yet and this test
-# covers the surface rather than a rejection: the variable exists, defaults to
-# strict, takes both values at runtime, and refuses anything else. The
-# rejection cases join this file when the table is populated.
+# The retired-key table (plugin/tidesdb_legacy_options.h) is populated as of
+# the TidesDB 10 bump, so this covers both the surface (the variable exists,
+# defaults to strict, takes both values at runtime, refuses anything else) and
+# the rejections themselves, including the dump-and-reload path an upgrade
+# actually takes.
 #
 # Runtime-settable is not incidental. The dump-and-reload upgrade a major
 # engine version forces needs SET GLOBAL mid-session (set warn, reload, set
@@ -47,6 +47,45 @@ SET GLOBAL tidesdb_legacy_compat = 'warn';
 CREATE TABLE tdb_legacy_t (id INT PRIMARY KEY) ENGINE=TIDESDB
   ENGINE_ATTRIBUTE='{"bloom_filter":true}';
 DROP TABLE tdb_legacy_t;
+
+--echo #
+--echo # A retired key that moved to a system variable: strict names the variable
+--echo #
+SET GLOBAL tidesdb_legacy_compat = 'strict';
+--error ER_UNKNOWN_ERROR
+CREATE TABLE tdb_legacy_t (id INT PRIMARY KEY) ENGINE=TIDESDB
+  ENGINE_ATTRIBUTE='{"write_buffer_size":67108864}';
+
+--echo #
+--echo # A retired key whose behaviour is gone: strict says so instead of
+--echo # inventing a replacement
+--echo #
+--error ER_UNKNOWN_ERROR
+CREATE TABLE tdb_legacy_t (id INT PRIMARY KEY) ENGINE=TIDESDB
+  ENGINE_ATTRIBUTE='{"use_btree":true}';
+
+--echo #
+--echo # The upgrade path: a dump from the previous release carries these keys
+--echo # verbatim, and warn is what lets it reload
+--echo #
+SET GLOBAL tidesdb_legacy_compat = 'warn';
+CREATE TABLE tdb_legacy_t (
+  id INT PRIMARY KEY,
+  v  VARCHAR(32)
+) ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"write_buffer_size":67108864,"sync_mode":"FULL","use_btree":true,"block_indexes":true,"min_disk_space":1048576,"bloom_filter":true}';
+--echo # the live key is still applied; the retired ones are ignored, not stored
+SHOW WARNINGS;
+INSERT INTO tdb_legacy_t VALUES (1,'reloaded');
+SELECT id, v FROM tdb_legacy_t;
+DROP TABLE tdb_legacy_t;
+
+--echo #
+--echo # and back to strict once the reload is done
+--echo #
+SET GLOBAL tidesdb_legacy_compat = 'strict';
+--error ER_UNKNOWN_ERROR
+CREATE TABLE tdb_legacy_t (id INT PRIMARY KEY) ENGINE=TIDESDB
+  ENGINE_ATTRIBUTE='{"sync_mode":"FULL"}';
 
 --eval SET GLOBAL tidesdb_legacy_compat = '$save_legacy_compat'
 --source suite/tidesdb/include/cleanup_tidesdb.inc

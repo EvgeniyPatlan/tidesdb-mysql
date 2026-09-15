@@ -17,6 +17,7 @@
 #include "ha_tidesdb.h"
 #include "storage/tidesdb/tidesdb_legacy_options.h"
 #include "storage/tidesdb/tidesdb_xid.h"
+#include "storage/tidesdb/tidesdb_datadir_version.h"
 
 extern "C"
 {
@@ -3533,6 +3534,37 @@ static int tidesdb_init_func(void *p)
        The sysvars that configured it stay registered as rejecting stubs so an
        existing my.cnf gets an explanation rather than "unknown variable" --
        see the tidesdb_objstore_removed_check family below. */
+
+    /* Refuse a data directory written by TidesDB 9 before opening it.
+       Without this the open *succeeds*: TidesDB 10 does not recognise the
+       older per-column-family layout, so it treats the directory as a fresh
+       database and writes its own manifest alongside. The server then starts
+       cleanly with every TidesDB table's data invisible -- the worst of the
+       three possible outcomes, because nothing anywhere says what happened.
+
+       The data is not destroyed, and the check says so: the v9 files are left
+       untouched and the previous release can still read them. That matters
+       for what an operator does next -- go back and dump, rather than reach
+       for a backup. */
+    {
+        std::string legacy_cf;
+        if (tdb_datadir_is_tidesdb9(g_engine_ctx.path, &legacy_cf))
+        {
+            sql_print_error(
+                "[TIDESDB] %s holds a TidesDB 9 data directory (found "
+                "'%s/config.ini', the per-column-family layout). TidesDB 10 "
+                "stores data differently and cannot read it.",
+                g_engine_ctx.path.c_str(), legacy_cf.c_str());
+            sql_print_error(
+                "[TIDESDB] Your data has not been modified. Start the previous "
+                "release against this directory, mysqldump the TidesDB tables, "
+                "then load the dump into this one. See docs/upgrade-v0.5.0.md.");
+            sql_print_error(
+                "[TIDESDB] Refusing to start rather than opening it as an empty "
+                "database, which would leave every table readable but empty.");
+            DBUG_RETURN(1);
+        }
+    }
 
     tidesdb_t *opened = nullptr;
     int rc = tidesdb_open(&cfg, &opened);
