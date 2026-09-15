@@ -3,12 +3,16 @@
 This document tracks defects we've confirmed in the bundled TidesDB engine
 that affect `tidesdb-mysql` users.
 
-## Current: bundled on TidesDB v10.0.1 — one patch carried
+## Current: bundled on TidesDB v10.0.1 — one patch carried, one issue open
 
 The engine is pinned to **TidesDB v10.0.1** and we carry **one** patch,
 `docker/patches/tidesdb/0001-reservation-retirement-floor.patch`. It is applied
 by both `docker/Dockerfile.mysql` and `scripts/setup-workspace.sh`, so a local
 build and the shipped image run the same engine.
+
+One issue is **open and unfixed**: concurrent bulk loaders take false conflicts
+and fail. It is the unpatched half of the same reservation-collision behaviour,
+it needs a design change upstream, and it is written up below.
 
 ### `0001-reservation-retirement-floor.patch` — conflict-free commits refused
 
@@ -46,6 +50,92 @@ without walking all 32 shards, which keeps single-threaded commit throughput
 where it was.
 
 Sent upstream; drop the patch once it lands.
+
+### OPEN: concurrent bulk loaders take false conflicts and fail
+
+**Severity:** high for multi-threaded bulk loading; no effect on ordinary OLTP.
+**Status:** upstream design limitation. Our patch above fixes one half of it;
+this is the half that remains. Not fixable plugin-side without giving up
+conflict detection that users are entitled to.
+
+**Symptom.** A bulk load run by several connections at once fails partway
+through, with a statement error and this in the error log:
+
+```
+[Warning] [TIDESDB] bulk mid-commit failed rc=-7; the engine has already
+          aborted this transaction, so the statement is rolled back rather
+          than retried
+```
+
+`-7` is `TDB_ERR_CONFLICT`. It is reported even when the loaders write
+completely disjoint keys and no real conflict is possible. A client that does
+not retry the statement simply stops; a HammerDB TPROC-C schema build at 10
+warehouses with 4 loader threads hangs at roughly 40% loaded, every time. The
+same build on the previous release completes.
+
+**Mechanism.** TidesDB 10 detects write-write conflicts with a
+first-committer-wins reservation table: 2^20 slots indexed by the low bits of
+a key hash, each holding a 16-bit fingerprint of that hash plus the commit
+sequence. Two unrelated keys can land in one slot. The fingerprint is what
+distinguishes a real same-key writer from that collision, but it is only
+consulted when the slot's current occupant can be retired:
+
+```c
+if (cseq > read_base && (TDB_MVCC_RES_FP(cur) == myfp || cseq > min_snapshot))
+    return 0;   /* conflict */
+```
+
+`min_snapshot` is the oldest snapshot any live transaction holds. With several
+loaders running concurrently that floor sits well behind the newest commits,
+so almost every occupant is unretirable, the fingerprint stops deciding
+anything, and a mere collision becomes a refused commit. The more concurrent
+writers, the wider the window and the more often it fires.
+
+**Why the arm cannot simply be deleted.** It is load-bearing. Claiming a slot
+evicts whatever record was there, and that record is what a later writer of
+the *colliding* key would have used to notice a conflict of its own. If the
+evicting transaction's sequence has fallen below the floor by the time that
+writer commits, the conflict is missed rather than merely mis-reported. A
+missed conflict is a lost update, which is far worse than a spurious abort.
+Trusting the fingerprint unconditionally trades a loud wrong answer for a
+silent one.
+
+Fixing it properly is a design change in the engine -- a larger table, chained
+slots, or storing enough of the key to verify a collision -- not a patch we
+should improvise into a vendored dependency.
+
+**Why there is no plugin-side workaround.** The obvious one is to run bulk DML
+at `READ COMMITTED`, where reservations are not taken at all. It was tried and
+reverted. `maybe_bulk_commit` already resets to `READ COMMITTED` after each
+mid-statement commit, so only the first batch of a statement is exposed, and
+closing that gap looked free. It is not: MySQL routes a plain `INSERT` inside
+`START TRANSACTION` through `start_bulk_insert`, so the change silently
+removed conflict detection from ordinary transactional inserts. Two
+transactions inserting the same primary key stopped conflicting and became
+last-writer-wins. `tidesdb_insert_conflict` and `tidesdb_concurrent_conflict`
+caught it immediately.
+
+**What this means in practice.**
+
+- Ordinary OLTP is unaffected. Reservations only fire at `SNAPSHOT` isolation
+  and above, and a single connection committing in a loop no longer takes
+  false conflicts at all since the patch above.
+- Multi-threaded bulk loading is affected: `mysqlslap --concurrency`, a
+  parallel `mysqldump` restore, a TPC-C loader, any `LOAD DATA` fan-out.
+- **Mitigation:** load with a single connection, or use a client that retries
+  a statement on `ER_LOCK_DEADLOCK` (1213) / error 1180. The data is never
+  wrong -- the transaction is aborted cleanly and nothing partial is kept.
+
+**Reproducer.** `IMG=<image> WARE=10 BUILDVU=4 RUNVU=8 RAMP=1 DUR=3
+./bench/hammerdb/run-hammerdb.sh`. Compare against the previous release with
+the same command and a different `IMG=`; it completes and reports ~1783 NOPM.
+
+**Related:** the same collision behaviour, in its single-connection form, is
+what `0001-reservation-retirement-floor.patch` above fixes. That patch removed
+the case where the floor was *never* advanced (published as zero before the
+first compaction, and counting the committing transaction itself). What is
+left is the case where the floor is real but simply older than the commits
+being collided with, which concurrency makes routine.
 
 ### Retired patches
 

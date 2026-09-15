@@ -55,6 +55,17 @@ All notable changes to this project will be documented in this file.
   `docker/patches/tidesdb/`, so a local build and the shipped image run the same
   engine.
 
+### Known issues
+
+- **Concurrent bulk loaders take false conflicts and fail.** Several
+  connections bulk-loading at once can hit `TDB_ERR_CONFLICT` on disjoint keys,
+  because the engine's reservation table refuses a hash collision as a conflict
+  whenever the colliding slot is newer than the oldest live snapshot — routine
+  once several writers are running. A client that does not retry the statement
+  stops there. Ordinary OLTP is unaffected. Load with one connection, or retry
+  on error 1213 / 1180. Full write-up and reproducer in
+  [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
+
 ### Fixed
 
 - **TTL was a no-op.** TidesDB 10 takes a lifetime in seconds where 9 took an
