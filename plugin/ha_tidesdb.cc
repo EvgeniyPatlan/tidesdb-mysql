@@ -16,6 +16,7 @@
 */
 #include "ha_tidesdb.h"
 #include "storage/tidesdb/tidesdb_legacy_options.h"
+#include "storage/tidesdb/tidesdb_xid.h"
 
 extern "C"
 {
@@ -2143,6 +2144,27 @@ static int tidesdb_savepoint_release(handlerton *, THD *thd, void *sv)
     return tdb_rc_to_ha(rc, "savepoint_release");
 }
 
+/* The engine's view of where this connection's transaction stands. Asking the
+   engine rather than keeping a parallel flag means the commit and rollback
+   hooks cannot disagree with it.
+
+   It also reports something the plugin cannot work out for itself. trx->dirty
+   says a DML statement used the transaction; it does not say the transaction
+   still has writes buffered, which is what the engine goes by. A statement
+   that matched no rows, or whose writes a bulk mid-commit already flushed,
+   leaves an empty batch -- and a prepare on an empty batch is resolved on the
+   spot, because a read-only transaction has nothing to vote about. So a
+   prepare can legitimately leave the transaction finished rather than
+   prepared, and phase two must recognise that instead of treating it as
+   "never prepared" and committing a second time.
+
+   Returns false only when there is no transaction to ask about. */
+static bool tdb_trx_txn_state(const tidesdb_trx_t *trx, tidesdb_txn_state_t *out)
+{
+    if (!trx || !trx->txn) return false;
+    return tidesdb_txn_state(trx->txn, out) == TDB_SUCCESS;
+}
+
 /*
   2PC prepare phase.
 
@@ -2151,23 +2173,31 @@ static int tidesdb_savepoint_release(handlerton *, THD *thd, void *sv)
   hook before the binlog write; only after the binlog flush succeeds does
   it call tidesdb_commit.
 
-  We move the actual TidesDB commit into prepare so that conflict errors
-  surface via HA_ERR_LOCK_DEADLOCK *before* binlog ordering. This avoids
-  the Debug-only assertion at sql/binlog.cc:7756
-  (`thd->commit_error != THD::CE_COMMIT_ERROR`) that fires whenever a
-  commit hook returns non-zero, and lets the user see ER_LOCK_DEADLOCK
-  cleanly -- exactly what the conflict tests expect.
+  Through TidesDB 9 this hook ran the whole commit, because the engine had
+  no durable prepare to run instead. That bought the error ordering we
+  need -- a conflict surfaces as HA_ERR_LOCK_DEADLOCK before binlog
+  ordering, which keeps clear of the Debug-only assertion at
+  sql/binlog.cc:7756 (`thd->commit_error != THD::CE_COMMIT_ERROR`) that
+  fires whenever a commit hook returns non-zero -- and it cost two things:
 
-  Risks:
-   * If mysqld dies between prepare-success and commit, the txn is
-     already durable in TidesDB but won't be in the binlog. There is no
-     XA recovery path; this is consistent with the prior "commit at
-     hton commit" behavior on crash and acceptable for this engine.
-   * We don't register commit_by_xid / rollback_by_xid -- TidesDB has no
-     prepare/commit_xid split, and the unrecovered case is the same.
+   * A crash between prepare and commit left the writes durable in the
+     engine but absent from the binlog, with no way to find them again.
+   * A binlog flush that failed after a successful prepare made the server
+     call rollback, and there was nothing left to roll back. The engine
+     kept data the server had decided to discard.
 
-  When prepare runs and succeeds, commit_done is set so the subsequent
-  commit hook is a pure bookkeeping no-op.
+  TidesDB 10 has the split, so phase one is now a real vote:
+  tidesdb_txn_prepare runs the same conflict checks commit would and
+  durably logs the batch under the server's XID, leaving it invisible and
+  unapplied. The error ordering is preserved for free -- the conflict is
+  still detected here -- and both costs go away, because an undecided
+  batch is now recoverable and a rollback after prepare really does
+  discard it.
+
+  Phase two is decided by the commit and rollback hooks, which ask
+  tidesdb_txn_state rather than tracking preparedness separately: the
+  engine already knows, and a second copy of that fact is a second thing
+  that can be wrong.
 */
 static int tidesdb_prepare(handlerton *, THD *thd, bool all)
 {
@@ -2188,7 +2218,36 @@ static int tidesdb_prepare(handlerton *, THD *thd, bool all)
         trx->stmt_savepoint_active = false;
     }
 
-    int rc = tidesdb_txn_commit(trx->txn);
+    /* The XID the server is coordinating this transaction under. For the
+       ordinary binlog-plus-engine case this is the server's internal 2PC id,
+       not a user XA id, but it is the handle recovery will ask us about
+       either way, so it is what we record. */
+    MYSQL_XID mxid;
+    memset(&mxid, 0, sizeof(mxid));
+    thd_get_xid(thd, &mxid);
+
+    unsigned char xid_buf[TDB_XID_MAX_SERIALIZED];
+    const size_t xid_len = tdb_xid_serialize(mxid.formatID, mxid.gtrid_length, mxid.bqual_length,
+                                             mxid.data, xid_buf, sizeof(xid_buf));
+    if (xid_len == 0)
+    {
+        /* No usable id means nothing could find this batch again after a
+           crash, so preparing it would create exactly the in-doubt state 2PC
+           exists to avoid. Refuse the transaction instead. */
+        sql_print_error(
+            "[TIDESDB] hton_prepare: server XID is not encodable "
+            "(formatID=%ld gtrid=%ld bqual=%ld)",
+            mxid.formatID, mxid.gtrid_length, mxid.bqual_length);
+        tidesdb_txn_rollback(trx->txn);
+        trx->txn_generation++;
+        trx->needs_reset = true;
+        trx->dirty = false;
+        trx->stmt_savepoint_active = false;
+        row_locks_release_all(trx);
+        return HA_ERR_INTERNAL_ERROR;
+    }
+
+    int rc = tidesdb_txn_prepare(trx->txn, xid_buf, xid_len);
     if (rc != TDB_SUCCESS)
     {
         /* Truly unexpected errors get logged; transient conflicts don't spam. */
@@ -2196,7 +2255,7 @@ static int tidesdb_prepare(handlerton *, THD *thd, bool all)
             rc != TDB_ERR_MEMORY_LIMIT && rc != TDB_ERR_TXN_EXPIRED &&
             rc != TDB_ERR_TXN_ABORTED)
             sql_print_error(
-                "[TIDESDB] hton_prepare: tidesdb_txn_commit returned %d "
+                "[TIDESDB] hton_prepare: tidesdb_txn_prepare returned %d "
                 "(dirty=%d gen=%lu)",
                 rc, trx->dirty, (unsigned long)trx->txn_generation);
         tidesdb_txn_rollback(trx->txn);
@@ -2205,18 +2264,16 @@ static int tidesdb_prepare(handlerton *, THD *thd, bool all)
         trx->txn_generation++;
         trx->dirty = false;
         trx->stmt_savepoint_active = false;
-        trx->commit_done = false;
         row_locks_release_all(trx);
         /* Surfaces to user as ER_LOCK_DEADLOCK / similar. Because this is
            prepare (not commit), the binlog assertion does NOT fire. */
         return tdb_rc_to_ha(rc, "hton_prepare");
     }
 
-    /* TidesDB-side commit done. Mark so the commit hook skips the actual
-       commit work. The txn handle stays alive for txn_reset reuse. */
-    trx->commit_done = true;
-    trx->txn_generation++;
-    trx->needs_reset = true;
+    /* Prepared and durable. The transaction now holds its snapshot and its
+       reservations until the commit or rollback hook resolves it; neither
+       hook needs a flag from here, because tidesdb_txn_state reports the
+       state they branch on. */
     return 0;
 }
 
@@ -2261,11 +2318,43 @@ static int tidesdb_commit(handlerton *, THD *thd, bool all)
         return 0;
     }
 
-    /* If prepare already committed to TidesDB, this is the binlog-ordering
-       commit hook -- pure bookkeeping. */
-    if (trx->commit_done)
+    tidesdb_txn_state_t cst = TDB_TXN_STATE_ACTIVE;
+    const bool cst_known = tdb_trx_txn_state(trx, &cst);
+
+    /* Prepare resolved it outright, having found nothing to vote about. There
+       is no phase two to run and nothing to commit; the transaction just needs
+       releasing like any other finished one. */
+    if (cst_known && (cst == TDB_TXN_STATE_COMMITTED || cst == TDB_TXN_STATE_ABORTED))
     {
-        trx->commit_done = false;
+        trx->txn_generation++;
+        trx->needs_reset = true;
+        trx->dirty = false;
+        trx->stmt_savepoint_active = false;
+        row_locks_release_all(trx);
+        return 0;
+    }
+
+    /* Phase two of a two-phase commit. The batch is already durable and the
+       conflict checks already passed at prepare, so this only records the
+       decision and makes the writes visible -- it cannot come back with a
+       conflict, which is what keeps the binlog-ordering assertion clear. */
+    if (cst_known && cst == TDB_TXN_STATE_PREPARED)
+    {
+        int prc = tidesdb_txn_commit_prepared(trx->txn);
+        if (prc != TDB_SUCCESS)
+        {
+            /* The transaction stays prepared so the decision can be retried,
+               here or by recovery after a restart. Losing it is the one
+               outcome that would leave the binlog and the engine disagreeing
+               with nothing left to reconcile them. */
+            sql_print_error(
+                "[TIDESDB] hton_commit: tidesdb_txn_commit_prepared returned %d; "
+                "transaction stays prepared and in doubt (gen=%lu)",
+                prc, (unsigned long)trx->txn_generation);
+            return tdb_rc_to_ha(prc, "hton_commit_prepared");
+        }
+        trx->txn_generation++;
+        trx->needs_reset = true;
         trx->dirty = false;
         trx->stmt_savepoint_active = false;
         row_locks_release_all(trx);
@@ -2293,10 +2382,14 @@ static int tidesdb_commit(handlerton *, THD *thd, bool all)
             if (rc != TDB_ERR_CONFLICT && rc != TDB_ERR_LOCKED &&
                 rc != TDB_ERR_MEMORY_LIMIT && rc != TDB_ERR_TXN_EXPIRED &&
                 rc != TDB_ERR_TXN_ABORTED)
+            {
+                tidesdb_txn_state_t dst = TDB_TXN_STATE_ACTIVE;
+                (void)tidesdb_txn_state(trx->txn, &dst);
                 sql_print_error(
                     "[TIDESDB] hton_commit: tidesdb_txn_commit returned %d "
-                    "(dirty=%d gen=%lu)",
-                    rc, trx->dirty, (unsigned long)trx->txn_generation);
+                    "(dirty=%d gen=%lu state=%d all=%d)",
+                    rc, trx->dirty, (unsigned long)trx->txn_generation, (int)dst, (int)all);
+            }
             tidesdb_txn_rollback(trx->txn);
             tidesdb_txn_free(trx->txn);
             trx->txn = NULL;
@@ -2350,17 +2443,37 @@ static int tidesdb_rollback(handlerton *, THD *thd, bool all)
         trx->stmt_savepoint_active = false;
     }
 
-    /* Full rollback -- we keep txn alive for reuse via reset on next use. */
-    tidesdb_txn_rollback(trx->txn);
+    /* Prepare succeeded and the server then decided against the transaction --
+       a binlog flush that failed is the usual way here. Through TidesDB 9 the
+       prepare had already committed, so this path silently kept data the
+       server had discarded; the prepared batch is now unapplied, and rolling
+       it back actually discards it. */
+    tidesdb_txn_state_t rst = TDB_TXN_STATE_ACTIVE;
+    const bool rst_known = tdb_trx_txn_state(trx, &rst);
+
+    if (rst_known && (rst == TDB_TXN_STATE_COMMITTED || rst == TDB_TXN_STATE_ABORTED))
+    {
+        /* Already resolved -- a prepare with an empty batch, or a decision
+           already recorded. Nothing to undo. */
+    }
+    else if (rst_known && rst == TDB_TXN_STATE_PREPARED)
+    {
+        int prc = tidesdb_txn_rollback_prepared(trx->txn);
+        if (prc != TDB_SUCCESS)
+            sql_print_error(
+                "[TIDESDB] hton_rollback: tidesdb_txn_rollback_prepared returned %d; "
+                "transaction stays prepared and in doubt (gen=%lu)",
+                prc, (unsigned long)trx->txn_generation);
+    }
+    else
+    {
+        /* Full rollback -- we keep txn alive for reuse via reset on next use. */
+        tidesdb_txn_rollback(trx->txn);
+    }
     trx->txn_generation++;
     trx->needs_reset = true;
     trx->dirty = false;
     trx->stmt_savepoint_active = false;
-    /* Edge case: prepare succeeded but binlog flush then failed -> MySQL
-       calls rollback after prepare. The TidesDB txn was already committed,
-       so this rollback is a no-op for the data; just clear the flag so a
-       fresh txn starts clean. */
-    trx->commit_done = false;
     row_locks_release_all(trx);
     return 0;
 }
@@ -8922,7 +9035,24 @@ int ha_tidesdb::external_lock(THD *thd, int lock_type)
             cached_stmt_shape_valid_
                 ? !cached_is_autocommit_
                 : (bool)thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
-        if (!in_multi_stmt || stmt_txn_dirty)
+
+        /* An iterator carries the view it was created with. Re-seeking it does
+           not pick it up again, so keeping one across statements is only sound
+           while the transaction's view is meant to be frozen -- repeatable read
+           and above, where a statement seeing nothing newer is the contract.
+
+           At read committed it is not sound: each statement is supposed to see
+           what has committed since the last one, and a kept iterator shows the
+           view from whenever it happened to be built. Whether that was visible
+           before depended on where the newer write landed -- a write that went
+           to a structure the iterator reads live would show up, one that did
+           not would be missed silently, with no error and a plainly wrong
+           result. Freeing it per statement is what makes read committed mean
+           what it says here. */
+        const bool frozen_view =
+            cached_trx_ && cached_trx_->isolation_level >= TDB_ISOLATION_REPEATABLE_READ;
+
+        if (!in_multi_stmt || stmt_txn_dirty || !frozen_view)
         {
             if (scan_iter)
             {
@@ -9038,8 +9168,8 @@ THR_LOCK_DATA **ha_tidesdb::store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lo
    the pre-Task-13 ordering (engine commit precedes CF mutations) without
    removing the atomic-DDL contract at the server / DD level -- the
    subsequent trans_commit_implicit still drives binlog + DD commit
-   atomically; the engine's portion of the 2PC just lands a no-op
-   (commit_done=true short-circuits the prepare hook).
+   atomically; the engine's portion of the 2PC just lands a no-op, because
+   the hooks all return early on a connection with no live txn.
 
    We also clear any cached iterators on the handler so they don't leak
    into the next statement on the same connection (the post-ALTER
@@ -9074,16 +9204,15 @@ static void tidesdb_flush_engine_txn_before_cf_mutation(THD *thd)
         tidesdb_txn_rollback(trx->txn);
     }
 
-    /* Free and clear; subsequent ops re-create via get_or_create_trx.
-       Mark commit_done=true so the eventual hton-prepare/commit hooks
-       become no-ops for this txn cycle. */
+    /* Free and clear; subsequent ops re-create via get_or_create_trx. The
+       prepare, commit and rollback hooks all return early for a connection
+       with no live txn, so this cycle is already a no-op to them. */
     tidesdb_txn_free(trx->txn);
     trx->txn = NULL;
     trx->txn_generation++;
     trx->dirty = false;
     trx->stmt_savepoint_active = false;
     trx->needs_reset = false;
-    trx->commit_done = true;
     row_locks_release_all(trx);
 }
 
