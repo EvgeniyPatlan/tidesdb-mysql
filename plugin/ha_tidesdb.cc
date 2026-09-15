@@ -187,19 +187,49 @@ static int tdb_rc_to_ha(int rc, const char *ctx)
             }
             return HA_ERR_LOCK_DEADLOCK;
 
-        /* Lock wait timeout -- rolls back the current statement only
-           (not the whole transaction), less disruptive than full deadlock. */
+        /* Transient contention. Rolls back the current statement only, not the
+           whole transaction.
+
+           TDB_ERR_BUSY used to carry the backpressure-stall case here -- the
+           engine giving up after an ingest stall exhausted its no-progress
+           budget, mapped to lock-wait-timeout so a stall could not be mistaken
+           for corruption. That code is gone in v10 (its -14 now means
+           TDB_ERR_TXN_EXPIRED) and TDB_ERR_LOCKED absorbed the role, so the
+           hazard is unchanged and only the code carrying it moved.
+
+           Reaching this arm at all should be rare on a read: tdb_retry_transient
+           (tidesdb_retry.h) absorbs TDB_ERR_LOCKED across a bounded ladder
+           first, because v10 reports it for any read that overlaps a compaction
+           moving its sources. What arrives here is contention that did not
+           clear, which is worth surfacing. */
         case TDB_ERR_LOCKED:
             return HA_ERR_LOCK_WAIT_TIMEOUT;
 
-        /* Backpressure timeout (TidesDB v9.3.0+): the engine gave up after an
-           ingest stall (L0 queue, active-memtable ceiling, or memory-pressure
-           critical) exhausted its no-progress budget. Transient and retriable;
-           map to lock-wait-timeout so only the statement rolls back. Before
-           v9.3.0 these sites returned TDB_ERR_IO (-> HA_ERR_CRASHED, a false
-           corruption signal) or TDB_ERR_MEMORY_LIMIT. */
-        case TDB_ERR_BUSY:
+        /* Transaction outlived tidesdb_config_t::txn_timeout_seconds. The
+           statement rolls back and can be retried; nothing is corrupt. */
+        case TDB_ERR_TXN_EXPIRED:
             return HA_ERR_LOCK_WAIT_TIMEOUT;
+
+        /* Aborted by another thread through tidesdb_txn_request_abort. The
+           whole transaction is gone, not just this statement, so deadlock is
+           the honest mapping -- it is what tells the client to redo the
+           transaction rather than the statement. */
+        case TDB_ERR_TXN_ABORTED:
+            return HA_ERR_LOCK_DEADLOCK;
+
+        /* Read needed a version older than the oldest the engine still keeps.
+           Retrying from a fresh snapshot is the remedy, which is what the
+           deadlock mapping gets the client to do. */
+        case TDB_ERR_TOO_OLD:
+            return HA_ERR_LOCK_DEADLOCK;
+
+        /* Out of disk. Distinct from TDB_ERR_IO precisely because the data is
+           intact and the operation succeeds once space is freed -- mapping it
+           to HA_ERR_CRASHED would tell an operator to start a recovery for a
+           full filesystem. */
+        case TDB_ERR_NO_SPACE:
+            sql_print_error("[TIDESDB] %s: out of disk space (TDB_ERR_NO_SPACE)", ctx);
+            return HA_ERR_RECORD_FILE_FULL;
 
         /* Memory pressure -- retriable, back off and let flush/compaction
            free memory. mapped to deadlock so MariaDB retries. */
@@ -1324,75 +1354,46 @@ static char *srv_checkpoint_dir = NULL;
 
 /* See tidesdb_backup_dir_check for the rationale on doing the work in
    check rather than update. */
-static int tidesdb_checkpoint_dir_check(THD *thd, SYS_VAR *, void *save,
+/* tidesdb_checkpoint_dir no longer has an engine call behind it.
+
+   Through TidesDB 9 the checkpoint took a destination and produced a
+   near-instant hard-link snapshot there. v10 split the two ideas apart:
+   tidesdb_checkpoint(db) is a durability barrier taken in place -- flush the
+   memtable to L1, then force the value log, WAL and manifest to disk whatever
+   the sync mode -- and it writes no directory at all. Nothing in the v10 API
+   produces a hard-link snapshot.
+
+   So the variable cannot do what its own description promises. Silently
+   accepting a path and doing something else with it is the outcome worth
+   avoiding, and repurposing it onto tidesdb_backup would be worse still: a
+   backup is a full copy, not the near-instant snapshot a caller setting this
+   variable is asking for, and the surprise would be measured in hours on a
+   large database.
+
+   It is refused with an error naming the nearest real alternative. See
+   tidesdb_legacy_options.h for the same reasoning applied to table options. */
+static int tidesdb_checkpoint_dir_check(THD *, SYS_VAR *, void *save,
                                         struct st_mysql_value *value)
 {
     char buf[1024];
     int len = sizeof(buf);
     const char *new_dir = value->val_str(value, buf, &len);
 
+    /* Clearing it stays legal -- an operator must be able to unset a value a
+       previous version left in my.cnf without the server refusing them. */
     if (!new_dir || !new_dir[0])
     {
         *static_cast<const char **>(save) = NULL;
         return 0;
     }
 
-    /* MF-6: sanitize before logging. */
-    char sanitized_path[1024];
-    tdb_sanitize_for_log(new_dir, sanitized_path, sizeof(sanitized_path));
-
-    if (!tdb_path_is_safe(new_dir, (size_t)len))
-    {
-        my_printf_error(ER_UNKNOWN_ERROR,
-                        "[TIDESDB] Checkpoint path must be absolute and free of "
-                        "'..' / NUL components: '%s' rejected",
-                        MYF(0), sanitized_path);
-        return 1;
-    }
-
-    /* HF-3: enforce allowed-root if operator has configured one. */
-    if (!tdb_path_is_under_allowed_root(new_dir))
-    {
-        my_printf_error(ER_UNKNOWN_ERROR,
-                        "[TIDESDB] Checkpoint path '%s' is not under "
-                        "tidesdb_backup_allowed_root",
-                        MYF(0), sanitized_path);
-        return 1;
-    }
-
-    /* HF-4: refuse early if THD already killed; tidesdb_checkpoint is
-       uncancellable from our side. */
-    if (thd && thd_killed(thd))
-    {
-        my_error(ER_QUERY_INTERRUPTED, MYF(0));
-        return 1;
-    }
-
-    if (!tdb_get_engine())
-    {
-        my_error(ER_UNKNOWN_ERROR, MYF(0), "TidesDB is not open");
-        return 1;
-    }
-
-    std::string ckpt_path(new_dir);
-
-    /* check runs without LOCK_global_system_variables held, so no
-       unlock/relock needed (see tidesdb_backup_dir_check). */
-    int rc = tidesdb_checkpoint(tdb_get_engine(), ckpt_path.c_str());
-
-    if (rc != TDB_SUCCESS)
-    {
-        sql_print_error("[TIDESDB] Checkpoint to '%s' failed (err=%d)", sanitized_path, rc);
-        my_printf_error(ER_UNKNOWN_ERROR, "[TIDESDB] Checkpoint to '%s' failed (err=%d)",
-                        MYF(0), sanitized_path, rc);
-        return 1;
-    }
-
-    /* `thd` is the callback parameter (no longer ignored after HF-4
-       added the killed-pre-check); use it directly. */
-    *static_cast<const char **>(save) =
-        thd ? thd->strmake(ckpt_path.c_str(), ckpt_path.size()) : NULL;
-    return 0;
+    my_printf_error(ER_UNKNOWN_ERROR,
+                    "[TIDESDB] tidesdb_checkpoint_dir is no longer supported: "
+                    "TidesDB 10 takes checkpoints in place and produces no "
+                    "snapshot directory. Use tidesdb_backup_dir for a copy on "
+                    "disk -- note it is a full backup, not a hard-link snapshot",
+                    MYF(0));
+    return 1;
 }
 
 static void tidesdb_checkpoint_dir_update(THD *, SYS_VAR *, void *var_ptr, const void *save)
@@ -1402,12 +1403,12 @@ static void tidesdb_checkpoint_dir_update(THD *, SYS_VAR *, void *var_ptr, const
 
 static MYSQL_SYSVAR_STR(checkpoint_dir, srv_checkpoint_dir,
                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
-                        "Set to a directory path to trigger a TidesDB checkpoint "
-                        "(hard-link snapshot, near-instant). "
-                        "The directory must not exist or be empty. The path must be "
-                        "absolute and contain no '..' components. If tidesdb_backup_allowed_root "
-                        "is set, the path must additionally resolve under that root. "
-                        "Example: SET GLOBAL tidesdb_checkpoint_dir = '/path/to/checkpoint'",
+                        "No longer supported. TidesDB 10 takes checkpoints in "
+                        "place and produces no snapshot directory, so setting "
+                        "this is refused; use tidesdb_backup_dir for a copy on "
+                        "disk (a full backup, not a hard-link snapshot). Kept "
+                        "so an existing my.cnf gets that message rather than "
+                        "'unknown variable'.",
                         tidesdb_checkpoint_dir_check, tidesdb_checkpoint_dir_update, NULL);
 
 static SYS_VAR *tidesdb_system_variables[] = {
@@ -2169,7 +2170,8 @@ static int tidesdb_prepare(handlerton *, THD *thd, bool all)
     {
         /* Truly unexpected errors get logged; transient conflicts don't spam. */
         if (rc != TDB_ERR_CONFLICT && rc != TDB_ERR_LOCKED &&
-            rc != TDB_ERR_MEMORY_LIMIT && rc != TDB_ERR_BUSY)
+            rc != TDB_ERR_MEMORY_LIMIT && rc != TDB_ERR_TXN_EXPIRED &&
+            rc != TDB_ERR_TXN_ABORTED)
             sql_print_error(
                 "[TIDESDB] hton_prepare: tidesdb_txn_commit returned %d "
                 "(dirty=%d gen=%lu)",
@@ -2266,7 +2268,8 @@ static int tidesdb_commit(handlerton *, THD *thd, bool all)
         if (rc != TDB_SUCCESS)
         {
             if (rc != TDB_ERR_CONFLICT && rc != TDB_ERR_LOCKED &&
-                rc != TDB_ERR_MEMORY_LIMIT && rc != TDB_ERR_BUSY)
+                rc != TDB_ERR_MEMORY_LIMIT && rc != TDB_ERR_TXN_EXPIRED &&
+                rc != TDB_ERR_TXN_ABORTED)
                 sql_print_error(
                     "[TIDESDB] hton_commit: tidesdb_txn_commit returned %d "
                     "(dirty=%d gen=%lu)",
@@ -7224,7 +7227,8 @@ int ha_tidesdb::maybe_bulk_commit(tidesdb_trx_t *trx)
         if (crc == TDB_SUCCESS) break;
 
         const bool transient = (crc == TDB_ERR_CONFLICT || crc == TDB_ERR_LOCKED ||
-                                crc == TDB_ERR_MEMORY_LIMIT || crc == TDB_ERR_BUSY);
+                                crc == TDB_ERR_MEMORY_LIMIT || crc == TDB_ERR_TXN_EXPIRED ||
+                                crc == TDB_ERR_TXN_ABORTED);
         if (!transient || attempt == 3)
         {
             sql_print_warning(
