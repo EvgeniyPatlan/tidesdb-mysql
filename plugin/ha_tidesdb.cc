@@ -879,9 +879,11 @@ static my_bool srv_fast_mode = 0;
 static MYSQL_SYSVAR_BOOL(fast_mode, srv_fast_mode,
                          PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
                          "Disable HTON_SUPPORTS_ATOMIC_DDL participation for higher steady-state "
-                         "OLTP throughput.  ON drops the 2PC commit path and the data-dictionary "
-                         "prepare hook; OFF keeps the v0.4.0 atomic-DDL contract.  Set only at "
-                         "server start.  Default OFF.",
+                         "OLTP throughput.  ON drops the engine out of the server's DDL "
+                         "transaction and forces tidesdb_atomic_ddl_strict OFF; OFF keeps the "
+                         "v0.4.0 atomic-DDL contract.  It does NOT affect DML: transactions still "
+                         "prepare durably in the engine and stay recoverable across a crash.  "
+                         "Set only at server start.  Default OFF.",
                          NULL, NULL, 0);
 
 static MYSQL_SYSVAR_BOOL(unified_memtable, srv_unified_memtable,
@@ -2543,6 +2545,172 @@ static int tidesdb_start_consistent_snapshot(handlerton *, THD *thd)
     return 0;
 }
 
+/* ******************** XA recovery ******************** */
+
+/*
+  Transactions that were durably prepared before the last shutdown and never
+  decided. TidesDB hands them back at open as live handles in the prepared
+  state; the server then tells us, one XID at a time, which way each went,
+  by consulting the binlog it wrote before the crash.
+
+  Keyed by the encoded XID rather than by a reconstructed one, because that
+  is the form both sides can compare byte for byte -- an XID carries a fixed
+  128-byte buffer of which only a prefix is meaningful, and comparing the
+  struct would compare padding and an unused tail that are not part of the
+  identity.
+
+  The list only shrinks. An entry the server never asks about stays prepared
+  on disk and comes back at the next open, which is the correct outcome: an
+  undecided transaction is not ours to decide.
+*/
+struct TdbInDoubtTxn
+{
+    std::string xid;      /* encoded, as tdb_xid_serialize produces */
+    tidesdb_txn_t *txn;   /* prepared handle, owned here until resolved */
+};
+
+static std::vector<TdbInDoubtTxn> g_indoubt;
+static std::mutex g_indoubt_mutex;
+/* Where the next recover() call resumes. The server asks repeatedly until a
+   short count comes back, and an entry it declines to resolve must not be
+   handed out forever. */
+static size_t g_indoubt_cursor = 0;
+
+/* Collect what the engine recovered, once, at startup. Called after the
+   database is open and before anything can begin a transaction of its own. */
+static void tidesdb_collect_prepared(tidesdb_t *db)
+{
+    if (!db) return;
+
+    int count = 0;
+    int rc = tidesdb_recover_prepared(db, NULL, 0, &count);
+    if (rc != TDB_SUCCESS)
+    {
+        sql_print_error("[TIDESDB] recover: could not count prepared transactions (rc=%d)", rc);
+        return;
+    }
+    if (count <= 0) return;
+
+    std::vector<tidesdb_prepared_txn_t> found((size_t)count);
+    rc = tidesdb_recover_prepared(db, found.data(), count, &count);
+    if (rc != TDB_SUCCESS)
+    {
+        sql_print_error("[TIDESDB] recover: could not list %d prepared transaction(s) (rc=%d)",
+                        count, rc);
+        return;
+    }
+
+    std::lock_guard<std::mutex> guard(g_indoubt_mutex);
+    g_indoubt.clear();
+    g_indoubt_cursor = 0;
+    g_indoubt.reserve((size_t)count);
+    for (int i = 0; i < count; i++)
+    {
+        if (!found[i].txn || !found[i].xid || found[i].xid_size == 0) continue;
+        g_indoubt.push_back({std::string((const char *)found[i].xid, found[i].xid_size),
+                             found[i].txn});
+    }
+    sql_print_information(
+        "[TIDESDB] recover: %zu transaction(s) prepared and undecided; waiting for the server "
+        "to resolve them",
+        g_indoubt.size());
+}
+
+/* Release any handle the server never decided, at shutdown. The prepared
+   record stays durable, so the transaction is still in doubt and reappears at
+   the next open -- this frees memory, it does not resolve anything. */
+static void tidesdb_release_indoubt()
+{
+    std::lock_guard<std::mutex> guard(g_indoubt_mutex);
+    for (auto &e : g_indoubt)
+        if (e.txn) tidesdb_txn_free(e.txn);
+    g_indoubt.clear();
+    g_indoubt_cursor = 0;
+}
+
+/* Hand the server the XIDs it has to decide. Returns how many were written,
+   and a short count ends the server's loop. */
+static int tidesdb_xa_recover(handlerton *, XA_recover_txn *xid_list, uint len, MEM_ROOT *)
+{
+    if (!xid_list || len == 0) return 0;
+
+    std::lock_guard<std::mutex> guard(g_indoubt_mutex);
+    uint written = 0;
+    while (written < len && g_indoubt_cursor < g_indoubt.size())
+    {
+        const TdbInDoubtTxn &e = g_indoubt[g_indoubt_cursor++];
+
+        long format_id = 0, gtrid_len = 0, bqual_len = 0;
+        char data[TDB_XID_DATA_SIZE];
+        if (!tdb_xid_deserialize((const unsigned char *)e.xid.data(), e.xid.size(), &format_id,
+                                 &gtrid_len, &bqual_len, data))
+        {
+            /* Written by a version that encoded differently, or damaged. We
+               cannot name it to the server, so it cannot be decided here; say
+               so rather than skipping in silence. */
+            sql_print_error(
+                "[TIDESDB] recover: a prepared transaction carries an XID this build cannot "
+                "decode (%zu bytes); it stays in doubt",
+                e.xid.size());
+            continue;
+        }
+
+        xid_list[written].id.set_format_id(format_id);
+        xid_list[written].id.set_gtrid_length(gtrid_len);
+        xid_list[written].id.set_bqual_length(bqual_len);
+        xid_list[written].id.set_data(data, gtrid_len + bqual_len);
+        xid_list[written].mod_tables = nullptr;
+        written++;
+    }
+    return (int)written;
+}
+
+/* Find an in-doubt entry by the XID the server is asking about, resolve it
+   with fn, and drop it from the list. */
+static xa_status_code tidesdb_resolve_by_xid(XID *xid, int (*fn)(tidesdb_txn_t *),
+                                             const char *what)
+{
+    if (!xid) return XAER_NOTA;
+
+    unsigned char buf[TDB_XID_MAX_SERIALIZED];
+    const size_t n = tdb_xid_serialize(xid->get_format_id(), xid->get_gtrid_length(),
+                                       xid->get_bqual_length(), xid->get_data(), buf, sizeof(buf));
+    if (n == 0) return XAER_NOTA;
+    const std::string key((const char *)buf, n);
+
+    std::lock_guard<std::mutex> guard(g_indoubt_mutex);
+    for (size_t i = 0; i < g_indoubt.size(); i++)
+    {
+        if (g_indoubt[i].xid != key) continue;
+
+        const int rc = fn(g_indoubt[i].txn);
+        if (rc != TDB_SUCCESS)
+        {
+            /* A transient failure leaves it prepared, so the server can ask
+               again -- this run or after another restart. Keep the entry. */
+            sql_print_error("[TIDESDB] recover: %s failed (rc=%d); transaction stays in doubt",
+                            what, rc);
+            return XAER_RMERR;
+        }
+        tidesdb_txn_free(g_indoubt[i].txn);
+        g_indoubt.erase(g_indoubt.begin() + (long)i);
+        if (g_indoubt_cursor > i) g_indoubt_cursor--;
+        return XA_OK;
+    }
+    /* Not ours. The server asks every engine about every XID it recovered. */
+    return XAER_NOTA;
+}
+
+static xa_status_code tidesdb_commit_by_xid(handlerton *, XID *xid)
+{
+    return tidesdb_resolve_by_xid(xid, tidesdb_txn_commit_prepared, "commit_prepared");
+}
+
+static xa_status_code tidesdb_rollback_by_xid(handlerton *, XID *xid)
+{
+    return tidesdb_resolve_by_xid(xid, tidesdb_txn_rollback_prepared, "rollback_prepared");
+}
+
 /* ******************** SHOW ENGINE TIDESDB STATUS ******************** */
 
 static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print,
@@ -3195,6 +3363,19 @@ static int tidesdb_init_func(void *p)
     tidesdb_hton->prepare = tidesdb_prepare;
     tidesdb_hton->commit = tidesdb_commit;
     tidesdb_hton->rollback = tidesdb_rollback;
+
+    /* Crash recovery for the two-phase commit above. Without these the engine
+       would prepare durably and then have no way to be told which way the
+       server decided, which is worse than not preparing at all: the batch
+       would sit in doubt forever instead of being resolved from the binlog.
+
+       recover_prepared_in_tc / set_prepared_in_tc are deliberately not
+       registered. They serve externally coordinated (user XA) transactions
+       prepared in the server's transaction coordinator, which is a larger
+       contract than internal 2PC recovery and is not what this covers. */
+    tidesdb_hton->recover = tidesdb_xa_recover;
+    tidesdb_hton->commit_by_xid = tidesdb_commit_by_xid;
+    tidesdb_hton->rollback_by_xid = tidesdb_rollback_by_xid;
     tidesdb_hton->close_connection = tidesdb_close_connection;
 
     tidesdb_hton->savepoint_set = tidesdb_savepoint_set;
@@ -3409,6 +3590,12 @@ static int tidesdb_init_func(void *p)
 
     sql_print_information("[TIDESDB] TidesDB opened at %s", g_engine_ctx.path.c_str());
 
+    /* Ask the engine what it recovered as prepared-and-undecided, before
+       anything can begin a transaction of its own. The set is fixed when the
+       database opens, and the server resolves it against the binlog through
+       the recover / commit_by_xid / rollback_by_xid hooks. */
+    tidesdb_collect_prepared(opened);
+
     /* The __tidesql_schema discovery CF was created only in object-store mode,
        so replicas could read table definitions out of shared storage. With
        object-store mode removed from the engine there is no replica to serve
@@ -3590,6 +3777,11 @@ static int tidesdb_deinit_func(void *p)
        BEFORE we close the engine. reset() is idempotent so a prior panic
        call that already ran reset() is harmless. */
     g_engine_ctx.reset();
+
+    /* Any prepared transaction the server never decided is still in doubt.
+       Free the handles before the database closes; the durable prepare record
+       stays, so they come back at the next open. */
+    tidesdb_release_indoubt();
 
     /* Atomic exchange: takes ownership of the engine handle and races
        cleanly with tidesdb_hton_panic (which uses the same pattern). */
