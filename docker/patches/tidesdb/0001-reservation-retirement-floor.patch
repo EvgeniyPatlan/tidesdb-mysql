@@ -1,0 +1,208 @@
+Subject: [PATCH] reservation: base the retirement floor on other readers, exactly
+
+txn_reserve_writes decides whether a committed occupant of a reservation slot
+can be evicted. When it cannot, the slot's fingerprint stops being consulted
+and any key that merely collides aborts a transaction that conflicts with
+nothing. Two things about that bound were wrong, and together they made a
+single connection committing in a loop abort against itself.
+
+Which transactions the bound counts. It answers "could a live transaction
+still need this record to detect a conflict of its own". The transaction
+asking is not a candidate -- it has already weighed every key in its write
+set against its own read version, and it is about to finish. Counting itself
+only ever bars it from evicting records nothing else wants. A snapshot is
+drawn one below the highest assigned sequence (txn.c), so the commit that
+immediately preceded this transaction sits above its own snapshot: every slot
+that commit left is permanently unretirable to the next transaction on the
+same connection.
+
+Where the bound comes from. published_min_snapshot is maintained for the
+compaction gc floor, which wants to err low -- too low keeps a version a
+reader might still want. This consumer wants the opposite: too low makes
+occupants look unretirable and refuses commits that had no conflict. It is
+also stale low by construction between compaction scans, and zero before the
+first one, since tidesdb_txn_registry_publish_min_snapshot has exactly one
+caller (the compaction scheduler). A database that has not compacted yet
+therefore read zero on every commit, which reads as "nothing is ever
+retirable". The two consumers want opposite kinds of error out of one number.
+
+So this path now takes the exact minimum over the other live transactions.
+A registry walk per commit costs about 3% of single-threaded commit
+throughput, so the registry also keeps a live count, and the common case of
+nobody else being joined answers from one relaxed load instead of walking
+32 shards under their locks.
+
+Measured on MySQL 9.7 with the TidesDB storage engine, 1000 sequential
+single-connection transactions of 4 UPDATEs + 1 DELETE + 1 INSERT over 5000
+rows with a secondary index: 2 spurious TDB_ERR_CONFLICT aborts before, 0
+after, and 0 over a 5000-transaction run. No concurrency is involved, so
+every one of those was a false positive.
+
+tidesdb_bench fillrandom at isolation 3, txn_ops 6, 10s runs, 3 reps:
+single threaded 373/384/378 kops/s before and 377/380/385 kops/s after;
+8 threads 947/1058/1041 before and 923/1008/1008 after, a spread the
+unpatched numbers alone already cover. Engine suite passes (54 binaries),
+as does the MySQL plugin's MTR suite (86 tests) including its
+conflict-detection cases.
+
+diff --git a/src/txn/registry.c b/src/txn/registry.c
+index 93d3e48..f1b3d17 100644
+--- a/src/txn/registry.c
++++ b/src/txn/registry.c
+@@ -51,11 +51,15 @@ typedef struct
+  * @param shards the shard array
+  * @param published_min the last minimum a scan published, for readers that cannot afford the scan
+  *                      itself; starts at zero, which reads as "assume nothing"
++ * @param live the number of transactions currently joined, across every shard. kept so a caller
++ *             can tell "nobody but me is registered" from one relaxed load instead of walking
++ *             every shard under its lock to find out
+  */
+ struct tidesdb_txn_registry
+ {
+     tidesdb_txn_registry_shard_t shards[TDB_TXN_REGISTRY_SHARDS];
+     _Atomic(uint64_t) published_min;
++    _Atomic(int) live;
+ };
+ 
+ /* the shard a joining transaction takes, claimed once per thread from a global counter.
+@@ -135,6 +139,7 @@ int tidesdb_txn_registry_add(tidesdb_txn_registry_t *reg, tdb_txn_t *txn)
+     shard->txns[shard->count] = txn;
+     tdb_txn_set_registry_slot(txn, s, shard->count);
+     shard->count++;
++    atomic_fetch_add_explicit(&reg->live, 1, memory_order_relaxed);
+     pthread_rwlock_unlock(&shard->lock);
+     return TDB_SUCCESS;
+ }
+@@ -157,11 +162,41 @@ void tidesdb_txn_registry_remove(tidesdb_txn_registry_t *reg, tdb_txn_t *txn)
+         shard->txns[i] = moved;
+         tdb_txn_set_registry_slot(moved, s, i);
+         shard->count--;
++        atomic_fetch_sub_explicit(&reg->live, 1, memory_order_relaxed);
+         tdb_txn_set_registry_slot(txn, -1, -1);
+     }
+     pthread_rwlock_unlock(&shard->lock);
+ }
+ 
++int tidesdb_txn_registry_live(const tidesdb_txn_registry_t *reg)
++{
++    if (!reg) return 0;
++    return atomic_load_explicit(&reg->live, memory_order_relaxed);
++}
++
++uint64_t tidesdb_txn_registry_min_snapshot_excluding(tidesdb_txn_registry_t *reg,
++                                                     const tdb_txn_t *self)
++{
++    if (!reg) return UINT64_MAX;
++
++    /* same shard-at-a-time walk and the same fail-safe argument as the whole-registry form; the
++     * only difference is the one transaction left out */
++    uint64_t min = UINT64_MAX;
++    for (int s = 0; s < TDB_TXN_REGISTRY_SHARDS; s++)
++    {
++        tidesdb_txn_registry_shard_t *shard = &reg->shards[s];
++        pthread_rwlock_rdlock(&shard->lock);
++        for (int i = 0; i < shard->count; i++)
++        {
++            if (shard->txns[i] == self) continue;
++            const uint64_t snap = tdb_txn_snapshot(shard->txns[i]);
++            if (snap < min) min = snap;
++        }
++        pthread_rwlock_unlock(&shard->lock);
++    }
++    return min;
++}
++
+ uint64_t tidesdb_txn_registry_min_snapshot(tidesdb_txn_registry_t *reg)
+ {
+     if (!reg) return UINT64_MAX;
+diff --git a/src/txn/registry.h b/src/txn/registry.h
+index 6885d83..0522f9f 100644
+--- a/src/txn/registry.h
++++ b/src/txn/registry.h
+@@ -60,6 +60,26 @@ void tidesdb_txn_registry_remove(tidesdb_txn_registry_t *reg, tdb_txn_t *txn);
+  */
+ uint64_t tidesdb_txn_registry_min_snapshot(tidesdb_txn_registry_t *reg);
+ 
++/**
++ * tidesdb_txn_registry_min_snapshot_excluding
++ * the oldest snapshot any live transaction other than self holds, or UINT64_MAX when self is the
++ * only one registered. a caller asking "may I discard something a live reader might still want"
++ * is never its own answer, so counting itself only ever bars it from what nothing else needs
++ * @param reg the registry
++ * @param self the transaction to leave out, which may be NULL or unregistered
++ * @return the oldest snapshot held by another live transaction, or UINT64_MAX when there is none
++ */
++uint64_t tidesdb_txn_registry_min_snapshot_excluding(tidesdb_txn_registry_t *reg,
++                                                     const tdb_txn_t *self);
++
++/**
++ * tidesdb_txn_registry_live
++ * how many transactions are joined right now, across every shard
++ * @param reg the registry
++ * @return the count, or 0 when reg is NULL
++ */
++int tidesdb_txn_registry_live(const tidesdb_txn_registry_t *reg);
++
+ /**
+  * tidesdb_txn_registry_publish_min_snapshot
+  * run the scan once and publish its answer for readers that cannot afford to run it themselves.
+diff --git a/src/txn/txn_commit.c b/src/txn/txn_commit.c
+index 809aeb9..80e6092 100644
+--- a/src/txn/txn_commit.c
++++ b/src/txn/txn_commit.c
+@@ -478,11 +478,50 @@ static int txn_reserve_writes(tdb_txn_t *txn, const tidesdb_wal_entry_t *entries
+     /* read once for the whole write set rather than per key. this is the bound below which a
+      * committed occupant of a slot cannot still be depended on, and it is what lets the slot's
+      * fingerprint tell a real same-key writer from a hash collision; without it every collision
+-     * aborts a commit that had no real conflict. the published value is a scan the compaction
+-     * scheduler already runs, read here as one relaxed load -- running the scan on this path would
+-     * mean every registry shard, once per written key. it is only ever stale low, and low is the
+-     * conservative direction */
+-    const uint64_t min_snapshot = tidesdb_txn_registry_published_min_snapshot(txn->registry);
++     * aborts a commit that had no real conflict.
++     *
++     * two things about the bound have to be right or the fingerprint stops deciding anything, and
++     * a colliding key then aborts a transaction that conflicts with nothing.
++     *
++     * the first is which transactions it counts. the question the bound answers is whether some
++     * live transaction could still need this slot's record to detect a conflict of its own. the
++     * transaction asking is not a candidate: it has already weighed every key in its write set
++     * against its own read version, and it is about to finish. counting itself only ever bars it
++     * from evicting records that nothing else wants -- and on a database whose only writer is this
++     * one, it is the whole registry, so it bars everything. a snapshot is drawn one below the
++     * highest assigned sequence, so the commit immediately before this transaction began sits
++     * above its own snapshot: every slot that commit left is permanently unretirable to the next
++     * transaction on the same connection. a single connection committing in a loop then aborts as
++     * soon as one of its keys collides with one of them, with no second writer anywhere.
++     *
++     * the second is where it comes from. the published value is maintained for the compaction gc
++     * floor, which wants to err low -- too low keeps a version a reader might still want. this
++     * consumer wants the opposite: too low makes committed occupants look unretirable and refuses
++     * commits that had no conflict. a value published by the last compaction scan is stale low by
++     * construction between scans, and before the first scan it is zero, which reads as "nothing is
++     * ever retirable". the two consumers want opposite kinds of error out of the same number, so
++     * this one takes the exact minimum rather than the published one. that is a registry walk per
++     * commit -- once for the write set, not once per key -- on a path that would otherwise refuse
++     * wrongly.
++     *
++     * an empty result means no other live transaction holds a snapshot at all, and the honest
++     * bound is then this commit's own sequence: nothing below it is depended on by anyone. */
++    uint64_t min_snapshot;
++    if (tidesdb_txn_registry_live(txn->registry) <= 1)
++    {
++        /* nobody but this transaction is joined, so the walk can only answer "no other reader" --
++         * skip it and take that answer directly. a transaction joining between this load and the
++         * reservations below cannot invalidate it: it draws its snapshot from a monotonic clock,
++         * so its snapshot is at or above the sequence this commit is claiming, and a record older
++         * than that is one it reads as part of its own snapshot rather than one it needs the slot
++         * to find. this is the same fail-safe the shard-at-a-time walk already relies on */
++        min_snapshot = seq;
++    }
++    else
++    {
++        const uint64_t exact = tidesdb_txn_registry_min_snapshot_excluding(txn->registry, txn);
++        min_snapshot = (exact == UINT64_MAX) ? seq : exact;
++    }
+ 
+     /* the intervals this batch writes are claimed first, so a point write that arrives afterwards
+      * meets them. an interval cannot be claimed as a key hash -- there is no one key to hash -- so

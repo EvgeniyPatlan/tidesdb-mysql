@@ -15,18 +15,15 @@ id	v
 1	AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 2	BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
 SHOW ENGINE TIDESDB STATUS;
-SELECT VARIABLE_VALUE > 0 AS cf_positive FROM performance_schema.global_status
-WHERE VARIABLE_NAME = 'TIDESDB_COLUMN_FAMILIES';
-cf_positive
-1
-SELECT VARIABLE_VALUE > 0 AS mem_positive FROM performance_schema.global_status
-WHERE VARIABLE_NAME = 'TIDESDB_MEMORY_LIMIT';
-mem_positive
-1
-SELECT VARIABLE_VALUE > 0 AS parts_positive FROM performance_schema.global_status
-WHERE VARIABLE_NAME = 'TIDESDB_CACHE_PARTITIONS';
-parts_positive
-1
+SELECT
+(SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'TIDESDB_COLUMN_FAMILIES')  AS cf_positive,
+(SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'TIDESDB_CACHE_PARTITIONS') AS parts_positive,
+(SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'TIDESDB_VERSION_HEX')      AS version_positive;
+cf_positive	parts_positive	version_positive
+1	1	1
 #
 # TEST 3: All variable names are correct
 #
@@ -42,14 +39,10 @@ tidesdb_cache_partitions
 tidesdb_column_families
 tidesdb_compaction_queue
 tidesdb_data_size_bytes
-tidesdb_flush_pending
-tidesdb_flush_queue
 tidesdb_global_sequence
 tidesdb_immutable_memtables
 tidesdb_max_sst_tombstone_density
 tidesdb_max_sst_tombstone_density_level
-tidesdb_memory_limit
-tidesdb_memory_pressure
 tidesdb_memtable_bytes
 tidesdb_open_sstables
 tidesdb_perf_compiled
@@ -59,6 +52,14 @@ tidesdb_total_tombstones
 tidesdb_txn_memory_bytes
 tidesdb_version
 tidesdb_version_hex
+tidesdb_vlog_dead_bytes
+tidesdb_vlog_live_bytes
+tidesdb_vlog_segments
+tidesdb_vlog_segments_drainable
+tidesdb_write_stall_ceiling_hits
+tidesdb_write_stall_us
+tidesdb_writes_blocked
+tidesdb_writes_throttled
 #
 # Cleanup
 #

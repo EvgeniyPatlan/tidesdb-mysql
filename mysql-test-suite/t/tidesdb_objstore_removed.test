@@ -1,0 +1,57 @@
+--source suite/tidesdb/include/have_tidesdb.inc
+#
+# Object-store mode was removed from the engine in TidesDB 10. This replaces
+# tidesdb_object_store.test, which had become a false pass: it was written to
+# run against MinIO, and its own header said "when run without S3 config, tests
+# still pass using local storage" -- so in CI it did plain CRUD on local files
+# and asserted nothing whatever about object storage. It kept passing after the
+# feature was removed, which is the giveaway.
+#
+# What is worth asserting now is the removal surface itself. The sysvars stay
+# registered deliberately, as rejecting stubs, so an operator whose my.cnf
+# still sets one gets an explanation rather than "unknown variable" and a
+# server that will not start for a reason they have to guess at.
+#
+
+--echo #
+--echo # The configuration surface still exists, so an old my.cnf gets an
+--echo # explanation rather than an unknown-variable error
+--echo #
+SELECT VARIABLE_NAME FROM performance_schema.global_variables
+WHERE VARIABLE_NAME IN (
+  'tidesdb_object_store_backend',
+  'tidesdb_s3_endpoint',
+  'tidesdb_s3_bucket',
+  'tidesdb_s3_prefix',
+  'tidesdb_s3_access_key',
+  'tidesdb_s3_region',
+  'tidesdb_s3_path_style',
+  'tidesdb_objstore_wal_sync_on_commit',
+  'tidesdb_replica_mode',
+  'tidesdb_promote_primary')
+ORDER BY VARIABLE_NAME;
+
+--echo #
+--echo # They are start-time only, so a runtime SET is refused by the server
+--echo #
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SET GLOBAL tidesdb_s3_bucket = 'anything';
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SET GLOBAL tidesdb_object_store_backend = 'S3';
+
+--echo #
+--echo # tidesdb_promote_primary is settable, and refused with the reason
+--echo #
+--error ER_UNKNOWN_ERROR
+SET GLOBAL tidesdb_promote_primary = ON;
+
+--echo #
+--echo # A table behaves normally -- there is no object-store path left to take
+--echo #
+CREATE TABLE t_obj (id INT NOT NULL PRIMARY KEY, name VARCHAR(100)) ENGINE=TidesDB;
+INSERT INTO t_obj VALUES (1,'alpha'), (2,'beta'), (3,'gamma');
+SELECT id, name FROM t_obj ORDER BY id;
+DROP TABLE t_obj;
+
+--source suite/tidesdb/include/cleanup_tidesdb.inc
+--echo # Done.

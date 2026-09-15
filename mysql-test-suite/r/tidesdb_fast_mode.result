@@ -7,5 +7,14 @@ SELECT id, v FROM tdb_fast_t ORDER BY id;
 id	v
 1	a
 2	b
+#
+# fast_mode governs DDL atomicity, not DML durability
+#
+CREATE TABLE tdb_fast_2pc (id INT PRIMARY KEY) ENGINE=TIDESDB;
+BEGIN;
+INSERT INTO tdb_fast_2pc VALUES (1);
+COMMIT;
+# Handler_prepare advanced: the engine still prepares under fast_mode
+DROP TABLE tdb_fast_2pc;
 DROP TABLE tdb_fast_t;
 # Done.

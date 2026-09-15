@@ -28,6 +28,9 @@ add_executable(tidesdb_atomic_ddl_tests
     test_reconciler_delta.cc
     test_server_stubs.cc
     test_perf_ring.cc
+    test_retry_transient.cc
+    test_legacy_options.cc
+    test_xid_serialize.cc
     ${CMAKE_SOURCE_DIR}/storage/tidesdb/tidesdb_atomic_ddl_pure.cc
     ${CMAKE_SOURCE_DIR}/storage/tidesdb/tidesdb_perf_ring.cc
 )

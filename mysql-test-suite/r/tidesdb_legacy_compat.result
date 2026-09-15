@@ -1,0 +1,75 @@
+SELECT @@global.tidesdb_legacy_compat AS default_is_strict;
+default_is_strict
+strict
+SET GLOBAL tidesdb_legacy_compat = 'warn';
+SELECT @@global.tidesdb_legacy_compat AS now_warn;
+now_warn
+warn
+SET GLOBAL tidesdb_legacy_compat = 'strict';
+SELECT @@global.tidesdb_legacy_compat AS back_to_strict;
+back_to_strict
+strict
+SET GLOBAL tidesdb_legacy_compat = 'lenient';
+ERROR 42000: Variable 'tidesdb_legacy_compat' can't be set to the value of 'lenient'
+CREATE TABLE tdb_legacy_t (id INT PRIMARY KEY, v VARCHAR(32)) ENGINE=TIDESDB
+ENGINE_ATTRIBUTE='{"bloom_filter":true}';
+INSERT INTO tdb_legacy_t VALUES (1,'a');
+SELECT id, v FROM tdb_legacy_t;
+id	v
+1	a
+DROP TABLE tdb_legacy_t;
+SET GLOBAL tidesdb_legacy_compat = 'warn';
+CREATE TABLE tdb_legacy_t (id INT PRIMARY KEY) ENGINE=TIDESDB
+ENGINE_ATTRIBUTE='{"bloom_filter":true}';
+DROP TABLE tdb_legacy_t;
+#
+# A retired key that moved to a system variable: strict names the variable
+#
+SET GLOBAL tidesdb_legacy_compat = 'strict';
+CREATE TABLE tdb_legacy_t (id INT PRIMARY KEY) ENGINE=TIDESDB
+ENGINE_ATTRIBUTE='{"write_buffer_size":67108864}';
+ERROR HY000: ENGINE_ATTRIBUTE 'write_buffer_size' is no longer a table option; it is database-wide -- set @@tidesdb_unified_memtable_write_buffer_size
+#
+# A retired key whose behaviour is gone: strict says so instead of
+# inventing a replacement
+#
+CREATE TABLE tdb_legacy_t (id INT PRIMARY KEY) ENGINE=TIDESDB
+ENGINE_ATTRIBUTE='{"use_btree":true}';
+ERROR HY000: ENGINE_ATTRIBUTE 'use_btree' was removed: a key log is always a btree in TidesDB 10, and that btree is the index
+#
+# The upgrade path: a dump from the previous release carries these keys
+# verbatim, and warn is what lets it reload
+#
+SET GLOBAL tidesdb_legacy_compat = 'warn';
+CREATE TABLE tdb_legacy_t (
+id INT PRIMARY KEY,
+v  VARCHAR(32)
+) ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"write_buffer_size":67108864,"sync_mode":"FULL","use_btree":true,"block_indexes":true,"min_disk_space":1048576,"bloom_filter":true}';
+Warnings:
+Warning	1210	ENGINE_ATTRIBUTE 'write_buffer_size' is no longer a table option; it is database-wide -- set @@tidesdb_unified_memtable_write_buffer_size (ignored: tidesdb_legacy_compat=warn)
+Warning	1210	ENGINE_ATTRIBUTE 'sync_mode' is no longer a table option; it is database-wide -- set @@tidesdb_unified_memtable_sync_mode (ignored: tidesdb_legacy_compat=warn)
+Warning	1210	ENGINE_ATTRIBUTE 'use_btree' was removed: a key log is always a btree in TidesDB 10, and that btree is the index (ignored: tidesdb_legacy_compat=warn)
+Warning	1210	ENGINE_ATTRIBUTE 'block_indexes' was removed: block-format key logs are gone; the btree per key log is the index (ignored: tidesdb_legacy_compat=warn)
+Warning	1210	ENGINE_ATTRIBUTE 'min_disk_space' was removed: the engine no longer reserves a per-family disk floor (ignored: tidesdb_legacy_compat=warn)
+# the live key is still applied; the retired ones are ignored, not stored
+SHOW WARNINGS;
+Level	Code	Message
+Warning	1210	ENGINE_ATTRIBUTE 'write_buffer_size' is no longer a table option; it is database-wide -- set @@tidesdb_unified_memtable_write_buffer_size (ignored: tidesdb_legacy_compat=warn)
+Warning	1210	ENGINE_ATTRIBUTE 'sync_mode' is no longer a table option; it is database-wide -- set @@tidesdb_unified_memtable_sync_mode (ignored: tidesdb_legacy_compat=warn)
+Warning	1210	ENGINE_ATTRIBUTE 'use_btree' was removed: a key log is always a btree in TidesDB 10, and that btree is the index (ignored: tidesdb_legacy_compat=warn)
+Warning	1210	ENGINE_ATTRIBUTE 'block_indexes' was removed: block-format key logs are gone; the btree per key log is the index (ignored: tidesdb_legacy_compat=warn)
+Warning	1210	ENGINE_ATTRIBUTE 'min_disk_space' was removed: the engine no longer reserves a per-family disk floor (ignored: tidesdb_legacy_compat=warn)
+INSERT INTO tdb_legacy_t VALUES (1,'reloaded');
+SELECT id, v FROM tdb_legacy_t;
+id	v
+1	reloaded
+DROP TABLE tdb_legacy_t;
+#
+# and back to strict once the reload is done
+#
+SET GLOBAL tidesdb_legacy_compat = 'strict';
+CREATE TABLE tdb_legacy_t (id INT PRIMARY KEY) ENGINE=TIDESDB
+ENGINE_ATTRIBUTE='{"sync_mode":"FULL"}';
+ERROR HY000: ENGINE_ATTRIBUTE 'sync_mode' is no longer a table option; it is database-wide -- set @@tidesdb_unified_memtable_sync_mode
+SET GLOBAL tidesdb_legacy_compat = 'strict';
+# Done.

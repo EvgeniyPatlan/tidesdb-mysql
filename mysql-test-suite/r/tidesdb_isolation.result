@@ -18,6 +18,7 @@ INSERT INTO t_iso VALUES (2, 20);
 SELECT * FROM t_iso ORDER BY id;
 id	val
 1	10
+2	20
 COMMIT;
 #
 # ============================================

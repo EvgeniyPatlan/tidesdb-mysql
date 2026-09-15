@@ -57,7 +57,7 @@ FROM oraclelinux:9 AS builder
 # Pin sources for reproducibility; bump when the engine is known-compatible.
 ARG MYSQL_VERSION
 ARG MYSQL_TAG=mysql-${MYSQL_VERSION}
-ARG TIDESDB_TAG=v9.3.2
+ARG TIDESDB_TAG=v10.0.1
 
 # v0.4.1: build the plugin with -DTIDESDB_PERF=1 to compile in the
 # layer-by-layer perf instrumentation. Default OFF; pass --build-arg
@@ -95,7 +95,7 @@ RUN git clone --depth=1 --branch ${MYSQL_TAG} \
 
 # 2) Clone TidesDB and build the static archive (PIC so it can link into a .so).
 #
-#    We ship the engine source UNPATCHED as of v9.3.2 -- every fix we used to
+#    We ship the engine source UNPATCHED as of v10.0.1 -- every fix we used to
 #    carry is now upstream:
 #      * 0001-walfix.patch (four durability bugs we carried against v9.2.0:
 #        inverted convert_sync_mode, raw sync_mode at WAL opens, unconditional
@@ -114,15 +114,25 @@ RUN git clone --depth=1 --branch ${MYSQL_TAG} \
 RUN git clone --depth=1 --branch ${TIDESDB_TAG} \
         https://github.com/tidesdb/tidesdb.git tidesdb
 
-# Apply local patches against the engine source. No engine patch is carried
-# at present: the graduated active-memtable backpressure we used to patch in
-# landed upstream in TidesDB v9.3.5, whose notes describe the same change --
-# "the active memtable ceiling now ramps gradually instead of stalling hard,
-# which roughly halves worst case commit latency". The patch is kept as
-# 0001-graduated-active-memtable-backpressure.patch.disabled for reference
-# against the pre-9.3.5 engine and is not applied (the loop matches *.patch).
-# The step stays so a future patch only needs dropping into the directory;
-# an empty patches/tidesdb/ produces a friendly skip log.
+# Apply local patches against the engine source.
+#
+# Carried against v10.0.1:
+#   * 0001-reservation-retirement-floor.patch -- txn_reserve_writes decides
+#     whether a committed occupant of a reservation slot can be evicted, and
+#     when it cannot, the slot's fingerprint stops being consulted, so a key
+#     that merely collides aborts a transaction conflicting with nothing. The
+#     bound counted the committing transaction itself (which can only bar it
+#     from evicting records nothing else wants) and read a value published for
+#     the compaction gc floor, whose safe direction is the opposite of this
+#     consumer's. A single connection committing in a loop aborted against
+#     itself: 2 spurious conflicts per 1000 transactions, 0 after. Sent
+#     upstream; drop this once it lands.
+#
+# Kept but not applied (the loop matches *.patch, not *.disabled):
+#   * 0001-graduated-active-memtable-backpressure.patch.disabled -- landed
+#     upstream in v9.3.5, kept for reference against a pre-9.3.5 engine.
+#
+# An empty patches/tidesdb/ produces a friendly skip log.
 COPY docker/patches/tidesdb/ /build/tidesdb-patches/
 RUN cd /build/tidesdb && \
     if ls /build/tidesdb-patches/*.patch >/dev/null 2>&1; then \

@@ -51,6 +51,32 @@ a	b
 3	30
 4	40
 COMMIT;
+# ---- TEST 4: the snapshot survives compaction of the versions it reads ----
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION WITH CONSISTENT SNAPSHOT;
+# reader sees the four rows written so far
+SELECT COUNT(*) AS rows_at_snapshot FROM t_snap64;
+rows_at_snapshot
+4
+DELETE FROM t_snap64;
+INSERT INTO t_snap64 (a, b) VALUES (90, 900), (91, 910), (92, 920);
+# still the snapshot's four rows, not the writer's three
+SELECT COUNT(*) AS rows_after_writer FROM t_snap64;
+rows_after_writer
+4
+SELECT * FROM t_snap64 ORDER BY a;
+a	b
+1	10
+2	20
+3	30
+4	40
+COMMIT;
+# after COMMIT the writer's rows are what is there
+SELECT * FROM t_snap64 ORDER BY a;
+a	b
+90	900
+91	910
+92	920
 # Cleanup
 DROP TABLE t_snap64;
 #

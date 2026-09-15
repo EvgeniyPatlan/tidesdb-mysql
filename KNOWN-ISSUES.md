@@ -3,60 +3,179 @@
 This document tracks defects we've confirmed in the bundled TidesDB engine
 that affect `tidesdb-mysql` users.
 
-## Current: bundled on TidesDB v9.3.2 — shipped unpatched
+## Current: bundled on TidesDB v10.0.1 — one patch carried, one issue open
 
-As of release **v0.3.1** the engine is pinned to **TidesDB v9.3.2** and we
-continue to ship it **with zero patches**. Both fixes we used to carry are
-upstream:
+The engine is pinned to **TidesDB v10.0.1** and we carry **one** patch,
+`docker/patches/tidesdb/0001-reservation-retirement-floor.patch`. It is applied
+by both `docker/Dockerfile.mysql` and `scripts/setup-workspace.sh`, so a local
+build and the shipped image run the same engine.
 
-- `0001-walfix.patch` (four durability bugs) — fixed in **v9.2.5**, retired then.
+One issue is **open and unfixed**: concurrent bulk loaders take false conflicts
+and fail. It is the unpatched half of the same reservation-collision behaviour,
+it needs a design change upstream, and it is written up below.
+
+### `0001-reservation-retirement-floor.patch` — conflict-free commits refused
+
+**Severity:** high — aborts transactions that have no conflict, on workloads
+with no concurrency at all.
+
+TidesDB 10 added a first-committer-wins reservation table: 2^20 slots indexed
+by the low bits of a key hash, each packing a 16-bit fingerprint with a commit
+sequence. When two unrelated keys land in one slot, the fingerprint is what
+distinguishes a real same-key writer from the collision. It only gets to decide
+if the slot's current occupant can be retired, and the bound deciding that was
+wrong in two ways:
+
+- It counted the committing transaction itself. That transaction has already
+  weighed its whole write set against its own read versions, so it is never the
+  reader the bound is protecting; counting itself only barred it from evicting
+  records nothing else wanted. Snapshots are drawn one below the highest
+  assigned sequence, so the previous commit on the same connection always sat
+  above the next transaction's snapshot — permanently unretirable.
+- It read `published_min_snapshot`, which is maintained for the compaction GC
+  floor. That consumer wants the value to err low; this one needs the opposite,
+  because low makes occupants look unretirable and refuses good commits. It is
+  also stale between compaction scans and zero before the first one, since the
+  publishing call has a single caller.
+
+**Symptom:** `ERROR 1180 ... Got error 149 - 'Lock deadlock; Retry transaction'`
+on `COMMIT`, on a single connection, with no other writer on the server. A
+1000-transaction single-connection loop (4 UPDATEs + 1 DELETE + 1 INSERT over
+5000 rows with a secondary index) produced 2 such aborts; with the patch, 0
+over 5000 transactions.
+
+**Fix:** take the exact minimum over the *other* live transactions. The
+registry also gained a live count so the common single-writer case answers
+without walking all 32 shards, which keeps single-threaded commit throughput
+where it was.
+
+Sent upstream; drop the patch once it lands.
+
+### OPEN: concurrent bulk loaders take false conflicts and fail
+
+**Severity:** high for multi-threaded bulk loading; no effect on ordinary OLTP.
+**Status:** upstream design limitation. Our patch above fixes one half of it;
+this is the half that remains. Not fixable plugin-side without giving up
+conflict detection that users are entitled to.
+
+**Symptom.** A bulk load run by several connections at once fails partway
+through, with a statement error and this in the error log:
+
+```
+[Warning] [TIDESDB] bulk mid-commit failed rc=-7; the engine has already
+          aborted this transaction, so the statement is rolled back rather
+          than retried
+```
+
+`-7` is `TDB_ERR_CONFLICT`. It is reported even when the loaders write
+completely disjoint keys and no real conflict is possible. A client that does
+not retry the statement simply stops; a HammerDB TPROC-C schema build at 10
+warehouses with 4 loader threads hangs at roughly 40% loaded, every time. The
+same build on the previous release completes.
+
+**Mechanism.** TidesDB 10 detects write-write conflicts with a
+first-committer-wins reservation table: 2^20 slots indexed by the low bits of
+a key hash, each holding a 16-bit fingerprint of that hash plus the commit
+sequence. Two unrelated keys can land in one slot. The fingerprint is what
+distinguishes a real same-key writer from that collision, but it is only
+consulted when the slot's current occupant can be retired:
+
+```c
+if (cseq > read_base && (TDB_MVCC_RES_FP(cur) == myfp || cseq > min_snapshot))
+    return 0;   /* conflict */
+```
+
+`min_snapshot` is the oldest snapshot any live transaction holds. With several
+loaders running concurrently that floor sits well behind the newest commits,
+so almost every occupant is unretirable, the fingerprint stops deciding
+anything, and a mere collision becomes a refused commit. The more concurrent
+writers, the wider the window and the more often it fires.
+
+**Why the arm cannot simply be deleted.** It is load-bearing. Claiming a slot
+evicts whatever record was there, and that record is what a later writer of
+the *colliding* key would have used to notice a conflict of its own. If the
+evicting transaction's sequence has fallen below the floor by the time that
+writer commits, the conflict is missed rather than merely mis-reported. A
+missed conflict is a lost update, which is far worse than a spurious abort.
+Trusting the fingerprint unconditionally trades a loud wrong answer for a
+silent one.
+
+Fixing it properly is a design change in the engine -- a larger table, chained
+slots, or storing enough of the key to verify a collision -- not a patch we
+should improvise into a vendored dependency.
+
+**Why there is no plugin-side workaround.** The obvious one is to run bulk DML
+at `READ COMMITTED`, where reservations are not taken at all. It was tried and
+reverted. `maybe_bulk_commit` already resets to `READ COMMITTED` after each
+mid-statement commit, so only the first batch of a statement is exposed, and
+closing that gap looked free. It is not: MySQL routes a plain `INSERT` inside
+`START TRANSACTION` through `start_bulk_insert`, so the change silently
+removed conflict detection from ordinary transactional inserts. Two
+transactions inserting the same primary key stopped conflicting and became
+last-writer-wins. `tidesdb_insert_conflict` and `tidesdb_concurrent_conflict`
+caught it immediately.
+
+**What this means in practice.**
+
+- Ordinary OLTP is unaffected. Reservations only fire at `SNAPSHOT` isolation
+  and above, and a single connection committing in a loop no longer takes
+  false conflicts at all since the patch above.
+- Multi-threaded bulk loading is affected: `mysqlslap --concurrency`, a
+  parallel `mysqldump` restore, a TPC-C loader, any `LOAD DATA` fan-out.
+- **Mitigation:** load with a single connection, or use a client that retries
+  a statement on `ER_LOCK_DEADLOCK` (1213) / error 1180. The data is never
+  wrong -- the transaction is aborted cleanly and nothing partial is kept.
+
+**Reproducer.** `IMG=<image> WARE=10 BUILDVU=4 RUNVU=8 RAMP=1 DUR=3
+./bench/hammerdb/run-hammerdb.sh`. Compare against the previous release with
+the same command and a different `IMG=`; it completes and reports ~1783 NOPM.
+
+**Related:** the same collision behaviour, in its single-connection form, is
+what `0001-reservation-retirement-floor.patch` above fixes. That patch removed
+the case where the floor was *never* advanced (published as zero before the
+first compaction, and counting the committing transaction itself). What is
+left is the case where the floor is real but simply older than the commits
+being collided with, which concurrency makes routine.
+
+### Retired patches
+
+Both patches we used to carry are upstream and no longer applied:
+
+- `0001-walfix.patch` (four durability bugs) — fixed in **v9.2.5**.
 - `0001-bloomfix.patch` (the `bloom_filter_new` UAF, TidesDB **PR #626**) —
-  landed upstream **verbatim in v9.3.0**, retired with that bump.
+  landed upstream verbatim in **v9.3.0**.
 
-The `docker/patches/` directory has no engine patches; no Dockerfile or script
-applies one. The per-bug write-ups below are kept as a record and as a
-regression checklist for future upgrades.
+The per-bug write-ups below are kept as a record and as a regression checklist
+for future upgrades.
 
-What's new since v9.3.0 (v9.3.1 + v9.3.2, no plugin change needed):
+Handled plugin-side (see [CHANGELOG.md](CHANGELOG.md)):
 
-- **Concurrency / memory-safety hardening (v9.3.1).** Clock-cache reader-pin
-  wraparound at 128 readers (would corrupt zero-copy buffers), flush-cleanup
-  use-after-free over the sixteen-immutable threshold, transaction-reset
-  dangling pointer (repeatable-read / snapshot), duplicate column-family
-  registration race, 32-bit MSVC atomics.
-- **Reader FD starvation fix (v9.3.1).** Engine-side counterpart to the
-  fd-pressure behaviour the v0.3.0 100 GiB stress run documented: a flush-path
-  descriptor leak (a bare `close` skipping the counted-open decrement) is fixed,
-  and reader/reaper budgets are unified so the reserve always stays available.
-- **Backpressure simplification (v9.3.1).** L1 hard-stop removed; admission is
-  governed by L0 stall + the active-memtable ceiling.
-- **Parallel compaction within a round (v9.3.1).** Per-CF rounds borrow
-  ephemeral helper threads with work-stealing and shard merge output across
-  key-range subcompactions; ~25 % higher ingest throughput in upstream's tests.
-- **Large bloom filters / block indexes (v9.3.2).** Auxiliary klog blocks are
-  chunked when they exceed the 4 GB block-manager size; **backwards-compatible**.
-- **`_tidesdb_cancel_background_work_` (v9.3.2).** Quick-shutdown helper for
-  large flush/compaction queues.
+- **Error code -14 changed meaning in v10.** It was `TDB_ERR_BUSY`
+  (backpressure-stall timeout) through the 9.x line; it is now
+  `TDB_ERR_TXN_EXPIRED`. The number is the same, so nothing fails to compile --
+  `tdb_rc_to_ha` was updated by hand. v10 also adds `TDB_ERR_NO_SPACE` (-15),
+  `TDB_ERR_TXN_ABORTED` (-16) and `TDB_ERR_TOO_OLD` (-17).
+- **`TDB_ERR_LOCKED`** marks a read left unservable by contention, which the
+  caller is expected to retry rather than surface. The plugin wraps the
+  affected engine reads in a bounded retry (`plugin/tidesdb_retry.h`).
+- The **active-memtable backpressure ceiling** (2x `write_buffer_size`) bounds
+  the unbounded memtable growth that produced the WARE=100 OOM during v0.2.5
+  validation; the plugin's `default_l0_queue_stall_threshold` default was
+  lowered 20 -> 10 to match upstream now that this is the gating surface.
 
-Carried over from v9.3.0 and still handled plugin-side
-(see [CHANGELOG.md](CHANGELOG.md)):
-
-- **`TDB_ERR_BUSY` (-14)** is returned from backpressure-stall timeouts that
-  previously surfaced as `TDB_ERR_IO`. `tdb_rc_to_ha` maps it to
-  `HA_ERR_LOCK_WAIT_TIMEOUT` (retriable), so a transient stall no longer looks
-  like `HA_ERR_CRASHED` (corruption).
-- The new **active-memtable backpressure ceiling** (2× `write_buffer_size`)
-  bounds the unbounded memtable growth that produced the WARE=100 OOM during
-  v0.2.5 validation; the plugin's `default_l0_queue_stall_threshold` default
-  was lowered 20 → 10 to match upstream now that this is the gating surface.
-
-## Known limitations introduced or formalised in v0.4.0
+## Known limitations (carried into v0.5.0)
 
 These are atomic-DDL participation limitations. They are not engine bugs — they are deliberate scope boundaries of the v0.4.0 contract, tracked here so operators know what to expect. Full write-up: [docs/v0.4.0-validation-report.md](docs/v0.4.0-validation-report.md) (*Known limitations*).
 
-### 1. DD-commit / engine-commit two-phase-commit gap
+### 1. DDL: DD-commit / engine-commit two-phase-commit gap
 
-A narrow window exists between the DD-side commit and the engine-side commit where the two can momentarily diverge. The same window exists in InnoDB. If the engine commit hook fails after the DD has already committed, the next-startup `DdSyncReconciler` sweep reconciles per the `tidesdb_orphan_action` sysvar (default `quarantine`). Full closure requires server-side XA-style 2PC, which is **not** in MySQL 9.7's atomic-DDL contract. No code-side mitigation is possible from a storage-engine plugin alone.
+**Narrowed in v0.5.0, and worth separating into two halves that used to be described as one.**
+
+**DML is closed.** Through v0.4.x the engine had no durable prepare, so the plugin ran the whole commit inside the prepare hook. A crash between prepare and commit left writes durable in the engine and absent from the binlog with no way to find them, and a binlog flush that failed after a successful prepare left the engine holding data the server had discarded. TidesDB 10 has a real prepare: transactions prepare durably, stay invisible until phase two, and any left in doubt by a crash are resolved against the binlog at startup through the `recover` / `commit_by_xid` / `rollback_by_xid` hooks. `tidesdb_v10_prepared_recovery` covers both directions.
+
+**DDL is not.** Creating, dropping and renaming a column family are not transactional engine operations — they are direct calls, not writes inside a transaction — so they cannot be carried by the prepare above. The window between the DD-side commit and the engine-side CF mutation therefore remains, and the next-startup `DdSyncReconciler` sweep is still what reconciles it, per the `tidesdb_orphan_action` sysvar (default `quarantine`). Closing this needs the SE-private DDL journal described in §6, not more 2PC.
+
+Note also that the sweep this section relies on runs on a **manual trigger**, not at startup. See §5a.
 
 ### 2. DDSE callback stubs are inert
 
@@ -66,17 +185,33 @@ All eight DDSE entry points (`ddse_dict_init`, `dict_init`, `dict_recover`, `dic
 
 Pre-v0.4.0 tables have no `se_private_data` and no SDI blob in `__tidesdb_sdi`. The supported upgrade path is **`ALTER TABLE t ENGINE=TIDESDB`** per user table, which populates `se_private_data` and emits the SDI blob. Strict mode (`tidesdb_atomic_ddl_strict=ON`, the default) refuses to open legacy tables; setting it to `OFF` temporarily during upgrade allows opens with a warning. Auto-retrofit on open was considered and rejected — it would silently rewrite metadata for tables the operator may not have intended to touch.
 
+**Interaction with the v0.5.0 format break.** This retrofit has to happen on the **old** server, before dumping. v0.5.0 cannot open a v0.4.x data directory at all — it refuses to start the engine (see [docs/upgrade-v0.5.0.md](docs/upgrade-v0.5.0.md)) — so there is no v0.5.0 server on which to run the `ALTER`. A v0.3.x user upgrading to v0.5.0 does the retrofit on v0.4.x, dumps, then loads into v0.5.0.
+
 ### 4. `mysqldump --tab` round-trip is smoke-tested only
 
 The four SDI MTR tests exercise round-trip on the `__tidesdb_sdi` metadata CF, but a full `mysqldump --tab` end-to-end integration test is deferred to **v0.5.0**.
 
-### 5. Twelve crash-injection MTR tests skip on the Release `mysql-mtr` image
+### 5. Run the suite against a Debug build; the Release image is reduced coverage
 
-The atomic-DDL test suite includes 12 tests that use `DBUG_SUICIDE` for controlled crash injection. These require a Debug `mysqld` (gated by `have_debug.inc`) and so skip on the Release-mode `tidesdb/mysql-mtr:9.7` image used for CI. They were validated locally on a one-off Debug image (`tidesdb/mysql-mtr:9.7-dbg4`, preserved locally) during root-cause analysis of the COPY-ALTER 2PC SIGSEGV. Producing a steady-state Debug MTR image for CI is a follow-up.
+The crash-injection tests use `DBUG_SUICIDE` and are gated by `have_debug.inc`, so they do not execute on a Release build. This used to be written down as twelve tests that "skip on the Release image", with a Debug CI image listed as a follow-up.
+
+That framing was the problem. Tests that quietly skip read as passes, and four real plugin defects accumulated behind them — including a reconciler whose engine-name comparison never matched, which made the whole subsystem inert, and status variables that were invisible because every one of them was missing its scope field.
+
+**The expected way to run the suite is the local Debug tree** (`scripts/setup-workspace.sh` then `./mtr --suite=tidesdb`), where the crash-injection tests actually execute. The Release `tidesdb/mysql-mtr:9.7` image is the reduced-coverage path, not the default.
+
+Two further gates only a Debug build reaches: `tidesdb_v10_prepared_recovery`, which crashes the server between prepare and binlog and again between binlog and engine commit, and the perf-instrumented build (`-DTIDESDB_PERF=1`), which runs four tests and seven unit tests the default build skips. Check for `[ skipped ]` in the MTR summary rather than reading the pass count alone.
+
+### 5a. The reconciler sweep does not run at startup
+
+`DdSyncReconciler::apply_delta` is gated off at plugin init and driven by a DBUG hook instead. The reason is DD warm-up timing: on the bootstrap thread the data dictionary's table cache may not yet list user tables, and an init-time sweep then classifies live tables as orphan CFs and quarantines them — observed, not theorised.
+
+This matters because §1 and §6 both name that sweep as the recovery mechanism for their window. It is available, but an operator has to run it; it is not automatic. The principled fix is the `post_recover` handlerton hook, which runs after recovery with a warm DD.
 
 ### 6. COPY-ALTER fix is tactical
 
-The v0.4.0 fix for the COPY-ALTER 2PC use-after-free (`tidesdb_flush_engine_txn_before_cf_mutation`, commit `0d7fe2c`) flushes the engine session txn at the top of `ha_tidesdb::rename_table` and `ha_tidesdb::delete_table`. This restores pre-flag-flip engine-layer ordering and preserves the atomic-DDL contract at the server / DD layer, but it gives up a narrow window (engine has committed; DD has not) — the startup sweep recovers it. The architecturally correct fix — a SE-private DDL journal so CF rename / drop is itself transactional alongside user data writes — is deferred to **v0.5.0**.
+The v0.4.0 fix for the COPY-ALTER 2PC use-after-free (`tidesdb_flush_engine_txn_before_cf_mutation`, commit `0d7fe2c`) flushes the engine session txn at the top of `ha_tidesdb::rename_table` and `ha_tidesdb::delete_table`. This restores pre-flag-flip engine-layer ordering and preserves the atomic-DDL contract at the server / DD layer, but it gives up a narrow window (engine has committed; DD has not) — the sweep in §5a recovers it.
+
+**Still open after v0.5.0, and the durable prepare does not close it.** The architecturally correct fix is an SE-private DDL journal, so CF rename and drop are themselves transactional alongside user data writes. TidesDB 10's prepare covers transactions, and CF create / drop / rename are not transaction operations, so they cannot ride on it. Deferred again.
 
 ## Verified fixed upstream in v9.3.0 (formerly our bloomfix patch)
 

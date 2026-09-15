@@ -101,48 +101,29 @@ id	val
 DROP TABLE t_lowfpr;
 #
 # ============================================
-# TEST 5: CREATE TABLE with custom write buffer
+# TEST 5: options that became database-wide are refused
+#   write_buffer_size, sync_mode and sync_interval_us configure the
+#   memtable and WAL, which TidesDB 10 made database-wide. A table can
+#   no longer carry them, and accepting one silently would leave a
+#   CREATE TABLE looking like it had tuned something.
 # ============================================
 #
-CREATE TABLE t_bigbuf (id INT, val VARCHAR(50)) ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"write_buffer_size":16777216}';
-SHOW CREATE TABLE t_bigbuf;
-Table	Create Table
-t_bigbuf	CREATE TABLE `t_bigbuf` (
-  `id` int DEFAULT NULL,
-  `val` varchar(50) DEFAULT NULL
-) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci /*!80021 ENGINE_ATTRIBUTE='{"write_buffer_size": 16777216}' */
-INSERT INTO t_bigbuf VALUES (1, '16MB write buffer');
-SELECT * FROM t_bigbuf;
-id	val
-1	16MB write buffer
-DROP TABLE t_bigbuf;
-#
-# ============================================
-# TEST 6: CREATE TABLE with sync mode options
-# ============================================
-#
+CREATE TABLE t_bigbuf (id INT) ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"write_buffer_size":16777216}';
+ERROR HY000: ENGINE_ATTRIBUTE 'write_buffer_size' is no longer a table option; it is database-wide -- set @@tidesdb_unified_memtable_write_buffer_size
 CREATE TABLE t_syncnone (id INT) ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"sync_mode":"NONE"}';
-SHOW CREATE TABLE t_syncnone;
-Table	Create Table
-t_syncnone	CREATE TABLE `t_syncnone` (
-  `id` int DEFAULT NULL
-) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci /*!80021 ENGINE_ATTRIBUTE='{"sync_mode": "NONE"}' */
+ERROR HY000: ENGINE_ATTRIBUTE 'sync_mode' is no longer a table option; it is database-wide -- set @@tidesdb_unified_memtable_sync_mode
+# Under tidesdb_legacy_compat=warn the same statement is accepted with a
+# warning and the key ignored -- the mode a dump-and-reload upgrade needs.
+SET @@global.tidesdb_legacy_compat = 'warn';
+CREATE TABLE t_syncnone (id INT) ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"sync_mode":"NONE"}';
+Warnings:
+Warning	1210	ENGINE_ATTRIBUTE 'sync_mode' is no longer a table option; it is database-wide -- set @@tidesdb_unified_memtable_sync_mode (ignored: tidesdb_legacy_compat=warn)
 INSERT INTO t_syncnone VALUES (1);
 SELECT * FROM t_syncnone;
 id
 1
 DROP TABLE t_syncnone;
-CREATE TABLE t_syncint (id INT) ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"sync_mode":"INTERVAL","sync_interval_us":500000}';
-SHOW CREATE TABLE t_syncint;
-Table	Create Table
-t_syncint	CREATE TABLE `t_syncint` (
-  `id` int DEFAULT NULL
-) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci /*!80021 ENGINE_ATTRIBUTE='{"sync_mode": "INTERVAL", "sync_interval_us": 500000}' */
-INSERT INTO t_syncint VALUES (1);
-SELECT * FROM t_syncint;
-id
-1
-DROP TABLE t_syncint;
+SET @@global.tidesdb_legacy_compat = 'strict';
 #
 # ============================================
 # TEST 7: CREATE TABLE with isolation level
@@ -177,18 +158,9 @@ DROP TABLE t_ser;
 # TEST 8: CREATE TABLE with B+tree format
 # ============================================
 #
-CREATE TABLE t_btree (id INT, val VARCHAR(50)) ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"use_btree":true}';
-SHOW CREATE TABLE t_btree;
-Table	Create Table
-t_btree	CREATE TABLE `t_btree` (
-  `id` int DEFAULT NULL,
-  `val` varchar(50) DEFAULT NULL
-) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci /*!80021 ENGINE_ATTRIBUTE='{"use_btree": true}' */
-INSERT INTO t_btree VALUES (1, 'btree format');
-SELECT * FROM t_btree;
-id	val
-1	btree format
-DROP TABLE t_btree;
+# use_btree is gone: every key log is a btree in TidesDB 10.
+CREATE TABLE t_btree (id INT) ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"use_btree":true}';
+ERROR HY000: ENGINE_ATTRIBUTE 'use_btree' was removed: a key log is always a btree in TidesDB 10, and that btree is the index
 #
 # ============================================
 # TEST 9: CREATE TABLE with multiple options
@@ -197,13 +169,13 @@ DROP TABLE t_btree;
 CREATE TABLE t_multi (
 id INT,
 val VARCHAR(100)
-) ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"compression":"ZSTD","write_buffer_size":8388608,"bloom_filter":true,"bloom_fpr":50,"block_indexes":true,"sync_mode":"FULL","isolation_level":"REPEATABLE_READ","level_size_ratio":8,"min_levels":3,"skip_list_max_level":16,"skip_list_probability":50}';
+) ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"compression":"ZSTD","bloom_filter":true,"bloom_fpr":50,"isolation_level":"REPEATABLE_READ","level_size_ratio":8,"min_levels":3,"keep_values_inline":true}';
 SHOW CREATE TABLE t_multi;
 Table	Create Table
 t_multi	CREATE TABLE `t_multi` (
   `id` int DEFAULT NULL,
   `val` varchar(100) DEFAULT NULL
-) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci /*!80021 ENGINE_ATTRIBUTE='{"bloom_fpr": 50, "sync_mode": "FULL", "min_levels": 3, "compression": "ZSTD", "bloom_filter": true, "block_indexes": true, "isolation_level": "REPEATABLE_READ", "level_size_ratio": 8, "write_buffer_size": 8388608, "skip_list_max_level": 16, "skip_list_probability": 50}' */
+) ENGINE=TIDESDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci /*!80021 ENGINE_ATTRIBUTE='{"bloom_fpr": 50, "min_levels": 3, "compression": "ZSTD", "bloom_filter": true, "isolation_level": "REPEATABLE_READ", "level_size_ratio": 8, "keep_values_inline": true}' */
 INSERT INTO t_multi VALUES (1, 'multi-option table');
 INSERT INTO t_multi VALUES (2, 'second row');
 SELECT * FROM t_multi;

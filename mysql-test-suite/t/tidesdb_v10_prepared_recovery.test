@@ -1,0 +1,77 @@
+--source suite/tidesdb/include/have_tidesdb.inc
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--source include/not_valgrind.inc
+#
+# Crash recovery for the engine-durable prepare TidesDB 10 made possible.
+#
+# Through TidesDB 9 the prepare hook ran the whole commit, so a crash between
+# prepare and commit left the writes durable in the engine and absent from the
+# binlog, with nothing able to find them again. With a real prepare the batch
+# stays invisible until phase two, and the server decides it after the restart
+# from the binlog it managed to write -- which is the whole point of doing the
+# migration.
+#
+# Two directions, because only testing one proves half the contract:
+#
+#   crash_commit_after_prepare   engines prepared, binlog NOT yet written, so
+#                                recovery must roll the transaction back.
+#   crash_after_flush_binlog     binlog written, engine not yet committed, so
+#                                recovery must commit it.
+#
+# A row that survives the first case, or vanishes in the second, is the engine
+# and the binlog disagreeing about what happened.
+#
+
+CREATE TABLE t_rec (id INT PRIMARY KEY, v VARCHAR(32)) ENGINE=TIDESDB;
+INSERT INTO t_rec VALUES (1, 'committed-before-crash');
+
+--echo #
+--echo # ============================================
+--echo # CASE 1: crash after prepare, before binlog
+--echo #   the transaction is not in the binlog, so it must NOT survive
+--echo # ============================================
+--echo #
+
+SET SESSION DEBUG = '+d,crash_commit_after_prepare';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+
+# An autocommit statement, so the prepare that crashes is unambiguously this
+# transaction's. Inside BEGIN the statement-level prepare reaches the same hook
+# and the server dies on the INSERT instead, which tests nothing about COMMIT.
+--error 0,2013,CR_SERVER_LOST,CR_SERVER_GONE_ERROR
+INSERT INTO t_rec VALUES (2, 'prepared-then-crashed');
+
+--exec echo "restart" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--source include/wait_until_connected_again.inc
+
+--echo # row 1 survives; row 2 must be gone
+SELECT id, v FROM t_rec ORDER BY id;
+
+--echo #
+--echo # ============================================
+--echo # CASE 2: crash after binlog, before engine commit
+--echo #   the transaction IS in the binlog, so it MUST survive
+--echo # ============================================
+--echo #
+
+SET SESSION DEBUG = '+d,crash_after_flush_binlog';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+
+--error 0,2013,CR_SERVER_LOST,CR_SERVER_GONE_ERROR
+INSERT INTO t_rec VALUES (3, 'binlogged-then-crashed');
+
+--exec echo "restart" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--source include/wait_until_connected_again.inc
+
+--echo # rows 1 and 3 present, row 2 still absent
+SELECT id, v FROM t_rec ORDER BY id;
+
+--echo # the table is usable afterwards -- recovery left no transaction pinned
+INSERT INTO t_rec VALUES (4, 'after-recovery');
+UPDATE t_rec SET v = 'updated' WHERE id = 1;
+SELECT id, v FROM t_rec ORDER BY id;
+
+DROP TABLE t_rec;
+--echo #
+--echo # Done.

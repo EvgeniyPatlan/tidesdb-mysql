@@ -16,16 +16,24 @@
 --echo # Relative paths must be rejected.
 --error ER_UNKNOWN_ERROR
 SET GLOBAL tidesdb_backup_dir = 'relative/path';
---error ER_UNKNOWN_ERROR
-SET GLOBAL tidesdb_checkpoint_dir = 'rel/path';
 
 --echo # Absolute paths containing '..' must be rejected.
 --error ER_UNKNOWN_ERROR
 SET GLOBAL tidesdb_backup_dir = '/var/lib/mysql/../etc/sneaky';
 --error ER_UNKNOWN_ERROR
+SET GLOBAL tidesdb_backup_dir = '/var/../etc';
+
+--echo # checkpoint_dir no longer reaches a path at all: TidesDB 10 checkpoints
+--echo # in place, so the variable is refused whatever it is set to. Asserting
+--echo # that directly is the honest test -- feeding it traversal paths would
+--echo # pass on the rejection it now always gives and prove nothing about
+--echo # path validation.
+--error ER_UNKNOWN_ERROR
+SET GLOBAL tidesdb_checkpoint_dir = 'rel/path';
+--error ER_UNKNOWN_ERROR
 SET GLOBAL tidesdb_checkpoint_dir = '/../etc/sneaky';
 --error ER_UNKNOWN_ERROR
-SET GLOBAL tidesdb_backup_dir = '/var/../etc';
+SET GLOBAL tidesdb_checkpoint_dir = '/var/lib/mysql/perfectly-fine';
 
 --echo # Absolute path with a '..' substring inside a legitimate name is fine.
 --echo # (e.g. /var/lib/...backups should not match the '..' boundary rule)

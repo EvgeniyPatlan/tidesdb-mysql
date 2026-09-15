@@ -167,7 +167,7 @@ int fts_load_meta(tidesdb_txn_t *txn, tidesdb_column_family_t *data_cf, uint key
     *total_docs = 0;
     *total_words = 0;
 
-    int rc = tidesdb_txn_get(txn, data_cf, mk, FTS_META_KEY_LEN, &val, &vlen);
+    int rc = tdb_txn_get_r(txn, data_cf, mk, FTS_META_KEY_LEN, &val, &vlen);
     if (rc == TDB_SUCCESS && vlen >= FTS_META_VALUE_LEN)
     {
         *total_docs = sint8korr(val);
@@ -348,13 +348,13 @@ static bool tdb_load_stopwords_from_table_spec_into(const char *table_spec,
     if (tidesdb_txn_begin(tdb_get_engine(), &txn) != TDB_SUCCESS) return false;
 
     tidesdb_iter_t *iter = NULL;
-    if (tidesdb_iter_new(txn, sw_cf, &iter) != TDB_SUCCESS)
+    if (tdb_iter_new_r(txn, sw_cf, &iter) != TDB_SUCCESS)
     {
         tidesdb_txn_free(txn);
         return false;
     }
 
-    tidesdb_iter_seek_to_first(iter);
+    tdb_iter_seek_to_first_r(iter);
     out.clear();
 
     while (tidesdb_iter_valid(iter))
@@ -391,7 +391,7 @@ static bool tdb_load_stopwords_from_table_spec_into(const char *table_spec,
                 }
             }
         }
-        tidesdb_iter_next(iter);
+        tdb_iter_next_r(iter);
     }
 
     tidesdb_iter_free(iter);

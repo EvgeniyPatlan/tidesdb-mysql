@@ -51,15 +51,40 @@ workflow does not touch Docker Hub.
 by Actions; `gh release create` is done by `release-docker.sh` on your machine
 using your existing `gh auth`.
 
-### 3. (Optional) Issue labels
+### 3. (Required) Issue labels
 
-Both workflows reference two labels for triage; create them once under
-**Issues → Labels** if they don't already exist:
+These are not optional, and the failure mode if they are missing is the worst
+kind: the detection workflow does its job and then throws the answer away.
+
+Both issue-opening steps pass `--label upstream-bump --label
+needs-plugin-update` to `gh issue create`. `gh` refuses a label that does not
+exist, and the step runs under `set -euo pipefail`, so the whole job fails
+*after* it has correctly detected and classified the new release. The run shows
+up red, but nothing says "a release was missed" — there is no issue, because
+opening the issue is the step that died.
+
+That is what happened here: every scheduled run from 2026-07-29 onward detected
+upstream correctly and then failed at the last step, so the v9.3.3 → v10.0.1
+gap went unreported for six weeks, and GitHub then disabled the schedule after
+60 days of repository inactivity.
+
+Create them once (both now exist on this repo):
+
+```bash
+gh label create upstream-bump \
+  --description "New upstream TidesDB release available" --color 0075ca
+gh label create needs-plugin-update \
+  --description "Upstream release needs hand-edited plugin changes first" --color d73a4a
+```
 
 - `upstream-bump` — opened by the detection workflow for any new release.
 - `needs-plugin-update` — added when `tidesdb.h` introduces new public enums
   or error codes that need a hand-edited `plugin/ha_tidesdb.cc` update before
   the release workflow can run.
+
+If the schedule has been disabled for inactivity, `gh workflow list --all` shows
+it as `disabled_inactivity`; `gh workflow enable check-upstream-tidesdb.yml`
+turns it back on.
 
 ## How a release happens after setup
 

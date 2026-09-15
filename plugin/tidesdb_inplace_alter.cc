@@ -36,6 +36,7 @@
  */
 
 #include "ha_tidesdb.h"
+#include "storage/tidesdb/tidesdb_owned_buf.h"
 
 #include <mysql/plugin.h>
 
@@ -70,10 +71,24 @@
   COPY        column type changes, PK changes
 */
 enum_alter_inplace_result ha_tidesdb::check_if_supported_inplace_alter(
-    TABLE *altered_table [[maybe_unused]], Alter_inplace_info *ha_alter_info)
+    TABLE *altered_table, Alter_inplace_info *ha_alter_info)
 {
     DBUG_ENTER("ha_tidesdb::check_if_supported_inplace_alter");
     TDB_PERF_SCOPE(check_if_supported_inplace_alter);
+
+    /* An ALTER can introduce a retired ENGINE_ATTRIBUTE key just as a CREATE
+       can, and this path never reaches ha_tidesdb::create -- commit_inplace
+       recomputes the options from altered_table on its own. Validate here so
+       an ALTER cannot quietly set something the engine will not receive.
+
+       Refused before any classification work: whether the statement would
+       have been INSTANT, INPLACE or COPY does not matter if the attribute
+       itself is not acceptable. */
+    if (altered_table && altered_table->s &&
+        !tidesdb_check_legacy_engine_attribute(ha_thd(), altered_table->s->engine_attribute))
+    {
+        DBUG_RETURN(HA_ALTER_ERROR); /* my_error already raised */
+    }
 
     Alter_inplace_info::HA_ALTER_FLAGS flags = ha_alter_info->handler_flags;
 
@@ -202,9 +217,10 @@ bool ha_tidesdb::prepare_inplace_alter_table(
             /* We drop stale CF if it exists from a previous failed ALTER */
             tidesdb_drop_column_family(tdb_get_engine(), idx_cf.c_str());
 
+            /* The per-index USE_BTREE override is gone: in v10 a key log is
+               always a btree and the btree per key log *is* the index, so
+               there is no alternative layout left to select. */
             tidesdb_column_family_config_t idx_cfg = cfg;
-            ha_index_option_struct *iopts = TDB_INDEX_OPTIONS(new_key);
-            if (iopts) idx_cfg.use_btree = iopts->use_btree ? 1 : 0;
 
             int rc = tidesdb_create_column_family(tdb_get_engine(), idx_cf.c_str(), &idx_cfg);
             if (rc != TDB_SUCCESS)
@@ -322,7 +338,7 @@ bool ha_tidesdb::inplace_alter_table(
     }
 
     tidesdb_iter_t *iter = NULL;
-    rc = tidesdb_iter_new(txn, share->cf, &iter);
+    rc = tdb_iter_new_r(txn, share->cf, &iter);
     if (rc != TDB_SUCCESS || !iter)
     {
         tidesdb_txn_free(txn);
@@ -331,7 +347,7 @@ bool ha_tidesdb::inplace_alter_table(
         tmp_restore_column_map(altered_table->read_set, old_map);
         DBUG_RETURN(true);
     }
-    tidesdb_iter_seek_to_first(iter);
+    tdb_iter_seek_to_first_r(iter);
 
     ha_rows rows_processed = 0;
 
@@ -379,21 +395,23 @@ bool ha_tidesdb::inplace_alter_table(
     while (tidesdb_iter_valid(iter))
     {
         uint8_t *key_data = NULL;
+        TdbFreeGuard key_data_guard(&key_data);
         size_t key_size = 0;
         uint8_t *val_data = NULL;
+        TdbFreeGuard val_data_guard(&val_data);
         size_t val_size = 0;
 
         if (tidesdb_iter_key(iter, &key_data, &key_size) != TDB_SUCCESS ||
             tidesdb_iter_value(iter, &val_data, &val_size) != TDB_SUCCESS)
         {
-            tidesdb_iter_next(iter);
+            tdb_iter_next_r(iter);
             continue;
         }
 
         /* We skip non-data keys (meta namespace) */
         if (key_size < KEY_NAMESPACE_LEN || key_data[0] != KEY_NS_DATA)
         {
-            tidesdb_iter_next(iter);
+            tdb_iter_next_r(iter);
             continue;
         }
 
@@ -582,7 +600,7 @@ bool ha_tidesdb::inplace_alter_table(
                 }
             }
             iter = NULL;
-            rc = tidesdb_iter_new(txn, share->cf, &iter);
+            rc = tdb_iter_new_r(txn, share->cf, &iter);
             if (rc != TDB_SUCCESS || !iter)
             {
                 tidesdb_txn_free(txn);
@@ -592,17 +610,17 @@ bool ha_tidesdb::inplace_alter_table(
                 DBUG_RETURN(true);
             }
             /* We seek directly to the last processed key and advance past it */
-            int src = tidesdb_iter_seek(iter, last_data_key, last_data_key_len);
+            int src = tdb_iter_seek_r(iter, last_data_key, last_data_key_len);
             if (src != TDB_SUCCESS)
             {
                 sql_print_warning("[TIDESDB] inplace ADD INDEX: iter_seek failed rc=%d", src);
                 break; /* end scan gracefully */
             }
-            if (tidesdb_iter_valid(iter)) tidesdb_iter_next(iter);
+            if (tidesdb_iter_valid(iter)) tdb_iter_next_r(iter);
             continue; /* Don't call iter_next again */
         }
 
-        tidesdb_iter_next(iter);
+        tdb_iter_next_r(iter);
     }
 
     tidesdb_iter_free(iter);
@@ -803,7 +821,7 @@ bool ha_tidesdb::commit_inplace_alter_table(
         /* Main data CF */
         if (share->cf)
         {
-            int rc = tidesdb_cf_update_runtime_config(share->cf, &cfg, 1);
+            int rc = tidesdb_cf_update_runtime_config(tdb_get_engine(), share->cf, &cfg, 1);
             if (rc != TDB_SUCCESS)
                 sql_print_information(
                     "[TIDESDB] ALTER: failed to update runtime config for "
@@ -816,14 +834,11 @@ bool ha_tidesdb::commit_inplace_alter_table(
         {
             if (share->idx_cfs[i])
             {
+                /* No per-index USE_BTREE override in v10 -- see above. */
                 tidesdb_column_family_config_t idx_cfg = cfg;
-                if (i < altered_table->s->keys && TDB_INDEX_OPTIONS(&altered_table->key_info[i]))
-                {
-                    ha_index_option_struct *iopts = TDB_INDEX_OPTIONS(&altered_table->key_info[i]);
-                    idx_cfg.use_btree = iopts->use_btree ? 1 : 0;
-                }
 
-                int rc = tidesdb_cf_update_runtime_config(share->idx_cfs[i], &idx_cfg, 1);
+                int rc = tidesdb_cf_update_runtime_config(tdb_get_engine(), share->idx_cfs[i],
+                                                          &idx_cfg, 1);
                 if (rc != TDB_SUCCESS)
                     sql_print_information(
                         "[TIDESDB] ALTER: failed to update runtime config for "

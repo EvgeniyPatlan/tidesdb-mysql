@@ -7,7 +7,9 @@
 --echo # TEST 1: Status variables exist
 --echo #
 
-# All 19 variables should be present
+# TEST 3 below pins the exact name list; this only catches the whole set
+# going missing, which is what a handlerton that failed to register its
+# status array looks like.
 SELECT COUNT(*) >= 19 AS has_all_vars FROM performance_schema.global_status
 WHERE VARIABLE_NAME LIKE 'TIDESDB%';
 
@@ -24,17 +26,18 @@ SELECT * FROM t_stat ORDER BY id;
 SHOW ENGINE TIDESDB STATUS;
 --enable_result_log
 
-# Column families should be > 0
-SELECT VARIABLE_VALUE > 0 AS cf_positive FROM performance_schema.global_status
-WHERE VARIABLE_NAME = 'TIDESDB_COLUMN_FAMILIES';
-
-# Memory limit should be > 0
-SELECT VARIABLE_VALUE > 0 AS mem_positive FROM performance_schema.global_status
-WHERE VARIABLE_NAME = 'TIDESDB_MEMORY_LIMIT';
-
-# Cache partitions should be > 0
-SELECT VARIABLE_VALUE > 0 AS parts_positive FROM performance_schema.global_status
-WHERE VARIABLE_NAME = 'TIDESDB_CACHE_PARTITIONS';
+# One row, one column per variable, via scalar subqueries. A plain
+# WHERE VARIABLE_NAME = ... returns *no rows* for a variable the engine
+# stopped publishing, and a recorded empty result asserts nothing -- which
+# is how TIDESDB_MEMORY_LIMIT went on "passing" here after TidesDB 10
+# removed it. A missing variable now shows as NULL and fails the compare.
+SELECT
+  (SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status
+     WHERE VARIABLE_NAME = 'TIDESDB_COLUMN_FAMILIES')  AS cf_positive,
+  (SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status
+     WHERE VARIABLE_NAME = 'TIDESDB_CACHE_PARTITIONS') AS parts_positive,
+  (SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status
+     WHERE VARIABLE_NAME = 'TIDESDB_VERSION_HEX')      AS version_positive;
 
 --echo #
 --echo # TEST 3: All variable names are correct

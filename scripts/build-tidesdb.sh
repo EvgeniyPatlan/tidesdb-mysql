@@ -9,13 +9,18 @@
 set -euo pipefail
 
 REPO=${REPO:-/work}
-SRC="$REPO/vendor/tidesdb"
+# Source tree and install prefix are overridable so a second engine version can
+# be built alongside the pinned one. Defaults are the pinned engine, so every
+# existing invocation behaves exactly as before.
+SRC=${TIDESDB_SRC_DIR:-$REPO/vendor/tidesdb}
 BUILD="$SRC/build-static"
-PREFIX="$REPO/vendor/tidesdb-prefix"
+PREFIX=${TIDESDB_PREFIX_DIR:-$REPO/vendor/tidesdb-prefix}
 
 [ -d "$SRC" ] || { echo "ERROR: $SRC not found"; exit 1; }
 
 echo "[build-tidesdb] configuring (static, PIC, no tests, system allocator)"
+echo "[build-tidesdb]   src=$SRC"
+echo "[build-tidesdb]   prefix=$PREFIX"
 cmake -S "$SRC" -B "$BUILD" \
       -DBUILD_SHARED_LIBS=OFF \
       -DTIDESDB_BUILD_TESTS=OFF \

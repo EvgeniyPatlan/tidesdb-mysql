@@ -15,7 +15,7 @@ SELECT id, v FROM t_lz4;
 
 -- ZSTD compression with custom write buffer
 CREATE TABLE t_zstd (id INT PRIMARY KEY, v VARCHAR(64))
-    ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"compression":"ZSTD","write_buffer_size":67108864}';
+    ENGINE=TIDESDB ENGINE_ATTRIBUTE='{"compression":"ZSTD","bloom_fpr":50}';
 INSERT INTO t_zstd VALUES (1, 'zstd'), (2, 'zstd2');
 SELECT id, v FROM t_zstd ORDER BY id;
 

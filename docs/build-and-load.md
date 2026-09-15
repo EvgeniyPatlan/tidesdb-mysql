@@ -118,16 +118,44 @@ docker stop tidesdb-mysqld && docker rm tidesdb-mysqld
 
 ## Inner dev loop (after the first full build)
 
+Edit under `plugin/`, never under `vendor/`. The build compiles a **copy**:
+`setup-workspace.sh` installs `plugin/` into
+`vendor/mysql-server/storage/tidesdb/` and `mysql-test-suite/` into
+`vendor/mysql-server/mysql-test/suite/tidesdb/`. Editing the copy directly is
+the classic way to lose an afternoon — the next `setup-workspace.sh` run
+overwrites it without a word.
+
 ```bash
-# Edit storage/tidesdb/ha_tidesdb.cc on host
-vim mysql-server/storage/tidesdb/ha_tidesdb.cc
+# 1. Edit the source of truth
+vim plugin/ha_tidesdb.cc
 
-# Rebuild only the plugin (~30s typical)
-docker run --rm -v /home/corvin/TIDES:/work tides-builder \
-    bash -c 'cmake --build /work/mysql-server/build --target tidesdb -j$(nproc)'
+# 2. Sync it into the MySQL tree (also re-applies the engine patches)
+./scripts/setup-workspace.sh
 
-# Restart mysqld + reload plugin (or just UNINSTALL/INSTALL if mysqld is still running)
+# 3. Rebuild only the plugin (~30s typical)
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/work tides-builder \
+    bash -lc 'cd /work/vendor/mysql-server/build && \
+              TIDESDB_ROOT=/work/vendor/tidesdb-prefix-v10 \
+              cmake --build . --target tidesdb -j$(nproc)'
+
+# 4. Run the suite
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/work tides-builder \
+    bash -lc 'cd /work/vendor/mysql-server/build/mysql-test && \
+              ./mtr --suite=tidesdb --force --retry=0'
 ```
+
+The same copy direction applies to recorded results. `--record` writes into
+`vendor/`, so copy the `.result` files **back** to `mysql-test-suite/r/` before
+the next `setup-workspace.sh`, or they are overwritten by the older versions.
+
+Two build settings that do not re-resolve on their own:
+
+- `TIDESDB_LIB` / `TIDESDB_INCLUDE_DIR` are cached and will not pick up a new
+  `TIDESDB_ROOT`. Pass `cmake -U TIDESDB_LIB -U TIDESDB_INCLUDE_DIR .` when
+  switching engine versions, or the build silently links the old one.
+- `-DTIDESDB_PERF=1` turns on the perf instrumentation and unlocks four MTR
+  tests and seven unit tests that otherwise skip. Set it explicitly back to
+  `0` when you are done.
 
 ## Troubleshooting
 

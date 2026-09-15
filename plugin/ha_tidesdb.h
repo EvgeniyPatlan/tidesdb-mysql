@@ -39,6 +39,8 @@ extern "C"
 #include <tidesdb/db.h>
 }
 
+#include "storage/tidesdb/tidesdb_retry.h" /* tdb_*_r read wrappers */
+
 /* Per-table / per-index / per-field engine options. Definitions live
    here (promoted from ha_tidesdb.cc in the A-7 pass) so the inplace-
    alter TU can construct ha_table_option_struct and dereference
@@ -46,36 +48,35 @@ extern "C"
    TidesDB_share::cached_opts. */
 struct ha_table_option_struct
 {
-    ulonglong write_buffer_size;
-    ulonglong min_disk_space;
-    ulonglong klog_value_threshold;
-    ulonglong sync_interval_us;
-    ulonglong index_sample_ratio;
-    ulonglong block_index_prefix_len;
+    /* Per-column-family in TidesDB 10. */
     ulonglong level_size_ratio;
     ulonglong min_levels;
     ulonglong dividing_level_offset;
-    ulonglong skip_list_max_level;
-    ulonglong skip_list_probability; /* percentage      -- 25 = 0.25 */
     ulonglong bloom_fpr;             /* parts per 10000 -- 100 = 1% */
     ulonglong l1_file_count_trigger;
-    ulonglong l0_queue_stall_threshold;
-    uint compression;
-    uint sync_mode;
     uint isolation_level;
     bool bloom_filter;
-    bool block_indexes;
-    bool use_btree;
-    bool object_lazy_compaction;     /* double L1 file count trigger in object store mode */
-    bool object_prefetch_compaction; /* prefetch input SSTables before compaction merge */
-    ulonglong ttl;                   /* default TTL in seconds (0 = no expiration) */
-    bool encrypted;                  /* ENCRYPTED=YES enables data-at-rest encryption */
-    ulonglong encryption_key_id;     /* ENCRYPTION_KEY_ID (default 1) */
     /* Tombstone-density compaction trigger. Stored as parts-per-10000
        (e.g. 5000 = 0.50 ratio) so the option list can use integer
        storage; converted to a double at build_cf_config time. */
     ulonglong tombstone_density_trigger;
     ulonglong tombstone_density_min_entries;
+
+    /* Compression selects the column family's encoding pipeline; the
+       compression enumerators are the pipeline's ids. */
+    uint compression;
+
+    /* Opt the family out of database-wide value separation entirely.
+       Replaces the per-table klog_value_threshold, which became the
+       database-level tidesdb_value_separation_threshold -- a family now
+       either follows that threshold or keeps every value inline. */
+    bool keep_values_inline;
+
+    /* Handled by the plugin, not the engine, and so unaffected by the
+       engine's own option churn. */
+    ulonglong ttl;                   /* default TTL in seconds (0 = no expiration) */
+    bool encrypted;                  /* ENCRYPTED=YES enables data-at-rest encryption */
+    ulonglong encryption_key_id;     /* ENCRYPTION_KEY_ID (default 1) */
 };
 
 struct ha_field_option_struct
@@ -557,11 +558,6 @@ struct tidesdb_trx_t
     bool stmt_savepoint_active; /* true while a "stmt" savepoint exists */
     bool stmt_was_dirty;        /* true if current stmt had writes */
     bool needs_reset;           /* true after commit/rollback; cleared after txn_reset */
-    bool commit_done;           /* true after prepare did the actual TidesDB commit;
-                                   commit hook then becomes a no-op. Lets us surface
-                                   conflict via HA_ERR_LOCK_DEADLOCK from prepare,
-                                   avoiding the binlog.cc:7756 Debug assertion that
-                                   fires when commit returns non-zero. */
     tidesdb_isolation_level_t isolation_level; /* from first table opened */
     uint64_t txn_generation; /* monotonic counter; incremented each time a new txn is created */
 
@@ -827,9 +823,10 @@ class ha_tidesdb : public handler
     /* Fetch a row by its PK bytes into buf; sets current_pk + last_row */
     int fetch_row_by_pk(tidesdb_txn_t *txn, const uchar *pk, uint pk_len, uchar *buf);
 
-    /* Compute the absolute TTL timestamp for a row being written.
+    /* Compute how long a row being written should live, in seconds.
        Reads per-row TTL_COL value if present, else uses table default.
-       Returns -1 (no expiration) or a future Unix timestamp. */
+       Returns TIDESDB_TTL_NONE (no expiration) or a positive second count --
+       a lifetime, which is what TidesDB 10 takes, not a deadline. */
     time_t compute_row_ttl(const uchar *buf);
 
     /* Read current iterator entry (data-CF), decode row into buf.
@@ -1106,6 +1103,13 @@ class ha_tidesdb : public handler
                                     dd::Table *new_table_def) override;
     bool check_if_incompatible_data(HA_CREATE_INFO *create_info, uint table_changes) override;
 };
+
+/* Reject an ENGINE_ATTRIBUTE carrying a key the bundled engine version has
+   retired (tidesdb_legacy_options.h). Returns false only when the statement
+   should be refused, having already raised the error. Module-scope because
+   both DDL entry points need it: ha_tidesdb::create and the inplace-ALTER
+   check, which never reaches create(). */
+bool tidesdb_check_legacy_engine_attribute(THD *thd, LEX_CSTRING attr);
 
 /* Log sanitizer (MF-6). Replaces every control byte (< 0x20 or 0x7f)
    in `in` with '?', writes a NUL-terminated copy into `out` (up to

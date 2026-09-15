@@ -19,6 +19,8 @@
 */
 
 #include "tidesdb_atomic_ddl.h"
+#include "storage/tidesdb/tidesdb_owned_buf.h"
+#include "tidesdb_retry.h"  /* tdb_*_r read wrappers */
 
 #include <atomic>
 #include <cstdint>
@@ -132,8 +134,11 @@ bool SdiStore::init() {
     /* Fixed-size char[TDB_MAX_CF_NAME_LEN] -- copy with a guaranteed NUL. */
     strncpy(cfg.name, kSdiCfName, sizeof(cfg.name) - 1);
     cfg.name[sizeof(cfg.name) - 1] = '\0';
-    cfg.write_buffer_size = 16 * 1024 * 1024; /* 16 MiB; metadata CF is small */
-    cfg.compression_algorithm = TDB_COMPRESS_LZ4;
+    /* The write buffer is database-wide in v10, so a metadata family can no
+       longer ask for a smaller one of its own; it shares the server's.
+       Compression is an encoding pipeline, and LZ4's enumerator is its id. */
+    cfg.encoding_pipeline[0] = (uint8_t)TDB_COMPRESS_LZ4;
+    cfg.encoding_count = 1;
 
     int rc = tidesdb_create_column_family(engine_, cfg.name, &cfg);
     if (rc != TDB_SUCCESS && rc != TDB_ERR_EXISTS) {
@@ -210,7 +215,7 @@ bool SdiStore::get(const sdi_key_t &k, void *out, uint64_t *len) {
     }
     uint8_t *val = nullptr;
     size_t val_len = 0;
-    rc = tidesdb_txn_get(txn, cf_, reinterpret_cast<const uint8_t *>(key.data()), key.size(), &val,
+    rc = tdb_txn_get_r(txn, cf_, reinterpret_cast<const uint8_t *>(key.data()), key.size(), &val,
                          &val_len);
     /* Reads do not need to be committed; rollback discards txn state cheaply. */
     tidesdb_txn_rollback(txn);
@@ -295,16 +300,17 @@ bool SdiStore::list_keys(sdi_vector_t &out) {
         return false;
     }
     tidesdb_iter_t *it = nullptr;
-    rc = tidesdb_iter_new(txn, cf_, &it);
+    rc = tdb_iter_new_r(txn, cf_, &it);
     if (rc != TDB_SUCCESS || !it) {
         sql_print_error("[TIDESDB] SdiStore::list_keys: iter_new rc=%d", rc);
         tidesdb_txn_rollback(txn);
         tidesdb_txn_free(txn);
         return false;
     }
-    tidesdb_iter_seek_to_first(it);
+    tdb_iter_seek_to_first_r(it);
     while (tidesdb_iter_valid(it)) {
         uint8_t *k = nullptr;
+        TdbFreeGuard k_guard(&k);
         size_t klen = 0;
         if (tidesdb_iter_key(it, &k, &klen) != TDB_SUCCESS || !k) break;
         if (klen == kSdiPackedKeyLen) {
@@ -319,7 +325,7 @@ bool SdiStore::list_keys(sdi_vector_t &out) {
         }
         /* Skip rows whose key isn't our fixed-length format. Defensive: should
            never happen unless something else wrote into this CF. */
-        tidesdb_iter_next(it);
+        tdb_iter_next_r(it);
     }
     tidesdb_iter_free(it);
     tidesdb_txn_rollback(txn);
@@ -370,8 +376,12 @@ DdSyncReconciler::DdSyncReconciler(tidesdb_t *engine, dd::cache::Dictionary_clie
       reconciler is best-effort -- partial enumeration is better than
       aborting startup.
 
-  Memory ownership: tidesdb_list_column_families allocates an array of
-  char* via malloc(); we free both the strings and the outer array
+  Memory ownership: tidesdb_list_column_families hands back "a newly
+  allocated array of newly allocated names; the caller frees each name and
+  then the array itself with tidesdb_free". Not libc free() -- the engine can
+  be built against jemalloc / mimalloc / tcmalloc, and freeing its memory with
+  the wrong allocator corrupts the heap. We free both the strings and the
+  outer array
   before returning.
 */
 ReconcileDelta DdSyncReconciler::compute_delta() {
@@ -444,10 +454,10 @@ ReconcileDelta DdSyncReconciler::compute_delta() {
             for (int i = 0; i < count; i++) {
                 if (names[i]) {
                     actual.insert(names[i]);
-                    free(names[i]);
+                    tidesdb_free(names[i]);
                 }
             }
-            free(names);
+            tidesdb_free(names);
         }
     }
 

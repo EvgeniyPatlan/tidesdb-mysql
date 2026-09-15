@@ -60,6 +60,35 @@ INSERT INTO tdb_fast_t VALUES (1,'a'), (2,'b');
 FLUSH TABLES tdb_fast_t;
 SELECT id, v FROM tdb_fast_t ORDER BY id;
 
+--echo #
+--echo # fast_mode governs DDL atomicity, not DML durability
+--echo #
+# HTON_SUPPORTS_ATOMIC_DDL is what fast_mode drops, and that flag decides
+# whether the engine joins the server's *DDL* transaction. The per-transaction
+# prepare hook is driven by the binlog and the participating engines, so it
+# still runs -- which since TidesDB 10 means a durable engine prepare, and a
+# transaction that survives a crash between prepare and commit.
+#
+# Worth asserting rather than assuming: the sysvar's own description used to
+# say fast_mode "drops the 2PC commit path", which would mean turning it on
+# quietly gave up crash recovery for DML. It does not, and Handler_prepare
+# counts the hook calls that prove it.
+--let $prep_before = `SELECT VARIABLE_VALUE FROM performance_schema.session_status WHERE VARIABLE_NAME = 'Handler_prepare'`
+
+CREATE TABLE tdb_fast_2pc (id INT PRIMARY KEY) ENGINE=TIDESDB;
+BEGIN;
+INSERT INTO tdb_fast_2pc VALUES (1);
+COMMIT;
+
+--let $prep_after = `SELECT VARIABLE_VALUE FROM performance_schema.session_status WHERE VARIABLE_NAME = 'Handler_prepare'`
+if ($prep_after <= $prep_before)
+{
+  --echo # Handler_prepare did not advance: $prep_before -> $prep_after
+  --die fast_mode suppressed the engine prepare; DML would not be crash-recoverable
+}
+--echo # Handler_prepare advanced: the engine still prepares under fast_mode
+DROP TABLE tdb_fast_2pc;
+
 DROP TABLE tdb_fast_t;
 
 --source suite/tidesdb/include/cleanup_tidesdb.inc

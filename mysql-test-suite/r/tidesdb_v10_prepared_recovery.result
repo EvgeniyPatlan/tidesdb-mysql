@@ -1,0 +1,38 @@
+CREATE TABLE t_rec (id INT PRIMARY KEY, v VARCHAR(32)) ENGINE=TIDESDB;
+INSERT INTO t_rec VALUES (1, 'committed-before-crash');
+#
+# ============================================
+# CASE 1: crash after prepare, before binlog
+#   the transaction is not in the binlog, so it must NOT survive
+# ============================================
+#
+SET SESSION DEBUG = '+d,crash_commit_after_prepare';
+INSERT INTO t_rec VALUES (2, 'prepared-then-crashed');
+# row 1 survives; row 2 must be gone
+SELECT id, v FROM t_rec ORDER BY id;
+id	v
+1	committed-before-crash
+#
+# ============================================
+# CASE 2: crash after binlog, before engine commit
+#   the transaction IS in the binlog, so it MUST survive
+# ============================================
+#
+SET SESSION DEBUG = '+d,crash_after_flush_binlog';
+INSERT INTO t_rec VALUES (3, 'binlogged-then-crashed');
+# rows 1 and 3 present, row 2 still absent
+SELECT id, v FROM t_rec ORDER BY id;
+id	v
+1	committed-before-crash
+3	binlogged-then-crashed
+# the table is usable afterwards -- recovery left no transaction pinned
+INSERT INTO t_rec VALUES (4, 'after-recovery');
+UPDATE t_rec SET v = 'updated' WHERE id = 1;
+SELECT id, v FROM t_rec ORDER BY id;
+id	v
+1	updated
+3	binlogged-then-crashed
+4	after-recovery
+DROP TABLE t_rec;
+#
+# Done.
