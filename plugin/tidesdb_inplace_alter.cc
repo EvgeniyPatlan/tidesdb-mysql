@@ -70,10 +70,24 @@
   COPY        column type changes, PK changes
 */
 enum_alter_inplace_result ha_tidesdb::check_if_supported_inplace_alter(
-    TABLE *altered_table [[maybe_unused]], Alter_inplace_info *ha_alter_info)
+    TABLE *altered_table, Alter_inplace_info *ha_alter_info)
 {
     DBUG_ENTER("ha_tidesdb::check_if_supported_inplace_alter");
     TDB_PERF_SCOPE(check_if_supported_inplace_alter);
+
+    /* An ALTER can introduce a retired ENGINE_ATTRIBUTE key just as a CREATE
+       can, and this path never reaches ha_tidesdb::create -- commit_inplace
+       recomputes the options from altered_table on its own. Validate here so
+       an ALTER cannot quietly set something the engine will not receive.
+
+       Refused before any classification work: whether the statement would
+       have been INSTANT, INPLACE or COPY does not matter if the attribute
+       itself is not acceptable. */
+    if (altered_table && altered_table->s &&
+        !tidesdb_check_legacy_engine_attribute(ha_thd(), altered_table->s->engine_attribute))
+    {
+        DBUG_RETURN(HA_ALTER_ERROR); /* my_error already raised */
+    }
 
     Alter_inplace_info::HA_ALTER_FLAGS flags = ha_alter_info->handler_flags;
 

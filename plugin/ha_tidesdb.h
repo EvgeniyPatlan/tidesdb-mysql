@@ -1108,6 +1108,13 @@ class ha_tidesdb : public handler
     bool check_if_incompatible_data(HA_CREATE_INFO *create_info, uint table_changes) override;
 };
 
+/* Reject an ENGINE_ATTRIBUTE carrying a key the bundled engine version has
+   retired (tidesdb_legacy_options.h). Returns false only when the statement
+   should be refused, having already raised the error. Module-scope because
+   both DDL entry points need it: ha_tidesdb::create and the inplace-ALTER
+   check, which never reaches create(). */
+bool tidesdb_check_legacy_engine_attribute(THD *thd, LEX_CSTRING attr);
+
 /* Log sanitizer (MF-6). Replaces every control byte (< 0x20 or 0x7f)
    in `in` with '?', writes a NUL-terminated copy into `out` (up to
    out_size - 1 chars). Used wherever a SYSTEM_VARIABLES_ADMIN-

@@ -65,6 +65,41 @@ struct TdbLegacyOption
   actually retires something.
 */
 inline constexpr TdbLegacyOption tdb_legacy_options[] = {
+    /* Settings that survive as server-level variables. Only a variable that
+       actually exists is named here -- an error pointing at something the
+       server does not have is worse than one that does not point anywhere. */
+    {"write_buffer_size", TdbLegacyDisposition::Relocated,
+     "tidesdb_unified_memtable_write_buffer_size", nullptr},
+    {"sync_mode", TdbLegacyDisposition::Relocated,
+     "tidesdb_unified_memtable_sync_mode", nullptr},
+    {"sync_interval_us", TdbLegacyDisposition::Relocated,
+     "tidesdb_unified_memtable_sync_interval", nullptr},
+
+    /* Settings whose behaviour no longer exists to be selected. */
+    {"use_btree", TdbLegacyDisposition::Removed, nullptr,
+     "a key log is always a btree in TidesDB 10, and that btree is the index"},
+    {"block_indexes", TdbLegacyDisposition::Removed, nullptr,
+     "block-format key logs are gone; the btree per key log is the index"},
+    {"block_index_prefix_len", TdbLegacyDisposition::Removed, nullptr,
+     "block indexes no longer exist, so there is no prefix to size"},
+    {"index_sample_ratio", TdbLegacyDisposition::Removed, nullptr,
+     "block indexes no longer exist, so there is nothing to sample"},
+    {"min_disk_space", TdbLegacyDisposition::Removed, nullptr,
+     "the engine no longer reserves a per-family disk floor"},
+    {"klog_value_threshold", TdbLegacyDisposition::Removed, nullptr,
+     "value separation is database-wide now; a family either follows that "
+     "threshold or sets keep_values_inline to keep every value whole"},
+    {"skip_list_max_level", TdbLegacyDisposition::Removed, nullptr,
+     "the memtable is database-wide, so its skip list is not per-family"},
+    {"skip_list_probability", TdbLegacyDisposition::Removed, nullptr,
+     "the memtable is database-wide, so its skip list is not per-family"},
+    {"l0_queue_stall_threshold", TdbLegacyDisposition::Removed, nullptr,
+     "L0 admission is governed database-wide, not per family"},
+    {"object_lazy_compaction", TdbLegacyDisposition::Removed, nullptr,
+     "object-store mode was removed from the engine in TidesDB 10"},
+    {"object_prefetch_compaction", TdbLegacyDisposition::Removed, nullptr,
+     "object-store mode was removed from the engine in TidesDB 10"},
+
     {nullptr, TdbLegacyDisposition::Removed, nullptr, nullptr},
 };
 

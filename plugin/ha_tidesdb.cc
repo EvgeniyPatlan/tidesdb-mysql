@@ -1556,7 +1556,7 @@ static constexpr size_t TIDESDB_ENGINE_ATTRIBUTE_MAX_LEN = 65536;
    hard failure on the open path makes an existing table unopenable, and
    therefore undroppable, so the operator cannot even clear it. Reject where
    the DDL is written; warn where stored state is replayed. */
-static bool tidesdb_check_legacy_engine_attribute(THD *thd, LEX_CSTRING attr)
+bool tidesdb_check_legacy_engine_attribute(THD *thd, LEX_CSTRING attr)
 {
     if (tdb_legacy_options_empty()) return true; /* nothing retired yet */
     if (!attr.str || attr.length == 0) return true;
