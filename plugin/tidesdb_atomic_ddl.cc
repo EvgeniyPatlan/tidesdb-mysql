@@ -376,8 +376,12 @@ DdSyncReconciler::DdSyncReconciler(tidesdb_t *engine, dd::cache::Dictionary_clie
       reconciler is best-effort -- partial enumeration is better than
       aborting startup.
 
-  Memory ownership: tidesdb_list_column_families allocates an array of
-  char* via malloc(); we free both the strings and the outer array
+  Memory ownership: tidesdb_list_column_families hands back "a newly
+  allocated array of newly allocated names; the caller frees each name and
+  then the array itself with tidesdb_free". Not libc free() -- the engine can
+  be built against jemalloc / mimalloc / tcmalloc, and freeing its memory with
+  the wrong allocator corrupts the heap. We free both the strings and the
+  outer array
   before returning.
 */
 ReconcileDelta DdSyncReconciler::compute_delta() {
@@ -450,10 +454,10 @@ ReconcileDelta DdSyncReconciler::compute_delta() {
             for (int i = 0; i < count; i++) {
                 if (names[i]) {
                     actual.insert(names[i]);
-                    free(names[i]);
+                    tidesdb_free(names[i]);
                 }
             }
-            free(names);
+            tidesdb_free(names);
         }
     }
 

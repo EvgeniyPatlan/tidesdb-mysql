@@ -7564,36 +7564,37 @@ int ha_tidesdb::maybe_bulk_commit(tidesdb_trx_t *trx)
        loader reports success (observed as an empty table after a "FINISHED
        SUCCESS" HammerDB bulk build under concurrent load).
 
-       tidesdb_txn_commit() returns the transient/conflict error *before*
-       marking the txn aborted or consuming a commit sequence, so the txn
-       stays intact and re-calling it is safe. Retry the transient resource
-       cases (memory-limit / lock / write-write conflict) with a short
-       exponential backoff -- backpressure clears once flush/compaction
-       frees memory -- then fail loud so the SQL layer rolls the statement
-       back instead of corrupting the table. */
-    int crc = TDB_SUCCESS;
-    for (int attempt = 0; attempt < 4; attempt++)
-    {
-        crc = tidesdb_txn_commit(trx->txn);
-        if (crc == TDB_SUCCESS) break;
+       This used to retry the transient cases -- memory limit, lock, conflict
+       -- on the strength of TidesDB 9's behaviour, where a commit returned
+       the error before marking the transaction aborted, so the batch was
+       still there and re-calling commit was a real second chance.
 
-        const bool transient = (crc == TDB_ERR_CONFLICT || crc == TDB_ERR_LOCKED ||
-                                crc == TDB_ERR_MEMORY_LIMIT || crc == TDB_ERR_TXN_EXPIRED ||
-                                crc == TDB_ERR_TXN_ABORTED);
-        if (!transient || attempt == 3)
-        {
-            sql_print_warning(
-                "[TIDESDB] bulk mid-commit failed rc=%d after %d attempt(s); "
-                "rolling back statement to avoid silent data loss",
-                crc, attempt + 1);
-            /* Do NOT reset/discard -- leave the txn for the SQL layer's
-               rollback. Returning the mapped error makes the caller abort
-               the statement (a loud, correct failure). */
-            return tdb_rc_to_ha(crc, "bulk mid-commit");
-        }
-        /* 200us, 1ms, 5ms */
-        static constexpr int backoff_us[3] = {200, 1000, 5000};
-        std::this_thread::sleep_for(std::chrono::microseconds(backoff_us[attempt]));
+       TidesDB 10 aborts first. Every failure path past the write phase sets
+       TDB_TXN_ABORTED and leaves the live-transaction registry ("already
+       aborted and left the registry", txn_commit.c), and the entry check
+       refuses a transaction that is not active. So the batch is gone before
+       the error reaches us and a second call cannot commit it -- it returns
+       TDB_ERR_INVALID_ARGS for a finished transaction, which is not in the
+       transient set, so the retry loop reported *that* instead of the real
+       cause. A conflict under concurrent bulk load came back as "invalid
+       arguments", and the loader had no idea what had happened to it.
+
+       So: no retry, and report what actually failed. Retrying a commit is
+       the SQL layer's job now, by re-running the statement -- the batch it
+       would need is no longer ours to resend. */
+    const int crc = tidesdb_txn_commit(trx->txn);
+    if (crc != TDB_SUCCESS)
+    {
+        sql_print_warning(
+            "[TIDESDB] bulk mid-commit failed rc=%d; the engine has already "
+            "aborted this transaction, so the statement is rolled back rather "
+            "than retried",
+            crc);
+        /* Do NOT reset/discard -- leave the txn for the SQL layer's
+           rollback, which sees it aborted and treats it as already resolved.
+           Returning the mapped error makes the caller abort the statement (a
+           loud, correct failure). */
+        return tdb_rc_to_ha(crc, "bulk mid-commit");
     }
 
     int rrc = tidesdb_txn_reset(trx->txn, TDB_ISOLATION_READ_COMMITTED);
@@ -9543,9 +9544,9 @@ int ha_tidesdb::rename_table(const char *from, const char *to,
                         sql_print_error("[TIDESDB] Failed to rename idx CF '%s' -> '%s' (err=%d)",
                                         cf_str.c_str(), new_idx.c_str(), rc);
                 }
-                free(names[i]);
+                tidesdb_free(names[i]);
             }
-            free(names);
+            tidesdb_free(names);
         }
     }
 
@@ -9605,9 +9606,9 @@ static int tidesdb_drop_table_impl(const char *path)
                 if (!names[i]) continue;
                 if (strncmp(names[i], prefix.c_str(), prefix.size()) == 0)
                     idx_cf_names.push_back(names[i]);
-                free(names[i]);
+                tidesdb_free(names[i]);
             }
-            free(names);
+            tidesdb_free(names);
         }
     }
 
@@ -9693,9 +9694,9 @@ static void tidesdb_hton_drop_database(handlerton *, char *path)
                 if (!names[i]) continue;
                 if (strncmp(names[i], prefix.c_str(), prefix.size()) == 0)
                     to_drop.emplace_back(names[i]);
-                free(names[i]);
+                tidesdb_free(names[i]);
             }
-            free(names);
+            tidesdb_free(names);
         }
     }
 
@@ -9923,8 +9924,8 @@ static void tidesdb_refresh_status_vars()
                 }
             }
         }
-        for (int i = 0; i < cf_count; i++) free(cf_names[i]);
-        free(cf_names);
+        for (int i = 0; i < cf_count; i++) tidesdb_free(cf_names[i]);
+        tidesdb_free(cf_names);
 
         srv_stat_total_tombstones = (long long)total_tomb;
         srv_stat_tombstone_ratio = total_keys > 0 ? (double)total_tomb / (double)total_keys : 0.0;
