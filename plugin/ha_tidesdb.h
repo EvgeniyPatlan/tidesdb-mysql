@@ -828,9 +828,10 @@ class ha_tidesdb : public handler
     /* Fetch a row by its PK bytes into buf; sets current_pk + last_row */
     int fetch_row_by_pk(tidesdb_txn_t *txn, const uchar *pk, uint pk_len, uchar *buf);
 
-    /* Compute the absolute TTL timestamp for a row being written.
+    /* Compute how long a row being written should live, in seconds.
        Reads per-row TTL_COL value if present, else uses table default.
-       Returns -1 (no expiration) or a future Unix timestamp. */
+       Returns TIDESDB_TTL_NONE (no expiration) or a positive second count --
+       a lifetime, which is what TidesDB 10 takes, not a deadline. */
     time_t compute_row_ttl(const uchar *buf);
 
     /* Read current iterator entry (data-CF), decode row into buf.
