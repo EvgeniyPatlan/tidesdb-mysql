@@ -135,10 +135,33 @@ caught it immediately.
   that takes a conflict mid-commit cannot be replayed: `mysqlslap
   --concurrency`, a parallel `mysqldump` restore, a TPC-C loader, any `LOAD
   DATA` fan-out.
-- **Mitigation:** load with a single connection -- verified, a 10-warehouse
-  TPC-C schema build completes with one loader where four hang -- and use a
-  client that retries on `ER_LOCK_DEADLOCK` (1213) / error 1180. The data is
-  never wrong: the transaction aborts cleanly and nothing partial is kept.
+**Mitigations**, in the order worth trying:
+
+1. **Run at `READ COMMITTED`.** This avoids the problem completely rather than
+   working around it: reservations are only taken at `SNAPSHOT` isolation and
+   above, so at read committed the colliding code path is never entered.
+   Verified at scale -- a 100-warehouse TPC-C run, 16 concurrent connections,
+   five minutes measured, logged **zero** conflicts, against roughly 4,400 for
+   a comparable run at the default isolation.
+
+   ```
+   --transaction-isolation=READ-COMMITTED
+   ```
+
+   The trade is real and you should make it deliberately: read committed gives
+   up write-write conflict detection, so two transactions updating the same row
+   resolve last-writer-wins instead of one being refused. Many MySQL
+   deployments already run this way, and InnoDB users often prefer it, but it
+   is a weaker guarantee than the default. MySQL's default `REPEATABLE READ`
+   maps to TidesDB `SNAPSHOT`, which is what engages the reservations.
+
+2. **Load with a single connection.** Verified at both scales: a 10-warehouse
+   schema build completes with one loader where four hang, and a 100-warehouse
+   (~10 GB) build completes single-threaded.
+
+3. **Retry on `ER_LOCK_DEADLOCK` (1213) / error 1180.** The data is never
+   wrong: the transaction aborts cleanly and nothing partial is kept, so a
+   retry is safe.
 
 **Reproducer.** `IMG=<image> WARE=10 BUILDVU=4 RUNVU=8 RAMP=1 DUR=3
 ./bench/hammerdb/run-hammerdb.sh`. Compare against the previous release with

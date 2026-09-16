@@ -64,8 +64,11 @@ All notable changes to this project will be documented in this file.
   once several writers are running. A client that does not retry the statement
   stops there. Concurrent OLTP also takes a large volume of spurious conflicts
   (measured: 4380 in a 3-minute 8-connection TPC-C run, against 1 on v0.4.1);
-  clients that retry absorb them. Load with one connection, and retry on error
-  1213 / 1180. Full write-up and reproducer in
+  clients that retry absorb them. Running the server at `READ COMMITTED` avoids
+  it entirely, since reservations are only taken at `SNAPSHOT` and above
+  (verified: zero conflicts on a 100-warehouse, 16-connection run) at the cost
+  of write-write conflict detection. Otherwise load with one connection and
+  retry on error 1213 / 1180. Full write-up and reproducer in
   [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
 ### Fixed
