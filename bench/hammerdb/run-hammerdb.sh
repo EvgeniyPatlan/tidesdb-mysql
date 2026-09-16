@@ -70,9 +70,23 @@ docker run -d --name "$DB" --network "$NET" --cpus "$CPUS" --memory "$MEM" \
   --max-connections=512 --max-connect-errors=1000000 --connect-timeout=30 \
   --net-read-timeout=120 --net-write-timeout=120 "${_db_extra[@]}" >/dev/null
 
-echo "[hdb] waiting for mysqld (socket)"
-i=0; until docker exec "$DB" mysql -uroot -N -B -e "SELECT 1" 2>/dev/null | grep -q '^1$'; do
-  i=$((i+1)); [ "$i" -gt 90 ] && { echo "[hdb] DB never ready (socket)" >&2; exit 1; }; sleep 2; done
+# Wait for the DURABLE server, not the entrypoint's init server. The official
+# mysql image starts a socket-only temporary server to run initialisation,
+# and that one loads no plugin at all ("Ignoring --plugin-load[_add] list as
+# the server is running with --initialize"). A socket SELECT 1 succeeds
+# against it, which used to be enough to let the run proceed -- and then the
+# effective-setting queries below read empty (the plugin's variables do not
+# exist yet) and the bench user got created against a server about to be
+# replaced, with every error discarded. The result was a run that sat in the
+# TCP wait until it timed out, reporting "DB never ready (TCP)" while the
+# real server had been up and healthy for minutes.
+#
+# TCP is the signal that separates them: the temp server is socket-only, so
+# a TCP connection can only be the durable server.
+echo "[hdb] waiting for mysqld (durable server, TCP)"
+i=0; until docker exec "$DB" mysql -h127.0.0.1 -P3306 --protocol=TCP -uroot -N -B \
+       -e "SELECT 1" 2>/dev/null | grep -q '^1$'; do
+  i=$((i+1)); [ "$i" -gt 150 ] && { echo "[hdb] DB never ready (durable server)" >&2; exit 1; }; sleep 2; done
 
 # Capture the EFFECTIVE unified-memtable setting so a mistyped/ignored
 # DB_EXTRA_ARGS can't masquerade as a result. If the run intends OFF but
@@ -81,6 +95,12 @@ i=0; until docker exec "$DB" mysql -uroot -N -B -e "SELECT 1" 2>/dev/null | grep
 UNIFIED_MT=$(docker exec "$DB" mysql -uroot -N -B \
   -e "SHOW GLOBAL VARIABLES LIKE 'tidesdb_unified_memtable'" 2>/dev/null | awk '{print $2}')
 echo "[hdb] effective tidesdb_unified_memtable = ${UNIFIED_MT:-?}"
+if [ -z "$UNIFIED_MT" ]; then
+  echo "[hdb] FATAL: could not read tidesdb_unified_memtable -- the plugin is not" >&2
+  echo "[hdb]        loaded, or the server is not the one we think it is. Refusing" >&2
+  echo "[hdb]        to benchmark an unverified configuration." >&2
+  exit 1
+fi
 case "${DB_EXTRA_ARGS:-}" in
   *unified_memtable=0*|*unified_memtable=OFF*|*unified-memtable=0*|*unified-memtable=OFF*)
     if [ "$UNIFIED_MT" != "OFF" ]; then
